@@ -702,9 +702,15 @@ pub struct AppConfig {
     /// Telegram Bot 代理地址 (e.g. http://127.0.0.1:7890, socks5://127.0.0.1:1080)
     #[serde(default)]
     pub telegram_bot_proxy: Option<String>,
-    /// Telegram Bot 允许的 chat_id 白名单，为空则允许所有
+    /// Telegram Bot 允许的 chat_id 白名单；为空时仅允许 /start 和 /bind
     #[serde(default)]
     pub telegram_bot_allowed_chat_ids: Vec<i64>,
+    /// Telegram Bot 一次性绑定码；通过 /bind <code> 授权当前 chat_id 后失效
+    #[serde(default)]
+    pub telegram_bot_bind_code: Option<String>,
+    /// Telegram Bot 一次性绑定码过期时间（Unix 秒）
+    #[serde(default)]
+    pub telegram_bot_bind_code_expires_at: Option<i64>,
     /// 是否启用飞书 Bot
     #[serde(default)]
     pub feishu_bot_enabled: bool,
@@ -882,6 +888,8 @@ impl Default for AppConfig {
             telegram_bot_token: None,
             telegram_bot_proxy: None,
             telegram_bot_allowed_chat_ids: Vec::new(),
+            telegram_bot_bind_code: None,
+            telegram_bot_bind_code_expires_at: None,
             feishu_bot_enabled: false,
             feishu_app_id: None,
             feishu_app_secret: None,
@@ -969,6 +977,15 @@ impl AppConfig {
             normalize_optional_string(self.daily_report_export_dir.take());
         self.localhost_api_port = normalize_localhost_api_port(self.localhost_api_port);
         self.localhost_api_host = normalize_optional_string(self.localhost_api_host.take());
+        self.telegram_bot_bind_code = normalize_optional_string(self.telegram_bot_bind_code.take())
+            .map(|code| code.to_ascii_uppercase());
+        if self.telegram_bot_bind_code.is_none() {
+            self.telegram_bot_bind_code_expires_at = None;
+        }
+        self.remote_storage.s3.public_url_base =
+            normalize_optional_string(self.remote_storage.s3.public_url_base.take());
+        self.remote_storage.webdav.public_url_base =
+            normalize_optional_string(self.remote_storage.webdav.public_url_base.take());
         self.node_gateway.device_name =
             normalize_optional_string(self.node_gateway.device_name.take());
         self.sync_text_model_profiles();
@@ -1731,6 +1748,21 @@ mod tests {
 
         assert_eq!(config.daily_report_custom_prompt, "输出需要更偏周报风格");
         assert_eq!(config.daily_report_export_dir, None);
+    }
+
+    #[test]
+    fn 配置规范化应清理空白远程截图公开地址() {
+        let mut config = AppConfig::default();
+        config.remote_storage.s3.public_url_base = Some("   ".to_string());
+        config.remote_storage.webdav.public_url_base = Some(" https://cdn.example.com/base/ ".to_string());
+
+        config.normalize();
+
+        assert_eq!(config.remote_storage.s3.public_url_base, None);
+        assert_eq!(
+            config.remote_storage.webdav.public_url_base.as_deref(),
+            Some("https://cdn.example.com/base/")
+        );
     }
 
     #[test]

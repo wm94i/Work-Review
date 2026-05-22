@@ -9,6 +9,7 @@ use std::io::Write;
 use std::net::TcpListener as StdTcpListener;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tauri::AppHandle;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -18,18 +19,11 @@ use uuid::Uuid;
 pub const LOCALHOST_API_HOST: &str = "127.0.0.1";
 
 pub fn effective_api_host(config_host: Option<&str>) -> String {
-    let host = config_host
+    config_host
         .map(str::trim)
         .filter(|h| !h.is_empty())
-        .unwrap_or(LOCALHOST_API_HOST);
-    // 只允许 loopback 地址，防止暴露到局域网
-    match host {
-        "127.0.0.1" | "::1" | "localhost" => host.to_string(),
-        _ => {
-            log::warn!("localhost_api_host '{host}' 非 loopback 地址，强制使用 127.0.0.1");
-            LOCALHOST_API_HOST.to_string()
-        }
-    }
+        .unwrap_or(LOCALHOST_API_HOST)
+        .to_string()
 }
 const LOCALHOST_API_TOKEN_FILE: &str = "localhost_api_token.txt";
 const MAX_REQUEST_BYTES: usize = 256 * 1024;
@@ -37,6 +31,7 @@ const MAX_BODY_BYTES: usize = 128 * 1024;
 
 pub struct LocalhostApiRuntime {
     pub running: bool,
+    pub bound_host: Option<String>,
     pub bound_port: Option<u16>,
     pub last_error: Option<String>,
     pub shutdown_tx: Option<oneshot::Sender<()>>,
@@ -46,6 +41,7 @@ impl Default for LocalhostApiRuntime {
     fn default() -> Self {
         Self {
             running: false,
+            bound_host: None,
             bound_port: None,
             last_error: None,
             shutdown_tx: None,
@@ -272,11 +268,21 @@ pub fn reveal_localhost_api_token(state: &Arc<Mutex<AppState>>) -> Result<String
 
 pub fn get_localhost_api_status(state: &Arc<Mutex<AppState>>) -> Result<LocalhostApiStatusPayload> {
     let node_status = crate::node_gateway::get_node_gateway_status(state)?;
-    let (config, runtime_running, runtime_port, last_error, is_recording, is_paused, data_dir) = {
+    let (
+        config,
+        runtime_running,
+        runtime_host,
+        runtime_port,
+        last_error,
+        is_recording,
+        is_paused,
+        data_dir,
+    ) = {
         let state = state.lock().map_err(|e| AppError::Unknown(e.to_string()))?;
         (
             state.config.clone(),
             state.localhost_api_runtime.running,
+            state.localhost_api_runtime.bound_host.clone(),
             state.localhost_api_runtime.bound_port,
             state.localhost_api_runtime.last_error.clone(),
             state.is_recording,
@@ -286,8 +292,13 @@ pub fn get_localhost_api_status(state: &Arc<Mutex<AppState>>) -> Result<Localhos
     };
 
     let token = read_localhost_api_token_from_path(&localhost_api_token_path(&data_dir))?;
-    let port = runtime_port.unwrap_or(config.localhost_api_port);
-    let host = effective_api_host(config.localhost_api_host.as_deref());
+    let configured_port = if config.localhost_api_port == 0 {
+        DEFAULT_LOCALHOST_API_PORT
+    } else {
+        config.localhost_api_port
+    };
+    let port = runtime_port.unwrap_or(configured_port);
+    let host = runtime_host.unwrap_or_else(|| effective_api_host(config.localhost_api_host.as_deref()));
 
     Ok(LocalhostApiStatusPayload {
         enabled: config.localhost_api_enabled,
@@ -320,6 +331,7 @@ fn runtime_platform() -> &'static str {
 
 fn stop_runtime_locked(runtime: &mut LocalhostApiRuntime) -> Option<oneshot::Sender<()>> {
     runtime.running = false;
+    runtime.bound_host = None;
     runtime.bound_port = None;
     runtime.shutdown_tx.take()
 }
@@ -327,10 +339,27 @@ fn stop_runtime_locked(runtime: &mut LocalhostApiRuntime) -> Option<oneshot::Sen
 fn record_runtime_error(state: &Arc<Mutex<AppState>>, message: impl Into<String>) {
     if let Ok(mut state) = state.lock() {
         state.localhost_api_runtime.running = false;
+        state.localhost_api_runtime.bound_host = None;
         state.localhost_api_runtime.bound_port = None;
         state.localhost_api_runtime.shutdown_tx = None;
         state.localhost_api_runtime.last_error = Some(message.into());
     }
+}
+
+fn bind_localhost_api_listener(host: &str, port: u16) -> std::io::Result<StdTcpListener> {
+    let mut last_error = None;
+    for attempt in 0..5 {
+        match StdTcpListener::bind((host, port)) {
+            Ok(listener) => return Ok(listener),
+            Err(err) if err.kind() == std::io::ErrorKind::AddrInUse && attempt < 4 => {
+                last_error = Some(err);
+                std::thread::sleep(Duration::from_millis(120));
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    Err(last_error.expect("bind retry loop records address-in-use error"))
 }
 
 pub fn sync_localhost_api_runtime(app: &AppHandle, state: &Arc<Mutex<AppState>>) -> Result<()> {
@@ -356,6 +385,7 @@ pub fn sync_localhost_api_runtime(app: &AppHandle, state: &Arc<Mutex<AppState>>)
         }
 
         if state.localhost_api_runtime.running
+            && state.localhost_api_runtime.bound_host.as_deref() == Some(host.as_str())
             && state.localhost_api_runtime.bound_port == Some(port)
         {
             return Ok(());
@@ -375,7 +405,7 @@ pub fn sync_localhost_api_runtime(app: &AppHandle, state: &Arc<Mutex<AppState>>)
 
     let token = ensure_localhost_api_token(state)?;
 
-    let std_listener = StdTcpListener::bind((host.as_str(), port)).map_err(|e| {
+    let std_listener = bind_localhost_api_listener(host.as_str(), port).map_err(|e| {
         let message = format!("启动本地 API 失败: {e}");
         record_runtime_error(state, &message);
         AppError::Config(message)
@@ -388,6 +418,7 @@ pub fn sync_localhost_api_runtime(app: &AppHandle, state: &Arc<Mutex<AppState>>)
     {
         let mut state = state.lock().map_err(|e| AppError::Unknown(e.to_string()))?;
         state.localhost_api_runtime.running = true;
+        state.localhost_api_runtime.bound_host = Some(host.clone());
         state.localhost_api_runtime.bound_port = Some(port);
         state.localhost_api_runtime.last_error = None;
         state.localhost_api_runtime.shutdown_tx = Some(shutdown_tx);
@@ -402,6 +433,7 @@ pub fn sync_localhost_api_runtime(app: &AppHandle, state: &Arc<Mutex<AppState>>)
             record_runtime_error(&state_handle, format!("本地 API 异常退出: {e}"));
         } else if let Ok(mut state) = state_handle.lock() {
             state.localhost_api_runtime.running = false;
+            state.localhost_api_runtime.bound_host = None;
             state.localhost_api_runtime.bound_port = None;
             state.localhost_api_runtime.shutdown_tx = None;
         }
@@ -557,6 +589,11 @@ fn handle_device_info(state: &Arc<Mutex<AppState>>) -> Result<HttpResponse> {
     };
     let node_status = crate::node_gateway::get_node_gateway_status(state)?;
     let host = effective_api_host(config_host.as_deref());
+    let port = if config_port == 0 {
+        DEFAULT_LOCALHOST_API_PORT
+    } else {
+        config_port
+    };
     Ok(HttpResponse::json(
         200,
         &serde_json::json!({
@@ -567,7 +604,7 @@ fn handle_device_info(state: &Arc<Mutex<AppState>>) -> Result<HttpResponse> {
             "protocolVersion": node_status.protocol_version,
             "recording": is_recording,
             "paused": is_paused,
-            "apiEndpoint": format!("http://{host}:{config_port}"),
+            "apiEndpoint": format!("http://{host}:{port}"),
         }),
     ))
 }
@@ -675,8 +712,16 @@ async fn route_request(
             }
         }
         ("GET", "/v1/apps/recent") => {
-            commands::get_recent_apps_inner(state)
-                .map(|apps| HttpResponse::json(200, &serde_json::json!({ "apps": apps })))
+            commands::get_recent_app_usage_inner(state).map(|items| {
+                let apps = items
+                    .iter()
+                    .map(|item| item.app_name.clone())
+                    .collect::<Vec<_>>();
+                HttpResponse::json(200, &serde_json::json!({
+                    "apps": apps,
+                    "items": items,
+                }))
+            })
         }
         ("GET", "/v1/apps/category-overview") => {
             commands::get_app_category_overview_inner(state)
@@ -744,7 +789,7 @@ async fn route_request(
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(10000);
                 match state.lock() {
-                    Ok(s) => s.database.get_activities_in_range(Some(date), None, limit)
+                    Ok(s) => s.database.get_activities_in_range(Some(date), Some(date), limit)
                         .map(|result| HttpResponse::json(200, &result)),
                     Err(e) => Err(AppError::Unknown(e.to_string())),
                 }
@@ -846,8 +891,17 @@ fn authorize_request(request: &ParsedRequest, state: &Arc<Mutex<AppState>>) -> R
 #[cfg(test)]
 mod tests {
     use super::{
-        extract_bearer_token, mask_localhost_api_token, request_auth_mode, RequestAuthMode,
+        effective_api_host, extract_bearer_token, mask_localhost_api_token, request_auth_mode,
+        RequestAuthMode,
     };
+
+    #[test]
+    fn 监听地址应允许局域网与全部网卡绑定() {
+        assert_eq!(effective_api_host(None), "127.0.0.1");
+        assert_eq!(effective_api_host(Some(" 0.0.0.0 ")), "0.0.0.0");
+        assert_eq!(effective_api_host(Some("192.168.1.23")), "192.168.1.23");
+        assert_eq!(effective_api_host(Some("::")), "::");
+    }
 
     #[test]
     fn bearer_token解析应忽略前后空白() {

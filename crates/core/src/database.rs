@@ -1,6 +1,6 @@
 use crate::error::{AppError, Result};
 use chrono::{Local, MappedLocalTime, NaiveDateTime, TimeZone};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, Row};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::Mutex;
@@ -31,6 +31,26 @@ fn category_counts_toward_work_time(category: &str) -> bool {
 
 const UNRESOLVED_BROWSER_DOMAIN_LABEL: &str = "未识别页面";
 const UNRESOLVED_BROWSER_URL_LABEL: &str = "未识别 URL";
+
+const ACTIVITY_SELECT_COLUMNS: &str = "id, timestamp, app_name, window_title, screenshot_path, ocr_text, category, duration, browser_url, executable_path, semantic_category, semantic_confidence, screenshot_url";
+
+fn activity_from_row(row: &Row<'_>) -> rusqlite::Result<Activity> {
+    Ok(Activity {
+        id: Some(row.get(0)?),
+        timestamp: row.get(1)?,
+        app_name: row.get(2)?,
+        window_title: row.get(3)?,
+        screenshot_path: row.get(4)?,
+        ocr_text: row.get(5)?,
+        category: row.get(6)?,
+        duration: row.get(7)?,
+        browser_url: row.get(8)?,
+        executable_path: row.get(9)?,
+        semantic_category: row.get(10)?,
+        semantic_confidence: row.get(11)?,
+        screenshot_url: row.get(12)?,
+    })
+}
 
 /// 活动记录
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -86,6 +106,9 @@ pub struct AppUsage {
     pub count: i64,
     #[serde(default)]
     pub executable_path: Option<String>,
+    /// 该应用最近一次远程截图 URL（上传成功后填充）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub screenshot_url: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -93,7 +116,10 @@ pub struct AppCategorySnapshot {
     pub app_name: String,
     pub category: String,
     pub total_duration: i64,
+    pub count: i64,
+    pub executable_path: Option<String>,
     pub latest_timestamp: i64,
+    pub screenshot_url: Option<String>,
 }
 
 /// 分类使用统计
@@ -123,6 +149,9 @@ pub struct HourlyAppBucket {
 pub struct AppDuration {
     pub app_name: String,
     pub duration: i64,
+    /// 该小时内该应用最近一次远程截图 URL（上传成功后填充）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub screenshot_url: Option<String>,
 }
 
 /// 小时摘要
@@ -679,31 +708,18 @@ impl Database {
         // 回溯24小时
         let start_ts = chrono::Local::now().timestamp() - 86400;
 
-        let mut stmt = conn.prepare(
-            "SELECT id, timestamp, app_name, window_title, screenshot_path, ocr_text, category, duration, browser_url, executable_path, semantic_category, semantic_confidence
+        let sql = format!(
+            "SELECT {ACTIVITY_SELECT_COLUMNS}
              FROM activities
              WHERE app_name = ?1 AND timestamp >= ?2
              ORDER BY id DESC
              LIMIT 1"
-        )?;
+        );
+        let mut stmt = conn.prepare(&sql)?;
 
         let mut rows = stmt.query(params![app_name, start_ts])?;
         if let Some(row) = rows.next()? {
-            Ok(Some(Activity {
-                id: Some(row.get(0)?),
-                timestamp: row.get(1)?,
-                app_name: row.get(2)?,
-                window_title: row.get(3)?,
-                screenshot_path: row.get(4)?,
-                ocr_text: row.get(5)?,
-                category: row.get(6)?,
-                duration: row.get(7)?,
-                browser_url: row.get(8)?,
-                executable_path: row.get(9)?,
-                semantic_category: row.get(10)?,
-                semantic_confidence: row.get(11)?,
-                screenshot_url: None,
-            }))
+            Ok(Some(activity_from_row(row)?))
         } else {
             Ok(None)
         }
@@ -722,31 +738,18 @@ impl Database {
             safe_local_timestamp(ndt)
         };
 
-        let mut stmt = conn.prepare(
-            "SELECT id, timestamp, app_name, window_title, screenshot_path, ocr_text, category, duration, browser_url, executable_path, semantic_category, semantic_confidence
+        let sql = format!(
+            "SELECT {ACTIVITY_SELECT_COLUMNS}
              FROM activities
              WHERE app_name = ?1 AND timestamp >= ?2
              ORDER BY id DESC
              LIMIT 1"
-        )?;
+        );
+        let mut stmt = conn.prepare(&sql)?;
 
         let mut rows = stmt.query(params![app_name, today_start])?;
         if let Some(row) = rows.next()? {
-            Ok(Some(Activity {
-                id: Some(row.get(0)?),
-                timestamp: row.get(1)?,
-                app_name: row.get(2)?,
-                window_title: row.get(3)?,
-                screenshot_path: row.get(4)?,
-                ocr_text: row.get(5)?,
-                category: row.get(6)?,
-                duration: row.get(7)?,
-                browser_url: row.get(8)?,
-                executable_path: row.get(9)?,
-                semantic_category: row.get(10)?,
-                semantic_confidence: row.get(11)?,
-                screenshot_url: None,
-            }))
+            Ok(Some(activity_from_row(row)?))
         } else {
             Ok(None)
         }
@@ -769,31 +772,18 @@ impl Database {
             safe_local_timestamp(ndt)
         };
 
-        let mut stmt = conn.prepare(
-            "SELECT id, timestamp, app_name, window_title, screenshot_path, ocr_text, category, duration, browser_url, executable_path, semantic_category, semantic_confidence
+        let sql = format!(
+            "SELECT {ACTIVITY_SELECT_COLUMNS}
              FROM activities
              WHERE app_name = ?1 AND window_title = ?2 AND timestamp >= ?3
              ORDER BY id DESC
              LIMIT 1"
-        )?;
+        );
+        let mut stmt = conn.prepare(&sql)?;
 
         let mut rows = stmt.query(params![app_name, window_title, today_start])?;
         if let Some(row) = rows.next()? {
-            Ok(Some(Activity {
-                id: Some(row.get(0)?),
-                timestamp: row.get(1)?,
-                app_name: row.get(2)?,
-                window_title: row.get(3)?,
-                screenshot_path: row.get(4)?,
-                ocr_text: row.get(5)?,
-                category: row.get(6)?,
-                duration: row.get(7)?,
-                browser_url: row.get(8)?,
-                executable_path: row.get(9)?,
-                semantic_category: row.get(10)?,
-                semantic_confidence: row.get(11)?,
-                screenshot_url: None,
-            }))
+            Ok(Some(activity_from_row(row)?))
         } else {
             Ok(None)
         }
@@ -817,31 +807,18 @@ impl Database {
         log::debug!("URL 合并查询: 原始='{browser_url}', 规范化='{normalized_url}'");
 
         // 使用 RTRIM 规范化数据库中的 URL 进行比较
-        let mut stmt = conn.prepare(
-            "SELECT id, timestamp, app_name, window_title, screenshot_path, ocr_text, category, duration, browser_url, executable_path, semantic_category, semantic_confidence
+        let sql = format!(
+            "SELECT {ACTIVITY_SELECT_COLUMNS}
              FROM activities
              WHERE RTRIM(browser_url, '/') = ?1 AND timestamp >= ?2
              ORDER BY id DESC
              LIMIT 1"
-        )?;
+        );
+        let mut stmt = conn.prepare(&sql)?;
 
         let mut rows = stmt.query(params![normalized_url, today_start])?;
         if let Some(row) = rows.next()? {
-            Ok(Some(Activity {
-                id: Some(row.get(0)?),
-                timestamp: row.get(1)?,
-                app_name: row.get(2)?,
-                window_title: row.get(3)?,
-                screenshot_path: row.get(4)?,
-                ocr_text: row.get(5)?,
-                category: row.get(6)?,
-                duration: row.get(7)?,
-                browser_url: row.get(8)?,
-                executable_path: row.get(9)?,
-                semantic_category: row.get(10)?,
-                semantic_confidence: row.get(11)?,
-                screenshot_url: None,
-            }))
+            Ok(Some(activity_from_row(row)?))
         } else {
             Ok(None)
         }
@@ -853,28 +830,12 @@ impl Database {
             AppError::Database(rusqlite::Error::InvalidParameterName(e.to_string()))
         })?;
 
-        let mut stmt = conn.prepare(
-            "SELECT id, timestamp, app_name, window_title, screenshot_path, ocr_text, category, duration, browser_url, executable_path, semantic_category, semantic_confidence
-             FROM activities WHERE id = ?1"
-        )?;
+        let sql = format!("SELECT {ACTIVITY_SELECT_COLUMNS} FROM activities WHERE id = ?1");
+        let mut stmt = conn.prepare(&sql)?;
 
         let mut rows = stmt.query(params![id])?;
         if let Some(row) = rows.next()? {
-            Ok(Some(Activity {
-                id: Some(row.get(0)?),
-                timestamp: row.get(1)?,
-                app_name: row.get(2)?,
-                window_title: row.get(3)?,
-                screenshot_path: row.get(4)?,
-                ocr_text: row.get(5)?,
-                category: row.get(6)?,
-                duration: row.get(7)?,
-                browser_url: row.get(8)?,
-                executable_path: row.get(9)?,
-                semantic_category: row.get(10)?,
-                semantic_confidence: row.get(11)?,
-                screenshot_url: None,
-            }))
+            Ok(Some(activity_from_row(row)?))
         } else {
             Ok(None)
         }
@@ -1170,7 +1131,8 @@ impl Database {
                     duration,
                     browser_url,
                     executable_path,
-                    semantic_category
+                    semantic_category,
+                    screenshot_url
              FROM activities
              WHERE timestamp > ?1 AND (timestamp - duration) < ?2
              ORDER BY timestamp ASC",
@@ -1187,13 +1149,16 @@ impl Database {
                 row.get::<_, Option<String>>(6)?,
                 row.get::<_, Option<String>>(7)?,
                 row.get::<_, Option<String>>(8)?,
+                row.get::<_, Option<String>>(9)?,
             ))
         })?;
 
         let mut total_duration: i64 = 0;
         let mut work_time_duration: i64 = 0;
-        let mut app_usage_map: std::collections::HashMap<String, (i64, i64, Option<String>)> =
-            std::collections::HashMap::new();
+        let mut app_usage_map: std::collections::HashMap<
+            String,
+            (i64, i64, Option<String>, Option<String>, i64),
+        > = std::collections::HashMap::new();
         let mut category_usage_map: std::collections::HashMap<String, i64> =
             std::collections::HashMap::new();
         let mut browser_duration: i64 = 0;
@@ -1227,6 +1192,7 @@ impl Database {
             browser_url,
             executable_path,
             semantic_category,
+            screenshot_url,
         ) in activity_rows
         {
             let day_duration = calculate_overlap_duration(timestamp, duration, start_ts, end_ts);
@@ -1271,11 +1237,23 @@ impl Database {
                 0,
                 0,
                 executable_path.clone(),
+                None,
+                i64::MIN,
             ));
             entry.0 += day_duration;
             entry.1 += 1;
             if entry.2.is_none() && executable_path.is_some() {
                 entry.2 = executable_path.clone();
+            }
+            if screenshot_url
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .is_some()
+                && timestamp >= entry.4
+            {
+                entry.3 = screenshot_url.clone();
+                entry.4 = timestamp;
             }
 
             let norm_cat = crate::categorize::normalize_category_key(&category);
@@ -1355,11 +1333,12 @@ impl Database {
 
         let mut app_usage: Vec<AppUsage> = app_usage_map
             .into_iter()
-            .map(|(name, (dur, count, exe))| AppUsage {
+            .map(|(name, (dur, count, exe, screenshot_url, _))| AppUsage {
                 app_name: name,
                 duration: dur,
                 count,
                 executable_path: exe,
+                screenshot_url,
             })
             .collect();
         app_usage.sort_by(|a, b| b.duration.cmp(&a.duration));
@@ -1645,16 +1624,28 @@ impl Database {
             "SELECT
                 CAST((timestamp - ?1) / 3600 AS INTEGER) as hour,
                 app_name,
-                SUM(duration) as total_duration
+                SUM(duration) as total_duration,
+                (
+                    SELECT latest.screenshot_url
+                    FROM activities latest
+                    WHERE latest.timestamp >= ?1
+                      AND latest.timestamp < ?2
+                      AND CAST((latest.timestamp - ?1) / 3600 AS INTEGER) = CAST((activities.timestamp - ?1) / 3600 AS INTEGER)
+                      AND latest.app_name = activities.app_name
+                      AND latest.screenshot_url IS NOT NULL
+                      AND TRIM(latest.screenshot_url) != ''
+                    ORDER BY latest.timestamp DESC, latest.id DESC
+                    LIMIT 1
+                ) as screenshot_url
              FROM activities
              WHERE timestamp >= ?1 AND timestamp < ?2 AND duration > 0
              GROUP BY hour, app_name
              ORDER BY hour, total_duration DESC",
         )?;
 
-        let raw: Vec<(i32, String, i64)> = stmt
+        let raw: Vec<(i32, String, i64, Option<String>)> = stmt
             .query_map(params![start_ts, end_ts], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
             })?
             .filter_map(|r| r.ok())
             .collect();
@@ -1668,12 +1659,13 @@ impl Database {
             })
             .collect();
 
-        for (hour, app_name, duration) in raw {
+        for (hour, app_name, duration, screenshot_url) in raw {
             if let Some(bucket) = buckets.get_mut(hour as usize) {
                 bucket.total_duration += duration;
                 bucket.apps.push(AppDuration {
                     app_name,
                     duration,
+                    screenshot_url,
                 });
             }
         }
@@ -1697,7 +1689,7 @@ impl Database {
         let (start_ts, end_ts) = parse_date_bounds(date_from, date_to);
 
         let mut stmt = conn.prepare(
-            "SELECT id, timestamp, app_name, window_title, screenshot_path, ocr_text, category, duration, browser_url, executable_path, semantic_category, semantic_confidence
+            "SELECT id, timestamp, app_name, window_title, screenshot_path, ocr_text, category, duration, browser_url, executable_path, semantic_category, semantic_confidence, screenshot_url
              FROM activities
              WHERE (?1 IS NULL OR timestamp >= ?1)
                AND (?2 IS NULL OR timestamp < ?2)
@@ -1720,7 +1712,7 @@ impl Database {
                     executable_path: row.get(9)?,
                     semantic_category: row.get(10)?,
                     semantic_confidence: row.get(11)?,
-                    screenshot_url: None,
+                    screenshot_url: row.get(12)?,
                 })
             })?
             .filter_map(|row| row.ok())
@@ -1869,31 +1861,16 @@ impl Database {
         let start_ts = safe_local_timestamp(date_parsed.and_hms_opt(h, 0, 0).unwrap());
         let end_ts = start_ts + 3600; // 1小时
 
-        let mut stmt = conn.prepare(
-            "SELECT id, timestamp, app_name, window_title, screenshot_path, ocr_text, category, duration, browser_url, executable_path, semantic_category, semantic_confidence
+        let sql = format!(
+            "SELECT {ACTIVITY_SELECT_COLUMNS}
              FROM activities
              WHERE timestamp > ?1 AND timestamp - duration < ?2
              ORDER BY timestamp ASC"
-        )?;
+        );
+        let mut stmt = conn.prepare(&sql)?;
 
         let mut activities: Vec<(i64, Activity)> = stmt
-            .query_map(params![start_ts, end_ts], |row| {
-                Ok(Activity {
-                    id: Some(row.get(0)?),
-                    timestamp: row.get(1)?,
-                    app_name: row.get(2)?,
-                    window_title: row.get(3)?,
-                    screenshot_path: row.get(4)?,
-                    ocr_text: row.get(5)?,
-                    category: row.get(6)?,
-                    duration: row.get(7)?,
-                    browser_url: row.get(8)?,
-                    executable_path: row.get(9)?,
-                    semantic_category: row.get(10)?,
-                    semantic_confidence: row.get(11)?,
-                    screenshot_url: None,
-                })
-            })?
+            .query_map(params![start_ts, end_ts], activity_from_row)?
             .filter_map(|r| r.ok())
             .filter_map(|mut activity| {
                 let interval_start = activity.timestamp.saturating_sub(activity.duration);
@@ -1949,41 +1926,77 @@ impl Database {
     /// 获取历史应用列表（按使用时长排序）
     /// 返回去重后的应用名列表
     pub fn get_recent_apps(&self, limit: u32) -> Result<Vec<String>> {
+        Ok(self
+            .get_recent_app_usage(limit)?
+            .into_iter()
+            .map(|item| item.app_name)
+            .collect())
+    }
+
+    /// 获取历史应用详情（按使用时长排序），包含最近可用的远程截图 URL
+    pub fn get_recent_app_usage(&self, limit: u32) -> Result<Vec<AppUsage>> {
         use std::collections::HashMap;
 
         let conn = self.conn.lock().map_err(|e| {
             AppError::Database(rusqlite::Error::InvalidParameterName(e.to_string()))
         })?;
 
-        // 查询所有应用并在 Rust 侧做归一化合并，避免 work-review / Work Review 分裂成两条
         let mut stmt = conn.prepare(
-            "SELECT app_name, SUM(duration) as total_duration 
-             FROM activities 
-             GROUP BY app_name 
-             ORDER BY total_duration DESC",
+            "SELECT app_name, duration, executable_path, screenshot_url, timestamp
+             FROM activities
+             ORDER BY timestamp DESC, id DESC",
         )?;
 
-        let rows: Vec<(String, i64)> = stmt
+        let rows: Vec<(String, i64, Option<String>, Option<String>, i64)> = stmt
             .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
             })?
             .filter_map(|r| r.ok())
             .collect();
 
-        let mut merged: HashMap<String, i64> = HashMap::new();
-        for (raw_name, duration) in rows {
+        let mut merged: HashMap<String, (i64, i64, Option<String>, Option<String>, i64)> =
+            HashMap::new();
+        for (raw_name, duration, executable_path, screenshot_url, timestamp) in rows {
             let normalized = crate::categorize::normalize_display_app_name(&raw_name);
-            *merged.entry(normalized).or_insert(0) += duration;
+            let entry = merged
+                .entry(normalized.clone())
+                .or_insert((0, 0, None, None, i64::MIN));
+            entry.0 += duration;
+            entry.1 += 1;
+            if entry.2.is_none() && executable_path.is_some() {
+                entry.2 = executable_path;
+            }
+            if screenshot_url
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .is_some()
+                && timestamp >= entry.4
+            {
+                entry.3 = screenshot_url;
+                entry.4 = timestamp;
+            }
         }
 
-        let mut apps: Vec<(String, i64)> = merged.into_iter().collect();
-        apps.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-
-        Ok(apps
+        let mut apps: Vec<AppUsage> = merged
             .into_iter()
-            .take(limit as usize)
-            .map(|(name, _)| name)
-            .collect())
+            .map(|(app_name, (duration, count, executable_path, screenshot_url, _))| AppUsage {
+                app_name,
+                duration,
+                count,
+                executable_path,
+                screenshot_url,
+            })
+            .collect();
+        apps.sort_by(|a, b| b.duration.cmp(&a.duration).then_with(|| a.app_name.cmp(&b.app_name)));
+        apps.truncate(limit as usize);
+        Ok(apps)
     }
 
     pub fn get_app_category_overview(&self) -> Result<Vec<AppCategorySnapshot>> {
@@ -1994,25 +2007,27 @@ impl Database {
         })?;
 
         let mut stmt = conn.prepare(
-            "SELECT app_name, category, duration, timestamp
+            "SELECT app_name, category, duration, timestamp, executable_path, screenshot_url
              FROM activities
              ORDER BY timestamp DESC, id DESC",
         )?;
 
-        let rows: Vec<(String, String, i64, i64)> = stmt
+        let rows: Vec<(String, String, i64, i64, Option<String>, Option<String>)> = stmt
             .query_map([], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, i64>(2)?,
                     row.get::<_, i64>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
                 ))
             })?
             .filter_map(|row| row.ok())
             .collect();
 
         let mut merged: HashMap<String, AppCategorySnapshot> = HashMap::new();
-        for (raw_name, category, duration, timestamp) in rows {
+        for (raw_name, category, duration, timestamp, executable_path, screenshot_url) in rows {
             let normalized_name = crate::categorize::normalize_display_app_name(&raw_name);
             let key = normalized_name.to_lowercase();
 
@@ -2020,14 +2035,30 @@ impl Database {
                 app_name: normalized_name.clone(),
                 category: category.clone(),
                 total_duration: 0,
+                count: 0,
+                executable_path: executable_path.clone(),
                 latest_timestamp: timestamp,
+                screenshot_url: None,
             });
 
             entry.total_duration += duration;
+            entry.count += 1;
+            if entry.executable_path.is_none() && executable_path.is_some() {
+                entry.executable_path = executable_path.clone();
+            }
             if timestamp >= entry.latest_timestamp {
                 entry.latest_timestamp = timestamp;
                 entry.app_name = normalized_name;
                 entry.category = category;
+            }
+            if entry.screenshot_url.is_none()
+                && screenshot_url
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .is_some()
+            {
+                entry.screenshot_url = screenshot_url;
             }
         }
 
@@ -2050,31 +2081,16 @@ impl Database {
         let target = crate::categorize::normalize_display_app_name(app_name).to_lowercase();
         // 用 LIKE 做初步过滤，减少加载量；精确匹配仍在 Rust 侧完成
         let like_pattern = format!("%{}%", app_name);
-        let mut stmt = conn.prepare(
-            "SELECT id, timestamp, app_name, window_title, screenshot_path, ocr_text, category, duration, browser_url, executable_path, semantic_category, semantic_confidence
+        let sql = format!(
+            "SELECT {ACTIVITY_SELECT_COLUMNS}
              FROM activities
              WHERE app_name LIKE ?1
-             ORDER BY timestamp ASC, id ASC",
-        )?;
+             ORDER BY timestamp ASC, id ASC"
+        );
+        let mut stmt = conn.prepare(&sql)?;
 
         let activities = stmt
-            .query_map([&like_pattern], |row| {
-                Ok(Activity {
-                    id: Some(row.get(0)?),
-                    timestamp: row.get(1)?,
-                    app_name: row.get(2)?,
-                    window_title: row.get(3)?,
-                    screenshot_path: row.get(4)?,
-                    ocr_text: row.get(5)?,
-                    category: row.get(6)?,
-                    duration: row.get(7)?,
-                    browser_url: row.get(8)?,
-                    executable_path: row.get(9)?,
-                    semantic_category: row.get(10)?,
-                    semantic_confidence: row.get(11)?,
-                    screenshot_url: None,
-                })
-            })?
+            .query_map([&like_pattern], activity_from_row)?
             .filter_map(|row| row.ok())
             .filter(|activity| {
                 crate::categorize::normalize_display_app_name(&activity.app_name).to_lowercase()
@@ -2094,32 +2110,17 @@ impl Database {
             return Ok(Vec::new());
         };
 
-        let mut stmt = conn.prepare(
-            "SELECT id, timestamp, app_name, window_title, screenshot_path, ocr_text, category, duration, browser_url, executable_path, semantic_category, semantic_confidence
+        let sql = format!(
+            "SELECT {ACTIVITY_SELECT_COLUMNS}
              FROM activities
              WHERE browser_url IS NOT NULL AND browser_url != '' AND browser_url LIKE ?1
-             ORDER BY timestamp ASC, id ASC",
-        )?;
+             ORDER BY timestamp ASC, id ASC"
+        );
+        let mut stmt = conn.prepare(&sql)?;
 
         let like_pattern = format!("%{}%", &target);
         let activities = stmt
-            .query_map([&like_pattern], |row| {
-                Ok(Activity {
-                    id: Some(row.get(0)?),
-                    timestamp: row.get(1)?,
-                    app_name: row.get(2)?,
-                    window_title: row.get(3)?,
-                    screenshot_path: row.get(4)?,
-                    ocr_text: row.get(5)?,
-                    category: row.get(6)?,
-                    duration: row.get(7)?,
-                    browser_url: row.get(8)?,
-                    executable_path: row.get(9)?,
-                    semantic_category: row.get(10)?,
-                    semantic_confidence: row.get(11)?,
-                    screenshot_url: None,
-                })
-            })?
+            .query_map([&like_pattern], activity_from_row)?
             .filter_map(|row| row.ok())
             .filter(|activity| {
                 activity
@@ -2708,7 +2709,7 @@ mod tests {
                 executable_path: None,
                 semantic_category: None,
                 semantic_confidence: None,
-                screenshot_url: None,
+                screenshot_url: Some("https://cdn.example.com/workreview/shot-b.jpg".to_string()),
             },
             Activity {
                 id: None,
@@ -2744,8 +2745,24 @@ mod tests {
         assert_eq!(timeline.len(), 2);
         assert_eq!(file_a.duration, 35);
         assert_eq!(file_a.screenshot_path, "shot-b.jpg");
+        assert_eq!(
+            file_a.screenshot_url.as_deref(),
+            Some("https://cdn.example.com/workreview/shot-b.jpg")
+        );
         assert_eq!(file_a.ocr_text.as_deref(), Some("new"));
         assert_eq!(file_b.duration, 15);
+
+        let raw_activities = db
+            .get_activities_in_range(Some(&date), Some(&date), 100)
+            .expect("读取原始活动失败");
+        let raw_file_a = raw_activities
+            .iter()
+            .find(|activity| activity.screenshot_path == "shot-b.jpg")
+            .expect("未找到原始文件A记录");
+        assert_eq!(
+            raw_file_a.screenshot_url.as_deref(),
+            Some("https://cdn.example.com/workreview/shot-b.jpg")
+        );
 
         let _ = std::fs::remove_file(db_path);
     }
@@ -2785,6 +2802,65 @@ mod tests {
         assert_eq!(merged.duration, 30);
         assert_eq!(merged.timestamp, now);
         assert_eq!(merged.ocr_text.as_deref(), Some("old\n---\nnew"));
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn 最近应用详情应返回最近可用远程截图地址() {
+        let db_path = temp_db_path("recent-app-usage-screenshot-url");
+        let db = Database::new(&db_path).expect("创建测试数据库失败");
+        let now = chrono::Local::now().timestamp();
+
+        let records = vec![
+            Activity {
+                id: None,
+                timestamp: now - 90,
+                app_name: "Code".to_string(),
+                window_title: "旧窗口".to_string(),
+                screenshot_path: "old.jpg".to_string(),
+                ocr_text: None,
+                category: "development".to_string(),
+                duration: 30,
+                browser_url: None,
+                executable_path: Some("C:/Code/code.exe".to_string()),
+                semantic_category: None,
+                semantic_confidence: None,
+                screenshot_url: Some("https://cdn.example.com/old.jpg".to_string()),
+            },
+            Activity {
+                id: None,
+                timestamp: now - 30,
+                app_name: "Code".to_string(),
+                window_title: "新窗口".to_string(),
+                screenshot_path: "new.jpg".to_string(),
+                ocr_text: None,
+                category: "development".to_string(),
+                duration: 45,
+                browser_url: None,
+                executable_path: Some("C:/Code/code.exe".to_string()),
+                semantic_category: None,
+                semantic_confidence: None,
+                screenshot_url: Some("https://cdn.example.com/new.jpg".to_string()),
+            },
+        ];
+
+        for activity in &records {
+            db.insert_activity(activity).expect("插入测试数据失败");
+        }
+
+        let apps = db.get_recent_app_usage(10).expect("读取最近应用详情失败");
+        let code = apps
+            .iter()
+            .find(|item| item.app_name == "VS Code")
+            .expect("未找到 VS Code 应用详情");
+
+        assert_eq!(code.duration, 75);
+        assert_eq!(code.count, 2);
+        assert_eq!(
+            code.screenshot_url.as_deref(),
+            Some("https://cdn.example.com/new.jpg")
+        );
 
         let _ = std::fs::remove_file(db_path);
     }

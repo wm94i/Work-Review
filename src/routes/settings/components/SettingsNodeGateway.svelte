@@ -66,6 +66,9 @@
   async function refreshTelegramBotStatus() {
     try {
       tgBotStatus = await invoke('get_telegram_bot_status');
+      if (Array.isArray(tgBotStatus?.allowedChatIds)) {
+        config.telegram_bot_allowed_chat_ids = tgBotStatus.allowedChatIds;
+      }
     } catch (error) {
       console.warn('刷新 Telegram Bot 状态失败:', error);
     }
@@ -100,6 +103,9 @@
       nodeStatus = nextNodeStatus;
       localStatus = nextLocalStatus;
       tgBotStatus = nextTgBotStatus;
+      if (Array.isArray(tgBotStatus?.allowedChatIds)) {
+        config.telegram_bot_allowed_chat_ids = tgBotStatus.allowedChatIds;
+      }
       if (config.telegram_bot_enabled) {
         startTelegramStatusPolling();
       } else {
@@ -167,6 +173,21 @@
     } catch (error) {
       console.error('复制本地 API token 失败:', error);
       showToast(t('nodeGatewayPage.tokenCopyFailed', { error }), 'error');
+    }
+  }
+
+  async function generateTelegramBindCode() {
+    try {
+      const result = await invoke('generate_telegram_bot_bind_code');
+      tgBotStatus = await invoke('get_telegram_bot_status');
+      const code = result?.code || tgBotStatus?.bindCode;
+      if (code) {
+        await navigator.clipboard.writeText(`/bind ${code}`);
+      }
+      showToast(t('nodeGatewayPage.telegramBindCodeGenerated'), 'success');
+    } catch (error) {
+      console.error('生成 Telegram 绑定码失败:', error);
+      showToast(t('nodeGatewayPage.telegramBindCodeFailed', { error }), 'error');
     }
   }
 
@@ -446,6 +467,27 @@
               />
             </label>
             <p class="text-[11px] text-slate-400 dark:text-slate-500">{t('nodeGatewayPage.telegramBotProxyHint')}</p>
+            <div class="rounded-lg bg-blue-50/70 px-3 py-2 ring-1 ring-blue-100 dark:bg-blue-950/20 dark:ring-blue-900/50">
+              <div class="flex items-center justify-between gap-3">
+                <div class="min-w-0">
+                  <div class="text-[11px] font-medium text-blue-700 dark:text-blue-300">{t('nodeGatewayPage.telegramBindCodeTitle')}</div>
+                  <div class="mt-0.5 text-[11px] text-blue-600/80 dark:text-blue-300/80">{t('nodeGatewayPage.telegramBindCodeHint')}</div>
+                  {#if tgBotStatus?.bindCode && !tgBotStatus?.bindCodeExpired}
+                    <div class="mt-1 font-mono text-sm font-semibold text-blue-800 dark:text-blue-200">/bind {tgBotStatus.bindCode}</div>
+                  {:else if tgBotStatus?.bindCodeExpired}
+                    <div class="mt-1 text-[11px] text-amber-600 dark:text-amber-300">{t('nodeGatewayPage.telegramBindCodeExpired')}</div>
+                  {/if}
+                </div>
+                <button
+                  type="button"
+                  class="shrink-0 rounded-md bg-blue-600 px-2.5 py-1.5 text-xs font-medium text-white hover:bg-blue-700 disabled:opacity-60"
+                  on:click={generateTelegramBindCode}
+                  disabled={saving}
+                >
+                  {t('nodeGatewayPage.telegramBindCodeGenerate')}
+                </button>
+              </div>
+            </div>
             <label class="block mt-2">
               <span class="text-[11px] text-slate-500 dark:text-slate-400">{t('nodeGatewayPage.telegramAllowedChatIds')}</span>
               <input

@@ -679,7 +679,7 @@
         </label>
 
         <div class="flex items-center justify-between pt-1">
-          <p class="text-[11px] text-slate-400 dark:text-slate-500">{t('settingsStorage.remoteStorageDesc')}</p>
+          <p class="text-[11px] text-slate-400 dark:text-slate-500">{t('settingsStorage.publicUrlBaseEffectHint')}</p>
           <button
             type="button"
             class="settings-action-secondary"
@@ -786,7 +786,7 @@
         </label>
 
         <div class="flex items-center justify-between pt-1">
-          <p class="text-[11px] text-slate-400 dark:text-slate-500">{t('settingsStorage.remoteStorageDesc')}</p>
+          <p class="text-[11px] text-slate-400 dark:text-slate-500">{t('settingsStorage.publicUrlBaseEffectHint')}</p>
           <button
             type="button"
             class="settings-action-secondary"

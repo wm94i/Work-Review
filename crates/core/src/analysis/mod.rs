@@ -589,6 +589,7 @@ mod tests {
         normalize_custom_prompt, translate_semantic_category_name, AppLocale,
     };
     use crate::database::{DailyStats, HourlyActivityBucket};
+    use std::collections::HashMap;
 
     #[test]
     fn 空白附加提示词应被忽略() {
@@ -634,8 +635,9 @@ mod tests {
             ..Default::default()
         };
 
-        let summary = generate_stats_summary_for_locale(&stats, AppLocale::ZhCn);
-        let english_summary = generate_stats_summary_for_locale(&stats, AppLocale::En);
+        let empty = HashMap::new();
+        let summary = generate_stats_summary_for_locale(&stats, AppLocale::ZhCn, &empty);
+        let english_summary = generate_stats_summary_for_locale(&stats, AppLocale::En, &empty);
 
         assert!(summary.contains("按小时活跃度"));
         assert!(summary.contains("高峰时段"));

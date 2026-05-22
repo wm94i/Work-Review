@@ -3340,6 +3340,7 @@ async fn main() {
             commands::get_localhost_api_status,
             commands::get_node_gateway_status,
             commands::get_telegram_bot_status,
+            commands::generate_telegram_bot_bind_code,
             commands::reveal_localhost_api_token,
             commands::rotate_localhost_api_token,
             commands::get_config,

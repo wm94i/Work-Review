@@ -79,6 +79,8 @@ pub struct AppCategoryOverviewItem {
     pub category: String,
     pub total_duration: i64,
     pub is_overridden: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub screenshot_url: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -3029,9 +3031,13 @@ fn sum_daily_stats(days: Vec<DailyStats>) -> DailyStats {
                     duration: 0,
                     count: 0,
                     executable_path: None,
+                    screenshot_url: None,
                 });
             entry.duration += app.duration;
             entry.count += app.count;
+            if entry.screenshot_url.is_none() && app.screenshot_url.is_some() {
+                entry.screenshot_url = app.screenshot_url;
+            }
             update_preferred_path(&mut entry.executable_path, app.executable_path);
         }
 
@@ -4234,10 +4240,41 @@ pub async fn get_telegram_bot_status(
     state: State<'_, Arc<Mutex<AppState>>>,
 ) -> Result<serde_json::Value, AppError> {
     let s = state.lock().map_err(|e| AppError::Unknown(e.to_string()))?;
+    let now_ts = chrono::Local::now().timestamp();
     Ok(serde_json::json!({
         "running": s.telegram_bot_runtime.is_running(),
         "starting": s.telegram_bot_runtime.is_starting(),
         "lastError": s.telegram_bot_runtime.last_error(),
+        "allowedChatIds": s.config.telegram_bot_allowed_chat_ids.clone(),
+        "bindCode": s.config.telegram_bot_bind_code.clone(),
+        "bindCodeExpiresAt": s.config.telegram_bot_bind_code_expires_at,
+        "bindCodeExpired": s.config.telegram_bot_bind_code_expires_at.map(|expires_at| expires_at < now_ts).unwrap_or(false),
+    }))
+}
+
+#[tauri::command]
+pub async fn generate_telegram_bot_bind_code(
+    app: AppHandle,
+    state: State<'_, Arc<Mutex<AppState>>>,
+) -> Result<serde_json::Value, AppError> {
+    const TELEGRAM_BIND_CODE_TTL_SECONDS: i64 = 10 * 60;
+
+    let raw = uuid::Uuid::new_v4().simple().to_string();
+    let code = format!("WR-{}", raw[..6].to_ascii_uppercase());
+    let expires_at = chrono::Local::now().timestamp() + TELEGRAM_BIND_CODE_TTL_SECONDS;
+    let next_config = {
+        let state = state.lock().map_err(|e| AppError::Unknown(e.to_string()))?;
+        let mut config = state.config.clone();
+        config.telegram_bot_bind_code = Some(code.clone());
+        config.telegram_bot_bind_code_expires_at = Some(expires_at);
+        config
+    };
+
+    persist_app_config(next_config, app, state.inner())?;
+
+    Ok(serde_json::json!({
+        "code": code,
+        "expiresAt": expires_at,
     }))
 }
 
@@ -6466,6 +6503,14 @@ pub(crate) fn get_recent_apps_inner(state: &Arc<Mutex<AppState>>) -> Result<Vec<
     state.database.get_recent_apps(50)
 }
 
+/// 历史应用详情 —— 内部复用版，供 localhost API 返回截图 URL
+pub(crate) fn get_recent_app_usage_inner(
+    state: &Arc<Mutex<AppState>>,
+) -> Result<Vec<AppUsage>, AppError> {
+    let state = state.lock().map_err(|e| AppError::Unknown(e.to_string()))?;
+    state.database.get_recent_app_usage(50)
+}
+
 /// 获取历史应用列表（从数据库）
 #[tauri::command]
 pub async fn get_recent_apps(
@@ -6493,6 +6538,7 @@ pub(crate) fn get_app_category_overview_inner(state: &Arc<Mutex<AppState>>) -> R
                 category: override_category.unwrap_or(item.category),
                 total_duration: item.total_duration,
                 is_overridden,
+                screenshot_url: item.screenshot_url,
             }
         })
         .collect())
@@ -8537,6 +8583,7 @@ mod tests {
                 duration: 120,
                 count: 2,
                 executable_path: Some("/Applications/Cursor.app".to_string()),
+                screenshot_url: Some("https://cdn.example.com/cursor-day-one.jpg".to_string()),
             }],
             category_usage: vec![CategoryUsage {
                 category: "development".to_string(),
@@ -8583,12 +8630,14 @@ mod tests {
                     duration: 120,
                     count: 1,
                     executable_path: Some("/Applications/Cursor.app".to_string()),
+                    screenshot_url: None,
                 },
                 AppUsage {
                     app_name: "Google Chrome".to_string(),
                     duration: 60,
                     count: 1,
                     executable_path: Some("/Applications/Google Chrome.app".to_string()),
+                    screenshot_url: Some("https://cdn.example.com/chrome-day-two.jpg".to_string()),
                 },
             ],
             category_usage: vec![

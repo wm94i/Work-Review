@@ -35,12 +35,7 @@ async fn upload_s3(
     relative_path: &str,
 ) -> Result<String> {
     let endpoint = config.endpoint.trim_end_matches('/');
-    let prefix = config.path_prefix.trim_matches('/');
-    let object_key = if prefix.is_empty() {
-        relative_path.replace('\\', "/")
-    } else {
-        format!("{}/{}", prefix, relative_path.replace('\\', "/"))
-    };
+    let object_key = remote_object_path(&config.path_prefix, relative_path);
 
     let url = format!("{}/{}/{}", endpoint, &config.bucket, &object_key);
     let parsed = reqwest::Url::parse(&url)
@@ -116,11 +111,7 @@ async fn upload_s3(
         )));
     }
 
-    let public_url = if let Some(base) = &config.public_url_base {
-        format!("{}/{}", base.trim_end_matches('/'), &object_key)
-    } else {
-        url
-    };
+    let public_url = public_url_or_fallback(config.public_url_base.as_deref(), &object_key, &url);
 
     Ok(public_url)
 }
@@ -170,12 +161,7 @@ async fn upload_webdav(
     relative_path: &str,
 ) -> Result<String> {
     let base = config.url.trim_end_matches('/');
-    let prefix = config.path_prefix.trim_matches('/');
-    let object_path = if prefix.is_empty() {
-        relative_path.replace('\\', "/")
-    } else {
-        format!("{}/{}", prefix, relative_path.replace('\\', "/"))
-    };
+    let object_path = remote_object_path(&config.path_prefix, relative_path);
 
     ensure_webdav_directories(client, base, &object_path, &config.username, &config.password)
         .await?;
@@ -200,15 +186,7 @@ async fn upload_webdav(
         )));
     }
 
-    let public_url = if let Some(base_url) = &config.public_url_base {
-        format!(
-            "{}/{}",
-            base_url.trim_end_matches('/'),
-            relative_path.replace('\\', "/")
-        )
-    } else {
-        put_url
-    };
+    let public_url = public_url_or_fallback(config.public_url_base.as_deref(), &object_path, &put_url);
 
     Ok(public_url)
 }
@@ -249,4 +227,58 @@ async fn ensure_webdav_directories(
         }
     }
     Ok(())
+}
+
+fn remote_object_path(prefix: &str, relative_path: &str) -> String {
+    let relative_path = relative_path.replace('\\', "/");
+    let prefix = prefix.trim().trim_matches('/');
+    if prefix.is_empty() {
+        relative_path
+    } else {
+        format!("{}/{}", prefix, relative_path)
+    }
+}
+
+fn public_url_or_fallback(base_url: Option<&str>, object_path: &str, fallback: &str) -> String {
+    let Some(base_url) = base_url.map(str::trim).filter(|base_url| !base_url.is_empty()) else {
+        return fallback.to_string();
+    };
+    format!("{}/{}", base_url.trim_end_matches('/'), object_path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{public_url_or_fallback, remote_object_path};
+
+    #[test]
+    fn 远程对象路径应包含路径前缀并统一分隔符() {
+        assert_eq!(
+            remote_object_path(" workreview/ ", r"screenshots\2026-05-22\shot.jpg"),
+            "workreview/screenshots/2026-05-22/shot.jpg"
+        );
+        assert_eq!(
+            remote_object_path("", "screenshots/2026-05-22/shot.jpg"),
+            "screenshots/2026-05-22/shot.jpg"
+        );
+    }
+
+    #[test]
+    fn 公开访问地址应使用远程对象路径并忽略空前缀() {
+        assert_eq!(
+            public_url_or_fallback(
+                Some(" https://cdn.example.com/workreview/ "),
+                "archive/screenshots/shot.jpg",
+                "https://webdav.example.com/archive/screenshots/shot.jpg",
+            ),
+            "https://cdn.example.com/workreview/archive/screenshots/shot.jpg"
+        );
+        assert_eq!(
+            public_url_or_fallback(
+                Some("   "),
+                "archive/screenshots/shot.jpg",
+                "https://webdav.example.com/archive/screenshots/shot.jpg",
+            ),
+            "https://webdav.example.com/archive/screenshots/shot.jpg"
+        );
+    }
 }
