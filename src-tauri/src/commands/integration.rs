@@ -1,8 +1,6 @@
 //! Auto-extracted from the historical `commands.rs`. Behavior unchanged.
 
 use crate::error::AppError;
-#[cfg(target_os = "linux")]
-use crate::linux_session::{current_linux_desktop_environment, current_linux_desktop_session, LinuxDesktopSession};
 use crate::AppState;
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, State};

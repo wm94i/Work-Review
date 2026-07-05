@@ -2,8 +2,6 @@
 
 use crate::database::{AppUsage, BrowserUsage, CategoryUsage, DailyStats, DomainUsage, HourlyActivityBucket, HourlyAppBucket, UrlDetail, UrlUsage};
 use crate::error::AppError;
-#[cfg(target_os = "linux")]
-use crate::linux_session::{current_linux_desktop_environment, current_linux_desktop_session, LinuxDesktopSession};
 use crate::privacy::{apply_excluded_domains_to_stats, apply_ignored_apps_to_stats, matches_ignored_app};
 use crate::AppState;
 use std::collections::HashMap;

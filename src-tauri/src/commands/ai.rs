@@ -2,8 +2,6 @@
 
 use crate::config::{AiProvider, AiProviderConfig, ModelConfig};
 use crate::error::AppError;
-#[cfg(target_os = "linux")]
-use crate::linux_session::{current_linux_desktop_environment, current_linux_desktop_session, LinuxDesktopSession};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 

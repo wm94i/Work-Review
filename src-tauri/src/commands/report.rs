@@ -4,8 +4,6 @@ use crate::analysis::AppLocale;
 use crate::config::AppConfig;
 use crate::database::DailyReport;
 use crate::error::AppError;
-#[cfg(target_os = "linux")]
-use crate::linux_session::{current_linux_desktop_environment, current_linux_desktop_session, LinuxDesktopSession};
 use crate::AppState;
 use serde::Serialize;
 use std::path::{Path, PathBuf};

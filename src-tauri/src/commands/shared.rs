@@ -3,8 +3,6 @@
 use crate::config::{AppConfig, AvatarFollowupItem, PrivacyConfig};
 use crate::database::Activity;
 use crate::error::AppError;
-#[cfg(target_os = "linux")]
-use crate::linux_session::{current_linux_desktop_environment, current_linux_desktop_session, LinuxDesktopSession};
 use crate::work_intelligence::TodoExtractionResult;
 use crate::AppState;
 use std::sync::{Arc, Mutex};

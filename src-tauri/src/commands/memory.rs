@@ -3,8 +3,6 @@
 use crate::config::ModelConfig;
 use crate::database::MemorySearchItem;
 use crate::error::AppError;
-#[cfg(target_os = "linux")]
-use crate::linux_session::{current_linux_desktop_environment, current_linux_desktop_session, LinuxDesktopSession};
 use crate::work_intelligence::{analyze_intents, build_work_sessions, extract_todos, generate_weekly_review as build_weekly_review, IntentAnalysisResult, TodoExtractionResult, WeeklyReviewResult, WorkSession};
 use crate::AppState;
 use serde::{Deserialize, Serialize};

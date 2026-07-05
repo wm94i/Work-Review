@@ -2,8 +2,6 @@
 
 use crate::config::{AppCategoryRule, AppConfig, CustomSemanticCategory, WebsiteSemanticRule};
 use crate::error::AppError;
-#[cfg(target_os = "linux")]
-use crate::linux_session::{current_linux_desktop_environment, current_linux_desktop_session, LinuxDesktopSession};
 use crate::AppState;
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
