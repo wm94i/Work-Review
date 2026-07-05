@@ -424,7 +424,13 @@ pub fn sync_avatar_window(
             let _ = window.set_always_on_top(true);
             let _ = window.set_visible_on_all_workspaces(true);
             let _ = window.set_skip_taskbar(true);
-            let _ = window.set_position(Position::Physical(PhysicalPosition::new(x, y)));
+            // 仅当目标位置与当前物理位置不同时才 set_position。
+            // 避免每次配置变更都触发无意义的窗口移动，进而引发 onMoved → save →
+            // sync 的循环，以及 Wayland/某些 WM 下频繁移动导致的窗口闪烁（#120 飘动）。
+            let needs_move = current_position != Some((x, y));
+            if needs_move {
+                let _ = window.set_position(Position::Physical(PhysicalPosition::new(x, y)));
+            }
             let _ = window.unminimize();
             let _ = window.show();
         }
@@ -595,6 +601,14 @@ fn default_avatar_position(
     scale: f64,
     saved_position: Option<(i32, i32)>,
 ) -> (i32, i32) {
+    // 多屏适配：已保存位置时，优先用该位置所在的显示器来 clamp，
+    // 避免副屏坐标被主屏的工作区边界强行拉回（issue #120）。
+    if let Some((saved_x, saved_y)) = saved_position {
+        if let Some(bounds) = monitor_bounds_for_point(app, saved_x, saved_y) {
+            return resolve_avatar_position(bounds, None, saved_position, scale);
+        }
+    }
+
     if let Some(main_window) = app.get_webview_window("main") {
         if let Ok(Some(monitor)) = main_window.current_monitor() {
             let anchor = match (main_window.outer_position(), main_window.outer_size()) {
@@ -616,6 +630,32 @@ fn default_avatar_position(
     }
 
     saved_position.unwrap_or((40, 40))
+}
+
+/// 在所有可用显示器中，找到包含 (x, y) 的那个，返回其工作区物理像素 bounds。
+/// 用于多屏场景下根据桌宠保存位置定位正确的显示器。
+fn monitor_bounds_for_point(app: &AppHandle, x: i32, y: i32) -> Option<Rect> {
+    let monitors = app.available_monitors().ok()?;
+    for monitor in monitors {
+        let position = monitor.position();
+        let size = monitor.size();
+        let bounds = Rect {
+            x: position.x,
+            y: position.y,
+            width: size.width as i32,
+            height: size.height as i32,
+        };
+        if point_in_rect(x as i64, y as i64, bounds.x as i64, bounds.y as i64, bounds.width as i64, bounds.height as i64) {
+            let work_area = monitor.work_area();
+            return Some(Rect {
+                x: work_area.position.x,
+                y: work_area.position.y,
+                width: work_area.size.width as i32,
+                height: work_area.size.height as i32,
+            });
+        }
+    }
+    None
 }
 
 fn compute_avatar_position(
@@ -1082,5 +1122,69 @@ mod tests {
         let (x, y) = clamp_avatar_position_with_size(bounds, 120, 200, compact_w, compact_h);
 
         assert_eq!((x, y), (120, 200));
+    }
+
+    /// 多屏场景：主屏 1440x900 在原点，副屏在 (1440, 0)，尺寸 1920x1080。
+    /// 验证保存的副屏坐标在用副屏 bounds clamp 时，仍落在副屏内（不被拉回主屏）。
+    #[test]
+    fn 多屏下副屏坐标应保留在副屏工作区内() {
+        let secondary_bounds = Rect {
+            x: 1440,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        };
+        let saved = (2200, 800);
+        let (compact_w, compact_h) = avatar_window_size(0.9, false);
+
+        let (x, y) =
+            clamp_avatar_position_with_size(secondary_bounds, saved.0, saved.1, compact_w, compact_h);
+
+        // 仍在副屏内（x >= 1440），且未被错误地拉回主屏原点附近
+        assert!(
+            x >= secondary_bounds.x,
+            "副屏坐标 x={x} 不应被钳制到主屏（x<{}）",
+            secondary_bounds.x
+        );
+        assert_eq!((x, y), saved);
+    }
+
+    /// 多屏场景：副屏坐标用主屏 bounds clamp 时会越界 —— 这正是 #120 的 bug 行为，
+    /// 用于回归验证修复后我们改用副屏 bounds 的必要性。
+    #[test]
+    fn 多屏下副屏坐标若误用主屏bounds会被错误钳制() {
+        let primary_bounds = Rect {
+            x: 0,
+            y: 0,
+            width: 1440,
+            height: 900,
+        };
+        let (compact_w, compact_h) = avatar_window_size(0.9, false);
+        let saved = (2200, 800);
+
+        let (x, y) =
+            clamp_avatar_position_with_size(primary_bounds, saved.0, saved.1, compact_w, compact_h);
+
+        // 用主屏 bounds 时副屏 x=2200 会被钳到主屏右边缘 —— 这是要避免的行为
+        assert_eq!(x, primary_bounds.x + primary_bounds.width - compact_w as i32);
+        assert_ne!((x, y), saved);
+    }
+
+    /// 多屏场景：保存坐标的副屏被拔掉（不在任何 monitor 上）时，
+    /// resolve_avatar_position 应回退到传入 monitor 的 bounds，仍给出合法可视位置。
+    #[test]
+    fn 已保存坐标超出所有屏幕时应回退到可用显示器可视区域() {
+        let fallback_bounds = Rect {
+            x: 0,
+            y: 0,
+            width: 1440,
+            height: 900,
+        };
+        let orphan_saved = (5000, 5000);
+
+        let (x, y) = resolve_avatar_position(fallback_bounds, None, Some(orphan_saved), 0.9);
+
+        let (w, h) = avatar_window_size(0.9, false);
+        assert_eq!((x, y), (fallback_bounds.x + fallback_bounds.width - w as i32, fallback_bounds.y + fallback_bounds.height - h as i32));
     }
 }
