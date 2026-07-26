@@ -93,6 +93,11 @@
       en: { name: 'OpenAI / Compatible', description: 'Official OpenAI and compatible endpoints (Azure, Cloudflare, etc.)' },
       'zh-TW': { name: 'OpenAI / 相容 API', description: '支援官方與相容端點（Azure、Cloudflare 等）' },
     },
+    atlascloud: {
+      'zh-CN': { name: 'Atlas Cloud', description: 'OpenAI 兼容的多模型文本推理 API' },
+      en: { name: 'Atlas Cloud', description: 'Multi-model text inference with an OpenAI-compatible API' },
+      'zh-TW': { name: 'Atlas Cloud', description: '支援 OpenAI 相容格式的多模型文字推論 API' },
+    },
     siliconflow: {
       'zh-CN': { name: '硅基流动 SiliconFlow', description: '国内高性价比 API' },
       en: { name: 'SiliconFlow', description: 'Cost-effective domestic API' },
@@ -250,6 +255,7 @@
   const PROVIDER_BRAND = {
     ollama: '#111827',
     openai: '#10a37f',
+    atlascloud: '#2563eb',
     siliconflow: '#6e4ff6',
     deepseek: '#4d6bfe',
     qwen: '#615ced',

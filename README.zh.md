@@ -197,7 +197,7 @@ Work Review 的核心始终是**本地记录**。AI 的作用是让记录更容�
 | **基础模板** | 零配置，输出稳定的结构化结果 |
 | **AI 增强** | 调用你自行配置的模型服务，让问答和总结更自然 |
 
-支持的提供商：Ollama (本地) / LM Studio (本地) / OpenAI 兼容 / DeepSeek / 通义千问 / 智谱 / Kimi / 豆包 / MiniMax / SiliconFlow / Gemini / Claude / OpenRouter / Groq / xAI Grok / Mistral / 自定义接口
+支持的提供商：Ollama (本地) / LM Studio (本地) / OpenAI 兼容 / Atlas Cloud / DeepSeek / 通义千问 / 智谱 / Kimi / 豆包 / MiniMax / SiliconFlow / Gemini / Claude / OpenRouter / Groq / xAI Grok / Mistral / 自定义接口
 
 ---
 

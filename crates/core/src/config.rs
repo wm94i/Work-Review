@@ -23,6 +23,9 @@ pub enum AiProvider {
     Ollama,
     /// OpenAI / OpenAI Compatible
     OpenAI,
+    /// Atlas Cloud (OpenAI Compatible)
+    #[serde(rename = "atlascloud")]
+    AtlasCloud,
     /// Google Gemini
     Gemini,
     /// Anthropic Claude
@@ -80,6 +83,7 @@ impl AiProvider {
         match self {
             AiProvider::Ollama => "Ollama (本地)",
             AiProvider::OpenAI => "OpenAI / 兼容API",
+            AiProvider::AtlasCloud => "Atlas Cloud",
             AiProvider::Gemini => "Google Gemini",
             AiProvider::Claude => "Anthropic Claude",
             AiProvider::SiliconFlow => "硅基流动 SiliconFlow",
@@ -103,6 +107,7 @@ impl AiProvider {
         match self {
             AiProvider::Ollama => "http://localhost:11434",
             AiProvider::OpenAI => "https://api.openai.com/v1",
+            AiProvider::AtlasCloud => "https://api.atlascloud.ai/v1",
             AiProvider::Gemini => "https://generativelanguage.googleapis.com/v1",
             AiProvider::Claude => "https://api.anthropic.com/v1",
             AiProvider::SiliconFlow => "https://api.siliconflow.cn/v1",
@@ -126,6 +131,7 @@ impl AiProvider {
         match self {
             AiProvider::Ollama => "qwen3",
             AiProvider::OpenAI => "gpt-5.4",
+            AiProvider::AtlasCloud => "deepseek-ai/deepseek-v4-pro",
             AiProvider::Gemini => "gemini-3-flash",
             AiProvider::Claude => "claude-sonnet-4-6",
             AiProvider::SiliconFlow => "Qwen/Qwen3-8B",
@@ -149,6 +155,7 @@ impl AiProvider {
         matches!(
             self,
             AiProvider::OpenAI
+                | AiProvider::AtlasCloud
                 | AiProvider::SiliconFlow
                 | AiProvider::DeepSeek
                 | AiProvider::Qwen
@@ -2557,6 +2564,19 @@ mod tests {
             "https://api.minimaxi.com/v1"
         );
         assert_eq!(AiProvider::MiniMax.default_model(), "MiniMax-M2.5");
+    }
+
+    #[test]
+    fn atlas_cloud应使用_openai_兼容配置() {
+        assert!(AiProvider::AtlasCloud.is_openai_compatible());
+        assert_eq!(
+            AiProvider::AtlasCloud.default_endpoint(),
+            "https://api.atlascloud.ai/v1"
+        );
+        assert_eq!(
+            AiProvider::AtlasCloud.default_model(),
+            "deepseek-ai/deepseek-v4-pro"
+        );
     }
 
     #[test]

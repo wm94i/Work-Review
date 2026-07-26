@@ -51,6 +51,7 @@
       en: 'OpenAI Compatible',
       'zh-TW': 'OpenAI 相容',
     },
+    atlascloud: { 'zh-CN': 'Atlas Cloud', en: 'Atlas Cloud', 'zh-TW': 'Atlas Cloud' },
     siliconflow: {
       'zh-CN': '硅基流动',
       en: 'SiliconFlow',

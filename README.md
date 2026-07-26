@@ -197,7 +197,7 @@ The core of Work Review is always **local recording**. AI's role is to make reco
 | **Basic Template** | Zero configuration, outputs stable structured results |
 | **AI Enhanced** | Calls your self-configured model service for more natural Q&A and summaries |
 
-Supported providers: Ollama (local) / LM Studio (local) / OpenAI compatible / DeepSeek / Qwen / Zhipu / Kimi / Doubao / MiniMax / SiliconFlow / Gemini / Claude / OpenRouter / Groq / xAI Grok / Mistral / Custom endpoint
+Supported providers: Ollama (local) / LM Studio (local) / OpenAI compatible / Atlas Cloud / DeepSeek / Qwen / Zhipu / Kimi / Doubao / MiniMax / SiliconFlow / Gemini / Claude / OpenRouter / Groq / xAI Grok / Mistral / Custom endpoint
 
 ---
 

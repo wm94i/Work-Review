@@ -867,6 +867,15 @@ pub async fn get_ai_providers() -> Result<Vec<serde_json::Value>, AppError> {
             "supports_vision": false,
         }),
         serde_json::json!({
+            "id": "atlascloud",
+            "name": "Atlas Cloud",
+            "description": "OpenAI 兼容的多模型文本推理 API",
+            "default_endpoint": "https://api.atlascloud.ai/v1",
+            "default_model": "deepseek-ai/deepseek-v4-pro",
+            "requires_api_key": true,
+            "supports_vision": false,
+        }),
+        serde_json::json!({
             "id": "siliconflow",
             "name": "硅基流动 SiliconFlow",
             "description": "国内高性价比 API，兼容 OpenAI 格式",
