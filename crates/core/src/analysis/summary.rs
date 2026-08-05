@@ -236,18 +236,84 @@ fn request_ai_fallback_reason(locale: AppLocale, error_text: &str) -> String {
     reason.to_string()
 }
 
-/// 从成功响应中读取正文；字段缺失或类型不匹配属于响应格式异常，空字符串由上层单独处理。
-fn extract_ai_text(response: &serde_json::Value, pointer: &str, provider: &str) -> Result<String> {
-    let text = response
-        .pointer(pointer)
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| {
-            AppError::Analysis(format!(
-                "{provider} malformed response: expected text at {pointer}"
-            ))
-        })?;
+/// 截断 JSON 用于日志，避免把整个大响应塞进日志。
+fn preview_json(value: &serde_json::Value) -> String {
+    value.to_string().chars().take(300).collect()
+}
 
-    Ok(text.trim().to_string())
+/// 从 OpenAI 兼容响应中提取正文。
+/// 对 content 为 null / 缺失 / 类型异常保持宽容（推理模型、截断输出常见），
+/// 一律返回空串交给上层"空内容"友好回退，不再误报"响应格式异常"。
+/// 思考内容（reasoning_content）不是最终回答，不作为正文来源。
+fn extract_openai_text(response: &serde_json::Value) -> String {
+    let text = response["choices"]
+        .as_array()
+        .and_then(|choices| {
+            choices.iter().find_map(|choice| {
+                choice["message"]["content"]
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|t| !t.is_empty())
+            })
+        })
+        .unwrap_or("")
+        .to_string();
+    if text.is_empty() {
+        log::warn!(
+            "OpenAI 兼容响应未提取到可用正文: {}",
+            preview_json(response)
+        );
+    }
+    text
+}
+
+/// 从 Ollama /api/generate 响应中提取正文；字段缺失按空内容回退处理。
+fn extract_ollama_text(response: &serde_json::Value) -> String {
+    let text = response["response"].as_str().unwrap_or("").trim().to_string();
+    if text.is_empty() {
+        log::warn!("Ollama 响应未提取到可用正文: {}", preview_json(response));
+    }
+    text
+}
+
+/// 从 Claude 响应中提取正文：拼接所有 text 块，跳过 thinking 块；无 text 块返回空串。
+fn extract_claude_text(response: &serde_json::Value) -> String {
+    let mut text = String::new();
+    if let Some(blocks) = response["content"].as_array() {
+        for block in blocks {
+            if block["type"].as_str() == Some("text") {
+                if let Some(part) = block["text"].as_str() {
+                    text.push_str(part);
+                }
+            }
+        }
+    }
+    let text = text.trim().to_string();
+    if text.is_empty() {
+        log::warn!("Claude 响应未提取到可用正文: {}", preview_json(response));
+    }
+    text
+}
+
+/// 从 Gemini 响应中提取正文：拼接所有非思考 part 的文本。
+/// 思考模型的 thought part 与安全拦截（candidates 为空）都不会误报格式异常。
+fn extract_gemini_text(response: &serde_json::Value) -> String {
+    let mut text = String::new();
+    if let Some(parts) = response["candidates"][0]["content"]["parts"].as_array() {
+        for part in parts {
+            if part["thought"].as_bool() == Some(true) {
+                continue;
+            }
+            if let Some(part_text) = part["text"].as_str() {
+                text.push_str(part_text);
+            }
+        }
+    }
+    let text = text.trim().to_string();
+    if text.is_empty() {
+        log::warn!("Gemini 响应未提取到可用正文: {}", preview_json(response));
+    }
+    text
 }
 
 fn api_response_error(provider: &str, status: StatusCode, error_text: &str) -> AppError {
@@ -367,7 +433,7 @@ impl SummaryAnalyzer {
         }
 
         let result: serde_json::Value = response.json().await?;
-        extract_ai_text(&result, "/response", "Ollama")
+        Ok(extract_ollama_text(&result))
     }
     async fn generate_with_openai_compatible(&self, prompt: &str) -> Result<String> {
         // 第一轮：不设 max_tokens，让模型用自身默认值
@@ -448,7 +514,7 @@ impl SummaryAnalyzer {
             }
 
             let result: serde_json::Value = response.json().await?;
-            return extract_ai_text(&result, "/choices/0/message/content", "OpenAI-compatible");
+            return Ok(extract_openai_text(&result));
         }
 
         Err(AppError::Analysis(last_error.unwrap_or_else(|| {
@@ -488,7 +554,7 @@ impl SummaryAnalyzer {
 
             if response.status().is_success() {
                 let result: serde_json::Value = response.json().await?;
-                return extract_ai_text(&result, "/content/0/text", "Claude");
+                return Ok(extract_claude_text(&result));
             }
 
             let status = response.status();
@@ -565,7 +631,7 @@ impl SummaryAnalyzer {
 
         if response.status().is_success() {
             let result: serde_json::Value = response.json().await?;
-            return extract_ai_text(&result, "/candidates/0/content/parts/0/text", "Gemini");
+            return Ok(extract_gemini_text(&result));
         }
 
         let status = response.status();
@@ -1159,9 +1225,9 @@ impl Analyzer for SummaryAnalyzer {
 #[cfg(test)]
 mod tests {
     use super::{
-        api_response_error, empty_ai_fallback_reason, extract_ai_text,
-        openai_compatible_chat_completion_urls, request_ai_fallback_reason,
-        summary_request_timeout, SummaryAnalyzer,
+        api_response_error, empty_ai_fallback_reason, extract_claude_text, extract_gemini_text,
+        extract_ollama_text, extract_openai_text, openai_compatible_chat_completion_urls,
+        request_ai_fallback_reason, summary_request_timeout, SummaryAnalyzer,
     };
     use crate::analysis::Analyzer;
     use crate::analysis::AppLocale;
@@ -1292,29 +1358,56 @@ mod tests {
     }
 
     #[test]
-    fn ai响应字段缺失或类型错误应归类为响应格式异常() {
+    fn ai响应无可用正文应返回空串交给空内容友好回退而非误报格式异常() {
+        // 推理模型 content=null、choices 为空、content 类型异常、纯空白，
+        // 都应宽容返回空串，由上层走"返回空内容"友好回退，而不是误报"响应格式异常"。
         for response in [
             serde_json::json!({ "choices": [] }),
+            serde_json::json!({ "choices": [{ "message": { "content": null } }] }),
             serde_json::json!({ "choices": [{ "message": { "content": 42 } }] }),
+            serde_json::json!({ "choices": [{ "message": { "content": "  " } }] }),
+            serde_json::json!({}),
         ] {
-            let error =
-                extract_ai_text(&response, "/choices/0/message/content", "OpenAI-compatible")
-                    .expect_err("缺失或非字符串的正文应报响应格式异常");
-
             assert_eq!(
-                request_ai_fallback_reason(AppLocale::ZhCn, &error.to_string()),
-                "响应格式异常，已回退到基础模板"
+                extract_openai_text(&response),
+                "",
+                "应宽容返回空串: {response}"
             );
         }
+        assert_eq!(extract_ollama_text(&serde_json::json!({})), "");
+        assert_eq!(extract_claude_text(&serde_json::json!({})), "");
+        assert_eq!(extract_gemini_text(&serde_json::json!({ "candidates": [] })), "");
+    }
 
+    #[test]
+    fn ai响应正文提取应兼容推理模型与思考块() {
+        // OpenAI 兼容：正常 content 应取出
         assert_eq!(
-            extract_ai_text(
-                &serde_json::json!({ "choices": [{ "message": { "content": "  " } }] }),
-                "/choices/0/message/content",
-                "OpenAI-compatible",
-            )
-            .expect("存在的空字符串应留给空内容回退处理"),
-            ""
+            extract_openai_text(&serde_json::json!({
+                "choices": [{ "message": { "content": "  今日分析  " } }]
+            })),
+            "今日分析"
+        );
+        // Claude：跳过 thinking 块，拼接 text 块
+        assert_eq!(
+            extract_claude_text(&serde_json::json!({
+                "content": [
+                    { "type": "thinking", "thinking": "内部推理" },
+                    { "type": "text", "text": "结论A" },
+                    { "type": "text", "text": "结论B" }
+                ]
+            })),
+            "结论A结论B"
+        );
+        // Gemini：跳过 thought part，拼接正文 part
+        assert_eq!(
+            extract_gemini_text(&serde_json::json!({
+                "candidates": [{ "content": { "parts": [
+                    { "text": "思考过程", "thought": true },
+                    { "text": "最终回答" }
+                ] } }]
+            })),
+            "最终回答"
         );
     }
 
