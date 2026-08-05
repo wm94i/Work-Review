@@ -129,6 +129,9 @@
     try {
       const config = await invoke('get_config');
       modelProfiles = config.text_model_profiles || [];
+      if (config.assistant_timeout_secs) {
+        askTimeoutMs = (config.assistant_timeout_secs + 30) * 1000;
+      }
       if (
         selectedModelId !== BASIC_ASSISTANT_MODEL_ID &&
         !modelProfiles.some((profile) => profile.id === selectedModelId)
@@ -589,7 +592,9 @@
     }
   }
 
-  const ASK_TIMEOUT_MS = 120_000;
+  // 助手回答超时来自用户配置（assistant_timeout_secs）；前端兜底比后端墙钟多留
+  // 30s，让后端收束路径（基于已有工具结果产出答案）能正常返回，而不是被前端先掐断。
+  let askTimeoutMs = 150_000;
 
   function withTimeout(promise, ms) {
     let timer;
@@ -663,7 +668,7 @@
           requestId: assistantMessageId,
           onEvent: channel,
         }),
-        ASK_TIMEOUT_MS
+        askTimeoutMs
       );
 
       // 事件优先：已收到 done/error 则保留事件内容；否则用 await 返回值兜底。

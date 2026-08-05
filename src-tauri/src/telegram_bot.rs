@@ -340,7 +340,16 @@ async fn run(
                                             send_text(&client, bot_token, msg.chat.id, progress)
                                                 .await;
                                         }
-                                        handle_cmd(&client, &devices, text).await
+                                        handle_cmd(
+                                            &client,
+                                            &devices,
+                                            text,
+                                            state
+                                                .lock()
+                                                .map(|s| s.config.report_generation_timeout_secs)
+                                                .unwrap_or(300),
+                                        )
+                                        .await
                                     } else {
                                         Some(NON_TEXT_REPLY.to_string())
                                     };

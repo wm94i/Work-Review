@@ -319,7 +319,7 @@ pub async fn handle_wecom_callback(
     };
 
     // WeCom 被动回复必须在 5 秒内返回，所以不发送"处理中"提示，直接执行命令并回包。
-    let reply = handle_cmd(&client, &devices, &text)
+    let reply = handle_cmd(&client, &devices, &text, config.report_generation_timeout_secs)
         .await
         .unwrap_or_else(|| UNKNOWN_CMD_REPLY.to_string());
 

@@ -180,7 +180,7 @@ pub(crate) async fn generate_report_inner(
         );
     }
 
-    // 创建分析器（使用 text_model 配置）
+    // 创建分析器（使用 text_model 配置；AI 请求预算来自用户配置的日报生成超时）
     let analyzer = crate::analysis::create_analyzer(
         config.ai_mode,
         config.text_model.provider,
@@ -196,10 +196,11 @@ pub(crate) async fn generate_report_inner(
         } else {
             Some(config.daily_report_last_ai_order.clone())
         },
+        config.report_ai_request_timeout_secs(),
     );
 
     // 生成报告（spawn 隔离 panic，防止内部错误杀死整个 tokio 线程）
-    // 外层加 300 秒总超时，防止 AI 调用卡死后前端永远等待
+    // 外层总超时来自用户配置，防止 AI 调用卡死后前端永远等待
     let screenshots_dir = data_dir.clone();
     let date_gen = date.clone();
     let category_name_overrides: std::collections::HashMap<String, String> = config
@@ -226,8 +227,12 @@ pub(crate) async fn generate_report_inner(
             .await
     });
 
-    let report_result =
-        match tokio::time::timeout(std::time::Duration::from_secs(300), spawn_result).await {
+    let report_result = match tokio::time::timeout(
+        std::time::Duration::from_secs(config.report_generation_timeout_secs),
+        spawn_result,
+    )
+    .await
+    {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err(work_review_core::error::AppError::Analysis(
                 match report_locale {

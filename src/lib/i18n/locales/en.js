@@ -985,6 +985,13 @@ export default {
       manualModel: 'Enter manually...',
       backToList: 'Back to list',
       loadedModels: 'Fetched {count} models',
+      timeouts: {
+        assistant: 'Assistant reply timeout',
+        assistantHint: 'Max time to wait for a model reply; raise it for slow local models',
+        report: 'Report generation timeout',
+        reportHint: 'Overall deadline for AI report generation; falls back to the base template on timeout',
+        secondsUnit: 'sec',
+      },
       aiModeDisabled: 'Switch to AI Enhanced mode to configure',
       webAccess: {
         title: 'Assistant web access',

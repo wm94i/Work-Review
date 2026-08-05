@@ -273,16 +273,23 @@ fn build_generate_report_request(
     client: &Client,
     device: &DeviceEndpoint,
     date: &str,
+    report_timeout_secs: u64,
 ) -> reqwest::RequestBuilder {
     let url = format!("{}/v1/reports/generate", device.url.trim_end_matches('/'));
     client
         .post(url)
         .bearer_auth(&device.token)
         .json(&serde_json::json!({ "date": date }))
-        .timeout(Duration::from_secs(120))
+        // 设备侧有自己的日报生成超时；委托方多留 30s 缓冲，避免设备还没收尾委托先超时
+        .timeout(Duration::from_secs(report_timeout_secs.saturating_add(30)))
 }
 
-pub async fn handle_cmd(client: &Client, devices: &[DeviceEndpoint], text: &str) -> Option<String> {
+pub async fn handle_cmd(
+    client: &Client,
+    devices: &[DeviceEndpoint],
+    text: &str,
+    report_timeout_secs: u64,
+) -> Option<String> {
     let parts: Vec<&str> = text.split_whitespace().collect();
     let cmd = normalize_command(parts.first().copied().unwrap_or(""));
     if cmd.is_empty() {
@@ -410,9 +417,9 @@ pub async fn handle_cmd(client: &Client, devices: &[DeviceEndpoint], text: &str)
                 Ok(d) => d,
                 Err(reply) => return Some(reply),
             };
-            // 日报生成可长达 120 秒，而企微等被动回复通道 5 秒即超时；
+            // 日报生成耗时由用户配置（可达数百秒），而企微等被动回复通道 5 秒即超时；
             // 因此改为后台任务生成 + 立即回执，结果通过 /report 查询。
-            let request = build_generate_report_request(client, device, &date);
+            let request = build_generate_report_request(client, device, &date, report_timeout_secs);
             let device_name = device.name.clone();
             let task_date = date.clone();
             tokio::spawn(async move {
@@ -462,7 +469,7 @@ mod tests {
             is_local: true,
         };
 
-        let request = build_generate_report_request(&client, &device, "2026-07-21")
+        let request = build_generate_report_request(&client, &device, "2026-07-21", 300)
             .build()
             .expect("请求应可构造");
 
@@ -485,7 +492,7 @@ mod tests {
             .expect("JSON Body 应存在");
         let payload: serde_json::Value = serde_json::from_slice(body).expect("JSON Body 应合法");
         assert_eq!(payload, serde_json::json!({ "date": "2026-07-21" }));
-        assert_eq!(request.timeout(), Some(&Duration::from_secs(120)));
+        assert_eq!(request.timeout(), Some(&Duration::from_secs(330)));
     }
 
     #[test]
@@ -533,7 +540,7 @@ mod tests {
     async fn handle_cmd_help命令应返回帮助文本() {
         let client = dummy_client();
         let devices: Vec<DeviceEndpoint> = Vec::new();
-        let reply = handle_cmd(&client, &devices, "/help").await.unwrap();
+        let reply = handle_cmd(&client, &devices, "/help", 300).await.unwrap();
         assert!(reply.contains("Work Review Bot"));
         assert!(reply.contains("/devices"));
     }
@@ -542,7 +549,7 @@ mod tests {
     async fn handle_cmd_中文帮助别名应等价() {
         let client = dummy_client();
         let devices: Vec<DeviceEndpoint> = Vec::new();
-        let reply = handle_cmd(&client, &devices, "帮助").await.unwrap();
+        let reply = handle_cmd(&client, &devices, "帮助", 300).await.unwrap();
         assert!(reply.contains("Work Review Bot"));
     }
 
@@ -550,7 +557,7 @@ mod tests {
     async fn handle_cmd_未知命令应返回未知提示() {
         let client = dummy_client();
         let devices: Vec<DeviceEndpoint> = Vec::new();
-        let reply = handle_cmd(&client, &devices, "/random_garbage")
+        let reply = handle_cmd(&client, &devices, "/random_garbage", 300)
             .await
             .unwrap();
         assert_eq!(reply, UNKNOWN_CMD_REPLY);
@@ -560,7 +567,7 @@ mod tests {
     async fn handle_cmd_空文本应返回未知提示() {
         let client = dummy_client();
         let devices: Vec<DeviceEndpoint> = Vec::new();
-        let reply = handle_cmd(&client, &devices, "").await.unwrap();
+        let reply = handle_cmd(&client, &devices, "", 300).await.unwrap();
         assert_eq!(reply, UNKNOWN_CMD_REPLY);
     }
 
@@ -569,21 +576,21 @@ mod tests {
         let client = dummy_client();
         let devices: Vec<DeviceEndpoint> = Vec::new();
         // /devices 命中 devices.is_empty() 分支
-        let reply = handle_cmd(&client, &devices, "/devices").await.unwrap();
+        let reply = handle_cmd(&client, &devices, "/devices", 300).await.unwrap();
         assert!(reply.contains("无可用设备"));
         // /device 应通过 find_device 找不到设备时回落到无可用设备提示
-        let reply = handle_cmd(&client, &devices, "/device").await.unwrap();
+        let reply = handle_cmd(&client, &devices, "/device", 300).await.unwrap();
         assert!(reply.contains("无可用设备"));
         // /reports
-        let reply = handle_cmd(&client, &devices, "/reports").await.unwrap();
+        let reply = handle_cmd(&client, &devices, "/reports", 300).await.unwrap();
         assert!(reply.contains("无可用设备"));
         // /report
-        let reply = handle_cmd(&client, &devices, "/report today")
+        let reply = handle_cmd(&client, &devices, "/report today", 300)
             .await
             .unwrap();
         assert!(reply.contains("无可用设备"));
         // /generate
-        let reply = handle_cmd(&client, &devices, "/generate today")
+        let reply = handle_cmd(&client, &devices, "/generate today", 300)
             .await
             .unwrap();
         assert!(reply.contains("无可用设备"));
@@ -595,7 +602,7 @@ mod tests {
         let devices: Vec<DeviceEndpoint> = Vec::new();
         // 这些命令都没有设备，全部应返回"无可用设备"，证明中英文别名都正确分发了。
         for cmd in ["设备列表", "设备", "日报列表", "日报", "生成日报"] {
-            let reply = handle_cmd(&client, &devices, cmd).await.unwrap();
+            let reply = handle_cmd(&client, &devices, cmd, 300).await.unwrap();
             assert!(
                 reply.contains("无可用设备"),
                 "命令 {cmd} 应该分发到无设备分支，实际：{reply}"
@@ -608,7 +615,7 @@ mod tests {
         let client = dummy_client();
         let devices: Vec<DeviceEndpoint> = Vec::new();
         // 大写 + 多空白 + @机器人后缀都应被 normalize_command 处理
-        let reply = handle_cmd(&client, &devices, "  /HELP@work_review_bot  ")
+        let reply = handle_cmd(&client, &devices, "  /HELP@work_review_bot  ", 300)
             .await
             .unwrap();
         assert!(reply.contains("Work Review Bot"));

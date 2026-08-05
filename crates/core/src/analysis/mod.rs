@@ -120,14 +120,16 @@ pub fn create_analyzer(
     locale: AppLocale,
     pinned_blocks: Vec<String>,
     cached_ai_order: Option<Vec<String>>,
+    ai_request_timeout_secs: u64,
 ) -> Box<dyn Analyzer + Send + Sync> {
     log::info!(
-        "create_analyzer: mode={:?}, provider={:?}, endpoint={}, model={}, has_api_key={}",
+        "create_analyzer: mode={:?}, provider={:?}, endpoint={}, model={}, has_api_key={}, ai_timeout={}s",
         mode,
         provider,
         endpoint,
         model,
-        api_key.is_some()
+        api_key.is_some(),
+        ai_request_timeout_secs
     );
     match mode {
         AiMode::Local => Box::new(local::LocalAnalyzer::new(
@@ -136,6 +138,7 @@ pub fn create_analyzer(
             custom_prompt,
             locale,
             pinned_blocks,
+            ai_request_timeout_secs,
         )),
         AiMode::Summary => Box::new(summary::SummaryAnalyzer::new(
             provider,
@@ -147,6 +150,7 @@ pub fn create_analyzer(
             locale,
             pinned_blocks,
             cached_ai_order,
+            ai_request_timeout_secs,
         )),
         AiMode::Cloud => Box::new(cloud::CloudAnalyzer::new(
             endpoint,
@@ -154,6 +158,7 @@ pub fn create_analyzer(
             model,
             custom_prompt,
             locale,
+            ai_request_timeout_secs,
         )),
     }
 }

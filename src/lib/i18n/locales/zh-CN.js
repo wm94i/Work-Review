@@ -969,6 +969,13 @@ export default {
       manualModel: '手动输入...',
       backToList: '返回列表',
       loadedModels: '已获取 {count} 个模型',
+      timeouts: {
+        assistant: '助手回答超时',
+        assistantHint: '等待模型回答的最长时间，本地大模型反应慢时可调大',
+        report: '日报生成超时',
+        reportHint: '日报 AI 生成的总截止时间，超时自动回退基础模板',
+        secondsUnit: '秒',
+      },
       aiModeDisabled: '切换到「AI 增强」模式后配置',
       webAccess: {
         title: '助手联网能力',

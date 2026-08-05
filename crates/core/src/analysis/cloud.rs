@@ -56,9 +56,10 @@ impl CloudAnalyzer {
         model: &str,
         custom_prompt: &str,
         locale: AppLocale,
+        ai_request_timeout_secs: u64,
     ) -> Self {
         let client = Client::builder()
-            .timeout(Duration::from_secs(60))
+            .timeout(Duration::from_secs(ai_request_timeout_secs))
             .connect_timeout(Duration::from_secs(10))
             .build()
             .unwrap_or_else(|_| Client::new());

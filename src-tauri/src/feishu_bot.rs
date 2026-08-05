@@ -297,7 +297,7 @@ pub async fn handle_feishu_webhook(
         }
     }
 
-    let reply = handle_cmd(&client, &devices, text)
+    let reply = handle_cmd(&client, &devices, text, config.report_generation_timeout_secs)
         .await
         .unwrap_or_else(|| UNKNOWN_CMD_REPLY.to_string());
 

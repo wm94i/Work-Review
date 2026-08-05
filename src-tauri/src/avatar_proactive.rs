@@ -4,7 +4,7 @@
 //! 要不要开口、说什么、什么语气/表情、以及"下次什么时候再来问我"。
 //! 没配模型时整条链路由主循环短路，本模块不会被调用。
 
-use crate::agent::model::{chat_with_tools, Message};
+use crate::agent::model::{chat_with_tools, Message, ModelTimeouts};
 use crate::avatar_engine::{emit_avatar_bubble, AvatarBubblePayload};
 use crate::config::ModelConfig;
 use tauri::AppHandle;
@@ -58,13 +58,22 @@ pub async fn decide_and_speak(
     avatar_persona: &str,
     locale: &str,
     context: &ProactiveContext,
+    timeout_secs: u64,
 ) -> ProactiveOutcome {
     let now_ms = chrono::Local::now().timestamp_millis() as u64;
 
     let system = build_system_prompt(avatar_persona, locale);
     let event = build_event_prompt(context, avatar_persona);
 
-    let response = match chat_with_tools(text_model, &system, &[Message::user(&event)], &[]).await {
+    let response = match chat_with_tools(
+        text_model,
+        &system,
+        &[Message::user(&event)],
+        &[],
+        ModelTimeouts::from_assistant_timeout_secs(timeout_secs),
+    )
+    .await
+    {
         Ok(r) => r,
         Err(e) => {
             log::warn!("桌宠主动开口 LLM 调用失败: {e}");

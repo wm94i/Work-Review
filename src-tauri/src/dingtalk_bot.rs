@@ -159,7 +159,7 @@ pub async fn handle_dingtalk_callback(
         Err(e) => return DingtalkResponse::error(500, format!("HTTP client error: {e}")),
     };
 
-    let reply = handle_cmd(&client, &devices, &text)
+    let reply = handle_cmd(&client, &devices, &text, config.report_generation_timeout_secs)
         .await
         .unwrap_or_else(|| UNKNOWN_CMD_REPLY.to_string());
 

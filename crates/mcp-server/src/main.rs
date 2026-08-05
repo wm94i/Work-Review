@@ -283,9 +283,9 @@ fn localhost_api_base(config: &AppConfig) -> Option<String> {
 
 /// 低成本委托（live context 等）的快速失败超时。
 const LOCALHOST_QUICK_TIMEOUT_SECS: u64 = 2;
-/// AI 日报生成走完整模型调用链（30~120 秒常见）——此前统一 2 秒超时,
-/// 未缓存的 AI 日报永远委托失败、静默回退本地模板,而主应用侧生成仍在跑完(结果被丢弃)。
-const LOCALHOST_GENERATE_TIMEOUT_SECS: u64 = 120;
+/// AI 日报生成委托的额外缓冲（秒）：主应用侧有自己的生成超时，
+/// 委托方在其基础上多留一点余量，避免主应用还没收尾委托就先超时。
+const LOCALHOST_GENERATE_TIMEOUT_BUFFER_SECS: u64 = 30;
 
 fn build_localhost_get_request(
     config: &AppConfig,
@@ -735,7 +735,9 @@ fn handle_tool_call(name: &str, args: &Value, state: &Arc<Mutex<AppState>>) -> V
                     &s.config,
                     &s.localhost_api_token_path,
                     &path,
-                    LOCALHOST_GENERATE_TIMEOUT_SECS,
+                    s.config
+                        .report_generation_timeout_secs
+                        .saturating_add(LOCALHOST_GENERATE_TIMEOUT_BUFFER_SECS),
                 ) {
                     if let Some(content) = resp.get("content").and_then(|c| c.as_str()) {
                         return json!({

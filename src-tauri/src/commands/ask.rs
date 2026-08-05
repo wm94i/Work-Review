@@ -695,9 +695,10 @@ pub(crate) async fn generate_text_answer_with_model(
     model_config: &ModelConfig,
     system_prompt: &str,
     prompt: &str,
+    timeout_secs: u64,
 ) -> Result<String, AppError> {
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(60))
+        .timeout(Duration::from_secs(timeout_secs))
         .connect_timeout(Duration::from_secs(10))
         .build()
         .map_err(|e| AppError::Unknown(e.to_string()))?;
@@ -1377,6 +1378,7 @@ pub async fn chat_work_assistant(
         web_tools,
         avatar_followups,
         assistant_memory_enabled,
+        timeouts,
     ) = {
         let s = state.lock().map_err(|e| AppError::Unknown(e.to_string()))?;
         let (ignored_apps, excluded_domains) = collect_privacy_filters(&s);
@@ -1396,6 +1398,9 @@ pub async fn chat_work_assistant(
             web_tools,
             s.config.avatar_followups.clone(),
             s.config.assistant_memory_enabled,
+            crate::agent::model::ModelTimeouts::from_assistant_timeout_secs(
+                s.config.assistant_timeout_secs,
+            ),
         )
     };
     let user_memory_capabilities =
@@ -1528,6 +1533,7 @@ pub async fn chat_work_assistant(
             web_tools,
             runtime,
             Some(tx),
+            timeouts,
         ),
     )
     .await;
@@ -1565,8 +1571,13 @@ pub async fn generate_text_with_model(
     model_config: ModelConfig,
     system_prompt: String,
     prompt: String,
+    state: State<'_, Arc<Mutex<AppState>>>,
 ) -> Result<String, AppError> {
-    generate_text_answer_with_model(&model_config, &system_prompt, &prompt).await
+    let timeout_secs = {
+        let s = state.lock().map_err(|e| AppError::Unknown(e.to_string()))?;
+        s.config.assistant_timeout_secs
+    };
+    generate_text_answer_with_model(&model_config, &system_prompt, &prompt, timeout_secs).await
 }
 
 #[cfg(test)]

@@ -1711,6 +1711,7 @@ async fn background_avatar_task(state: Arc<Mutex<AppState>>, app: AppHandle) {
             is_paused,
             break_reminder_enabled,
             break_reminder_interval_minutes,
+            assistant_timeout_secs,
         ) = {
             let state_guard = state.lock().unwrap_or_else(|e| e.into_inner());
             (
@@ -1725,6 +1726,7 @@ async fn background_avatar_task(state: Arc<Mutex<AppState>>, app: AppHandle) {
                 state_guard.is_paused,
                 state_guard.config.break_reminder_enabled,
                 state_guard.config.break_reminder_interval_minutes,
+                state_guard.config.assistant_timeout_secs,
             )
         };
 
@@ -2111,6 +2113,7 @@ async fn background_avatar_task(state: Arc<Mutex<AppState>>, app: AppHandle) {
                 &avatar_persona,
                 "zh-CN",
                 &context,
+                assistant_timeout_secs,
             )
             .await;
             if let Some((mode, expires)) = outcome.mood {
@@ -3625,6 +3628,7 @@ async fn classify_entities_with_model(
     entities: &[String],
     category_options: &str,
     semantic_options: &str,
+    timeout_secs: u64,
 ) -> Option<Vec<(String, String, String)>> {
     let list = entities
         .iter()
@@ -3648,7 +3652,7 @@ async fn classify_entities_with_model(
         format!("{endpoint}/chat/completions")
     };
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(60))
+        .timeout(std::time::Duration::from_secs(timeout_secs))
         .connect_timeout(std::time::Duration::from_secs(10))
         .build()
         .ok()?;
@@ -3716,6 +3720,7 @@ async fn entity_classify_task(state: Arc<Mutex<AppState>>) {
             website_rule_domains,
             app_candidates,
             url_durations,
+            assistant_timeout_secs,
         ) = {
             let guard = state.lock().unwrap_or_else(|e| e.into_inner());
             let model = guard.config.text_model.clone();
@@ -3778,6 +3783,7 @@ async fn entity_classify_task(state: Arc<Mutex<AppState>>) {
                 website_rule_domains,
                 app_candidates,
                 url_durations,
+                guard.config.assistant_timeout_secs,
             )
         };
 
@@ -3843,9 +3849,14 @@ async fn entity_classify_task(state: Arc<Mutex<AppState>>) {
             continue;
         }
 
-        let Some(results) =
-            classify_entities_with_model(&model, &entities, &category_options, &semantic_options)
-                .await
+        let Some(results) = classify_entities_with_model(
+            &model,
+            &entities,
+            &category_options,
+            &semantic_options,
+            assistant_timeout_secs,
+        )
+        .await
         else {
             log::warn!("实体自动归类本轮失败,下轮重试");
             tokio::time::sleep(tokio::time::Duration::from_secs(SWEEP_INTERVAL_SECS)).await;

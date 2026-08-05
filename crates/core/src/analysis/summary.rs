@@ -17,9 +17,10 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::time::Duration;
 
-fn summary_request_timeout(_provider: AiProvider, _endpoint: &str) -> Duration {
-    // 日报命令的外层截止时间是 300 秒；给请求留出 60 秒用于回退模板和收尾。
-    Duration::from_secs(240)
+/// 日报命令的外层截止时间由配置决定；请求预算在其基础上预留 60 秒用于回退模板和收尾
+/// （见 AppConfig::report_ai_request_timeout_secs），此处只负责把秒数转成 Duration。
+fn summary_request_timeout(timeout_secs: u64) -> Duration {
+    Duration::from_secs(timeout_secs)
 }
 
 fn format_domain_label(
@@ -306,6 +307,8 @@ pub struct SummaryAnalyzer {
     locale: AppLocale,
     pinned_blocks: Vec<String>,
     cached_ai_order: Option<Vec<String>>,
+    /// AI 请求预算（来自用户配置的日报生成超时）
+    ai_request_timeout: Duration,
     client: Client,
 }
 
@@ -321,9 +324,10 @@ impl SummaryAnalyzer {
         locale: AppLocale,
         pinned_blocks: Vec<String>,
         cached_ai_order: Option<Vec<String>>,
+        ai_request_timeout_secs: u64,
     ) -> Self {
         let client = Client::builder()
-            .timeout(summary_request_timeout(provider, endpoint))
+            .timeout(summary_request_timeout(ai_request_timeout_secs))
             .connect_timeout(Duration::from_secs(10))
             .build()
             .unwrap_or_else(|_| Client::new());
@@ -338,6 +342,7 @@ impl SummaryAnalyzer {
             locale,
             pinned_blocks,
             cached_ai_order,
+            ai_request_timeout: Duration::from_secs(ai_request_timeout_secs),
             client,
         }
     }
@@ -1049,9 +1054,8 @@ impl Analyzer for SummaryAnalyzer {
             }
         }
 
-        // 区块编排和正文分析共享同一个 AI 预算，确保在外层 300 秒截止前仍能生成回退报告。
-        let ai_deadline =
-            tokio::time::Instant::now() + summary_request_timeout(self.provider, &self.endpoint);
+        // 区块编排和正文分析共享同一个 AI 预算，确保在外层截止时间（用户配置）前仍能生成回退报告。
+        let ai_deadline = tokio::time::Instant::now() + self.ai_request_timeout;
 
         // 统计区块：AI 编排顺序 + 用户偏好
         // 有缓存顺序时直接用（记忆性），否则调 LLM 排序。
@@ -1207,6 +1211,7 @@ mod tests {
             locale,
             pinned_blocks: Vec::new(),
             cached_ai_order: None,
+            ai_request_timeout: Duration::from_secs(240),
             client: reqwest::Client::builder()
                 .no_proxy()
                 .build()
@@ -1215,30 +1220,32 @@ mod tests {
     }
 
     #[test]
-    fn 日报_ai请求应统一使用低于外层截止时间的生成预算() {
-        let expected = Duration::from_secs(240);
-        let outer_deadline = Duration::from_secs(300);
+    fn 日报_ai请求预算应来自配置且低于外层截止时间() {
+        let config = crate::config::AppConfig::default();
+        let budget = config.report_ai_request_timeout_secs();
 
+        // 默认外层 300s → 预算 240s，留出回退模板与收尾余量
+        assert_eq!(budget, 240);
         assert_eq!(
-            summary_request_timeout(AiProvider::OpenAI, "http://127.0.0.1:1234/v1"),
-            expected
+            summary_request_timeout(budget),
+            Duration::from_secs(240)
         );
-        assert_eq!(
-            summary_request_timeout(AiProvider::Ollama, "http://localhost:11434"),
-            expected
-        );
-        assert_eq!(
-            summary_request_timeout(AiProvider::OpenAI, "https://api.openai.com/v1"),
-            expected
-        );
-        assert_eq!(
-            summary_request_timeout(
-                AiProvider::Gemini,
-                "https://generativelanguage.googleapis.com/v1"
-            ),
-            expected
-        );
-        assert!(expected < outer_deadline);
+        assert!(budget < config.report_generation_timeout_secs);
+
+        // 外层配置调大/调小时预算同步变化，且始终保留最低请求预算
+        let mut big = crate::config::AppConfig {
+            report_generation_timeout_secs: 1800,
+            ..crate::config::AppConfig::default()
+        };
+        big.normalize();
+        assert_eq!(big.report_ai_request_timeout_secs(), 1740);
+
+        let mut small = crate::config::AppConfig {
+            report_generation_timeout_secs: 60,
+            ..crate::config::AppConfig::default()
+        };
+        small.normalize();
+        assert_eq!(small.report_ai_request_timeout_secs(), 30);
     }
 
     #[test]

@@ -5,6 +5,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### 新增
+- **模型生成超时可配置**：新增「助手回答超时」与「日报生成超时」两项设置（设置 → AI 模型），此前均为硬编码（助手 120s、日报 300s），本地大模型来不及回答时不再被提前掐断；助手问答的 Agent 循环墙钟、单次模型请求、流式总时长与前端等待兜底，以及日报生成的外层截止与 AI 请求预算均随之联动，MCP/机器人委托超时也跟随日报配置。
+
 ## [1.1.0] - 2026-07-31
 
 ### 新增

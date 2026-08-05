@@ -241,6 +241,7 @@ impl Orchestrator {
         web_tools: Option<super::tools::WebToolsConfig>,
         runtime: super::tools::AssistantRuntime,
         event_tx: Option<StreamEventSender>,
+        timeouts: super::model::ModelTimeouts,
     ) -> Result<OrchestratorResult, AppError> {
         let has_model = model_config
             .map(|c| !c.endpoint.trim().is_empty() && !c.model.trim().is_empty())
@@ -294,6 +295,7 @@ impl Orchestrator {
                     web_tools,
                     runtime,
                     event_tx.clone(),
+                    timeouts,
                 )
                 .await
                 {
@@ -888,7 +890,6 @@ mod tests {
         });
         let history = Vec::new();
         let filters = Vec::new();
-
         let handle = Orchestrator::handle(
             "你好",
             None,
@@ -900,6 +901,7 @@ mod tests {
             None,
             Default::default(),
             Some(tx),
+            Default::default(),
         );
         let receive = async {
             assert!(matches!(
@@ -927,7 +929,6 @@ mod tests {
         let (tx, mut rx) = StreamEventSender::channel(1);
         let history = Vec::new();
         let filters = Vec::new();
-
         let handle = Orchestrator::handle(
             "你好",
             None,
@@ -939,6 +940,7 @@ mod tests {
             None,
             Default::default(),
             Some(tx),
+            Default::default(),
         );
         let reject = async {
             let envelope = rx.recv().await.expect("应收到 Done 事件");
@@ -970,7 +972,6 @@ mod tests {
         drop(rx);
         let history = Vec::new();
         let filters = Vec::new();
-
         let error = Orchestrator::handle(
             "分析一下我的工作",
             Some(&model_config),
@@ -982,6 +983,7 @@ mod tests {
             None,
             Default::default(),
             Some(tx),
+            Default::default(),
         )
         .await
         .expect_err("接收端关闭时应终止，而不是继续模型或降级流程");

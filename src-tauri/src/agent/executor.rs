@@ -52,11 +52,9 @@ pub(crate) enum AgentRunError {
 /// 默认最大迭代次数
 const DEFAULT_MAX_ITERATIONS: usize = 8;
 
-/// Agent 循环总时长预算（秒）。
-/// 旧值 30s 对上云端模型 15s+ 的单轮延迟，实际只能跑 1-2 轮，8 轮上限名存实亡。
-/// 现改为 120s，且只在"新一轮开始前"检查——不打断在途轮次，超预算时走
-/// 收束路径（基于已有工具结果强制产出答案），而不是丢弃全部进展。
-const LOOP_WALL_CLOCK_SECS: u64 = 120;
+// Agent 循环总时长预算来自用户配置的助手回答超时（ModelTimeouts::loop_wall_clock）。
+// 只在"新一轮开始前"检查——不打断在途轮次，超预算时走
+// 收束路径（基于已有工具结果强制产出答案），而不是丢弃全部进展。
 
 /// 用户确认等待上限（秒）：前端确认卡片无人响应时按"未批准"收束该操作。
 const CONFIRM_WAIT_SECS: u64 = 180;
@@ -139,6 +137,7 @@ impl AgentExecutor {
         web_tools: Option<WebToolsConfig>,
         runtime: AssistantRuntime,
         event_tx: Option<StreamEventSender>,
+        timeouts: model::ModelTimeouts,
     ) -> Result<AgentResult, AgentRunError> {
         // 注入当前日期上下文（issue #122）：让模型能正确理解"今天/本周/上周"
         // 等相对时间词，避免工具调用时把日期算错。
@@ -212,7 +211,7 @@ impl AgentExecutor {
 
             // 时长预算：只在新一轮开始前检查。超预算且已有工具结果 → 收束路径
             // （最后一次无工具调用，强制模型基于已有结果作答），而不是丢弃进展。
-            if start.elapsed().as_secs() > LOOP_WALL_CLOCK_SECS {
+            if start.elapsed() > timeouts.loop_wall_clock {
                 return Self::wrap_up(
                     model_config,
                     &sys,
@@ -220,6 +219,7 @@ impl AgentExecutor {
                     &tool_context,
                     tool_labels,
                     &event_tx,
+                    timeouts,
                 )
                 .await;
             }
@@ -237,6 +237,7 @@ impl AgentExecutor {
                             &sys,
                             &messages,
                             &tools,
+                            timeouts,
                             &mut on_text,
                         )
                         .await
@@ -244,7 +245,7 @@ impl AgentExecutor {
                     batcher.flush(&event_tx);
                     result
                 } else {
-                    model::chat_with_tools(model_config, &sys, &messages, &tools).await
+                    model::chat_with_tools(model_config, &sys, &messages, &tools, timeouts).await
                 }
             })
             .await?;
@@ -442,6 +443,7 @@ impl AgentExecutor {
             &tool_context,
             tool_labels,
             &event_tx,
+            timeouts,
         )
         .await
     }
@@ -456,6 +458,7 @@ impl AgentExecutor {
         tool_context: &super::tools::ToolContext<'_>,
         tool_labels: Vec<String>,
         event_tx: &Option<StreamEventSender>,
+        timeouts: model::ModelTimeouts,
     ) -> Result<AgentResult, AgentRunError> {
         let fallback = if tool_labels.is_empty() {
             "处理超时，请尝试更具体的问题。".to_string()
@@ -489,6 +492,7 @@ impl AgentExecutor {
                         sys,
                         &*messages,
                         &no_tools,
+                        timeouts,
                         &mut on_text,
                     )
                     .await
@@ -496,7 +500,7 @@ impl AgentExecutor {
                 batcher.flush(event_tx);
                 result
             } else {
-                model::chat_with_tools(model_config, sys, &*messages, &no_tools).await
+                model::chat_with_tools(model_config, sys, &*messages, &no_tools, timeouts).await
             }
         })
         .await?;

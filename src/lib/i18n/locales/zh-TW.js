@@ -970,6 +970,13 @@ export default {
       manualModel: '手動輸入...',
       backToList: '返回列表',
       loadedModels: '已取得 {count} 個模型',
+      timeouts: {
+        assistant: '助手回答逾時',
+        assistantHint: '等待模型回答的最長時間，本機大模型反應慢時可調大',
+        report: '日報生成逾時',
+        reportHint: '日報 AI 生成的總截止時間，逾時自動退回基礎模板',
+        secondsUnit: '秒',
+      },
       aiModeDisabled: '切換到「AI 增強」模式後可配置 AI 模型',
       webAccess: {
         title: '助手聯網能力',

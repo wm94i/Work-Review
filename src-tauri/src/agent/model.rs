@@ -12,7 +12,7 @@ use serde_json::{json, Value};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-/// 非流式共享 HTTP 客户端（整体 60s / 连接 10s 超时）。
+/// 非流式共享 HTTP 客户端（连接 10s 超时；整体超时按调用方配置的预算逐请求设置）。
 /// 进程内复用连接池，避免每次模型调用都重建客户端与 TLS 连接。
 static CHAT_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 /// 流式共享 HTTP 客户端：只限连接超时，读取由逐块 idle + 总时长双护栏控制。
@@ -23,7 +23,6 @@ fn chat_client() -> Result<&'static reqwest::Client, AppError> {
         return Ok(client);
     }
     let built = reqwest::Client::builder()
-        .timeout(Duration::from_secs(60))
         .connect_timeout(Duration::from_secs(10))
         .build()
         .map_err(|e| AppError::Unknown(e.to_string()))?;
@@ -41,6 +40,44 @@ fn stream_client() -> Result<&'static reqwest::Client, AppError> {
     Ok(STREAM_CLIENT.get_or_init(|| built))
 }
 
+
+/// 模型调用超时预算（由用户配置的"助手回答超时"派生）。
+/// 单次模型调用不允许超过用户的整体耐心；多轮总预算由 executor 墙钟控制。
+#[derive(Debug, Clone, Copy)]
+pub struct ModelTimeouts {
+    /// 单次非流式请求整体超时
+    pub request_total: Duration,
+    /// 单次流式响应总时长上限
+    pub stream_total: Duration,
+    /// 流式逐块空闲超时（连接死了要快速失败，与总预算无关）
+    pub stream_idle: Duration,
+    /// Agent 循环总墙钟预算（超预算走收束路径而非硬超时）
+    pub loop_wall_clock: Duration,
+}
+
+impl Default for ModelTimeouts {
+    fn default() -> Self {
+        Self {
+            request_total: Duration::from_secs(60),
+            stream_total: Duration::from_secs(120),
+            stream_idle: Duration::from_secs(30),
+            loop_wall_clock: Duration::from_secs(120),
+        }
+    }
+}
+
+impl ModelTimeouts {
+    /// 从用户配置的助手回答超时（秒）派生：非流式与流式总时长都用整体预算，
+    /// 空闲超时固定 30s，Agent 循环墙钟与整体预算一致。
+    pub fn from_assistant_timeout_secs(secs: u64) -> Self {
+        Self {
+            request_total: Duration::from_secs(secs),
+            stream_total: Duration::from_secs(secs),
+            stream_idle: Duration::from_secs(30),
+            loop_wall_clock: Duration::from_secs(secs),
+        }
+    }
+}
 /// 非流式请求发送：命中 429/5xx 时等待 2 秒重试一次（流式路径不重试）。
 async fn send_with_retry(request: reqwest::RequestBuilder) -> Result<reqwest::Response, AppError> {
     let retry = request.try_clone();
@@ -171,6 +208,7 @@ pub async fn chat_with_tools(
     system_prompt: &str,
     messages: &[Message],
     tools: &[Value],
+    timeouts: ModelTimeouts,
 ) -> Result<LlmResponse, AppError> {
     let client = chat_client()?;
 
@@ -185,13 +223,18 @@ pub async fn chat_with_tools(
 
     // 根据提供商分发
     match model_config.provider {
-        AiProvider::Ollama => chat_ollama(client, model_config, &full_messages, tools).await,
-        AiProvider::Claude => chat_claude(client, model_config, &full_messages, tools).await,
-        AiProvider::Gemini => chat_gemini(client, model_config, &full_messages, tools).await,
-        _ => chat_openai_compatible(client, model_config, &full_messages, tools).await,
+        AiProvider::Ollama => {
+            chat_ollama(client, model_config, &full_messages, tools, timeouts).await
+        }
+        AiProvider::Claude => {
+            chat_claude(client, model_config, &full_messages, tools, timeouts).await
+        }
+        AiProvider::Gemini => {
+            chat_gemini(client, model_config, &full_messages, tools, timeouts).await
+        }
+        _ => chat_openai_compatible(client, model_config, &full_messages, tools, timeouts).await,
     }
 }
-
 // ══════════════════════════════════════════════════════════
 // 第三部分：各家 Provider 的实现 — 格式翻译
 // ══════════════════════════════════════════════════════════
@@ -204,6 +247,7 @@ async fn chat_openai_compatible(
     model_config: &ModelConfig,
     messages: &[Value],
     tools: &[Value],
+    timeouts: ModelTimeouts,
 ) -> Result<LlmResponse, AppError> {
     let endpoint = model_config.endpoint.trim().trim_end_matches('/');
     let url = if endpoint.ends_with("/chat/completions") {
@@ -224,7 +268,7 @@ async fn chat_openai_compatible(
         body["tools"] = json!(tools);
     }
 
-    let mut request = client.post(&url).json(&body);
+    let mut request = client.post(&url).json(&body).timeout(timeouts.request_total);
     if let Some(api_key) = &model_config.api_key {
         if !api_key.is_empty() {
             request = request.header("Authorization", format!("Bearer {api_key}"));
@@ -247,6 +291,7 @@ async fn chat_ollama(
     model_config: &ModelConfig,
     messages: &[Value],
     tools: &[Value],
+    timeouts: ModelTimeouts,
 ) -> Result<LlmResponse, AppError> {
     let ollama_base = model_config.endpoint.trim().trim_end_matches('/');
     let url = if ollama_base.ends_with("/api/chat") {
@@ -266,7 +311,8 @@ async fn chat_ollama(
         body["tools"] = json!(tools);
     }
 
-    let response = send_with_retry(client.post(&url).json(&body)).await?;
+    let response =
+        send_with_retry(client.post(&url).json(&body).timeout(timeouts.request_total)).await?;
     if !response.status().is_success() {
         return Err(AppError::Analysis(format!(
             "Ollama 调用失败: {}",
@@ -360,6 +406,7 @@ async fn chat_claude(
     model_config: &ModelConfig,
     messages: &[Value],
     tools: &[Value],
+    timeouts: ModelTimeouts,
 ) -> Result<LlmResponse, AppError> {
     let api_key = model_config
         .api_key
@@ -392,7 +439,8 @@ async fn chat_claude(
             .header("anthropic-version", "2023-06-01")
             .header("content-type", "application/json")
             .header("x-api-key", api_key)
-            .json(&body),
+            .json(&body)
+            .timeout(timeouts.request_total),
     )
     .await?;
 
@@ -507,6 +555,7 @@ async fn chat_gemini(
     model_config: &ModelConfig,
     messages: &[Value],
     tools: &[Value],
+    timeouts: ModelTimeouts,
 ) -> Result<LlmResponse, AppError> {
     let endpoint = model_config.endpoint.trim().trim_end_matches('/');
     let api_key = model_config
@@ -521,7 +570,8 @@ async fn chat_gemini(
         client
             .post(&url)
             .header("x-goog-api-key", api_key)
-            .json(&body),
+            .json(&body)
+            .timeout(timeouts.request_total),
     )
     .await?;
     if !response.status().is_success() {
@@ -698,8 +748,8 @@ fn parse_gemini_response(result: &Value) -> Result<LlmResponse, AppError> {
 //   + 一个 HTTP 驱动（chunk 循环 + 行缓冲 + 喂装配器 + 文本增量回调）。
 // - 入口 chat_with_tools_streaming 与 chat_with_tools 同参，多一个 on_text 回调；
 //   流式路径任何失败都回退到既有非流式实现，保证不比旧行为差。
-// - 超时策略：流式不用整体 60s 超时（长答案会被掐断），改为逐块空闲 30s
-//   + 总时长 120s 双护栏。
+// - 超时策略：流式不用整体请求超时（长答案会被掐断），改为逐块空闲
+//   + 总时长双护栏，两者均来自用户配置的助手回答超时（ModelTimeouts）。
 
 /// 文本增量回调。executor 层把增量批量合并成 StreamEvent::Token 推给前端。
 pub type OnTextDelta<'a> = &'a mut (dyn FnMut(&str) + Send);
@@ -713,6 +763,7 @@ pub async fn chat_with_tools_streaming(
     system_prompt: &str,
     messages: &[Message],
     tools: &[Value],
+    timeouts: ModelTimeouts,
     on_text: OnTextDelta<'_>,
 ) -> Result<LlmResponse, AppError> {
     // 流式客户端：只限制连接超时，读取超时由逐块 idle 超时控制。
@@ -728,17 +779,27 @@ pub async fn chat_with_tools_streaming(
 
     let streamed = match model_config.provider {
         AiProvider::Ollama => {
-            chat_ollama_streaming(client, model_config, &full_messages, tools, on_text).await
+            chat_ollama_streaming(client, model_config, &full_messages, tools, timeouts, on_text)
+                .await
         }
         AiProvider::Claude => {
-            chat_claude_streaming(client, model_config, &full_messages, tools, on_text).await
+            chat_claude_streaming(client, model_config, &full_messages, tools, timeouts, on_text)
+                .await
         }
         AiProvider::Gemini => {
-            chat_gemini_streaming(client, model_config, &full_messages, tools, on_text).await
+            chat_gemini_streaming(client, model_config, &full_messages, tools, timeouts, on_text)
+                .await
         }
         _ => {
-            chat_openai_compatible_streaming(client, model_config, &full_messages, tools, on_text)
-                .await
+            chat_openai_compatible_streaming(
+                client,
+                model_config,
+                &full_messages,
+                tools,
+                timeouts,
+                on_text,
+            )
+            .await
         }
     };
 
@@ -746,7 +807,7 @@ pub async fn chat_with_tools_streaming(
         Ok(response) => Ok(response),
         Err(e) => {
             log::warn!("流式调用失败，回退非流式: {e}");
-            chat_with_tools(model_config, system_prompt, messages, tools).await
+            chat_with_tools(model_config, system_prompt, messages, tools, timeouts).await
         }
     }
 }
@@ -783,6 +844,7 @@ fn sse_data_payload(line: &str) -> Option<&str> {
 /// `on_line` 返回 true 表示流已到终态（如 OpenAI 的 [DONE]），提前结束。
 async fn drive_stream(
     response: reqwest::Response,
+    timeouts: ModelTimeouts,
     mut on_line: impl FnMut(&str) -> bool,
 ) -> Result<(), AppError> {
     let mut response = response;
@@ -790,10 +852,10 @@ async fn drive_stream(
     let started = Instant::now();
 
     loop {
-        if started.elapsed() > Duration::from_secs(120) {
+        if started.elapsed() > timeouts.stream_total {
             return Err(AppError::Analysis("流式响应总时长超限".to_string()));
         }
-        let chunk = tokio::time::timeout(Duration::from_secs(30), response.chunk())
+        let chunk = tokio::time::timeout(timeouts.stream_idle, response.chunk())
             .await
             .map_err(|_| AppError::Analysis("流式响应空闲超时".to_string()))?
             .map_err(|e| AppError::Analysis(format!("流式读取失败: {e}")))?;
@@ -927,6 +989,7 @@ async fn chat_openai_compatible_streaming(
     model_config: &ModelConfig,
     messages: &[Value],
     tools: &[Value],
+    timeouts: ModelTimeouts,
     on_text: OnTextDelta<'_>,
 ) -> Result<LlmResponse, AppError> {
     let endpoint = model_config.endpoint.trim().trim_end_matches('/');
@@ -957,7 +1020,7 @@ async fn chat_openai_compatible_streaming(
     let response = ensure_stream_status(request.send().await?, "LLM").await?;
 
     let mut assembler = OpenAiStreamAssembler::default();
-    drive_stream(response, |line| {
+    drive_stream(response, timeouts, |line| {
         let Some(payload) = sse_data_payload(line) else {
             return false;
         };
@@ -1055,6 +1118,7 @@ async fn chat_ollama_streaming(
     model_config: &ModelConfig,
     messages: &[Value],
     tools: &[Value],
+    timeouts: ModelTimeouts,
     on_text: OnTextDelta<'_>,
 ) -> Result<LlmResponse, AppError> {
     let ollama_base = model_config.endpoint.trim().trim_end_matches('/');
@@ -1076,7 +1140,7 @@ async fn chat_ollama_streaming(
     let response = ensure_stream_status(client.post(&url).json(&body).send().await?, "Ollama").await?;
 
     let mut assembler = OllamaStreamAssembler::default();
-    drive_stream(response, |line| {
+    drive_stream(response, timeouts, |line| {
         if let Ok(value) = serde_json::from_str::<Value>(line) {
             if let Some(delta) = assembler.ingest(&value) {
                 on_text(&delta);
@@ -1202,6 +1266,7 @@ async fn chat_claude_streaming(
     model_config: &ModelConfig,
     messages: &[Value],
     tools: &[Value],
+    timeouts: ModelTimeouts,
     on_text: OnTextDelta<'_>,
 ) -> Result<LlmResponse, AppError> {
     let api_key = model_config
@@ -1243,7 +1308,7 @@ async fn chat_claude_streaming(
     .await?;
 
     let mut assembler = ClaudeStreamAssembler::default();
-    drive_stream(response, |line| {
+    drive_stream(response, timeouts, |line| {
         let Some(payload) = sse_data_payload(line) else {
             return false;
         };
@@ -1341,6 +1406,7 @@ async fn chat_gemini_streaming(
     model_config: &ModelConfig,
     messages: &[Value],
     tools: &[Value],
+    timeouts: ModelTimeouts,
     on_text: OnTextDelta<'_>,
 ) -> Result<LlmResponse, AppError> {
     let endpoint = model_config.endpoint.trim().trim_end_matches('/');
@@ -1367,7 +1433,7 @@ async fn chat_gemini_streaming(
     .await?;
 
     let mut assembler = GeminiStreamAssembler::default();
-    drive_stream(response, |line| {
+    drive_stream(response, timeouts, |line| {
         let Some(payload) = sse_data_payload(line) else {
             return false;
         };

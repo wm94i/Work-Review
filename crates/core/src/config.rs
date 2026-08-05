@@ -955,6 +955,12 @@ pub struct AppConfig {
     /// 上次 AI 编排的段落顺序（缓存，避免每次生成都调 LLM 排序）
     #[serde(default)]
     pub daily_report_last_ai_order: Vec<String>,
+    /// 助手问答总超时（秒）：前端等待、Agent 循环墙钟与单次模型请求预算的基准
+    #[serde(default = "default_assistant_timeout_secs")]
+    pub assistant_timeout_secs: u64,
+    /// 日报生成总超时（秒）：外层截止时间，AI 请求预算在其基础上预留收尾余量
+    #[serde(default = "default_report_generation_timeout_secs")]
+    pub report_generation_timeout_secs: u64,
     /// 是否启用本地 localhost API
     #[serde(default)]
     pub localhost_api_enabled: bool,
@@ -1235,6 +1241,12 @@ fn default_avatar_persona() -> String {
 fn default_ui_visual_style() -> String {
     "c".to_string()
 }
+fn default_assistant_timeout_secs() -> u64 {
+    120
+}
+fn default_report_generation_timeout_secs() -> u64 {
+    300
+}
 
 impl Default for AppConfig {
     fn default() -> Self {
@@ -1264,6 +1276,8 @@ impl Default for AppConfig {
             daily_report_hidden_blocks: Vec::new(),
             daily_report_last_ai_order: Vec::new(),
             daily_report_auto_generate_time: None,
+            assistant_timeout_secs: default_assistant_timeout_secs(),
+            report_generation_timeout_secs: default_report_generation_timeout_secs(),
             localhost_api_enabled: false,
             localhost_api_host: None,
             localhost_api_port: DEFAULT_LOCALHOST_API_PORT,
@@ -1386,6 +1400,9 @@ impl AppConfig {
         self.break_reminder_interval_minutes =
             normalize_break_reminder_interval_minutes(self.break_reminder_interval_minutes);
         self.standard_work_hours = self.standard_work_hours.clamp(1.0, 24.0);
+        self.assistant_timeout_secs = normalize_assistant_timeout_secs(self.assistant_timeout_secs);
+        self.report_generation_timeout_secs =
+            normalize_report_generation_timeout_secs(self.report_generation_timeout_secs);
         self.daily_report_custom_prompt = self.daily_report_custom_prompt.trim().to_string();
         normalize_prompt_presets(&mut self.daily_report_prompt_presets);
         self.daily_report_export_dir =
@@ -1404,6 +1421,14 @@ impl AppConfig {
         self.node_gateway.device_name =
             normalize_optional_string(self.node_gateway.device_name.take());
         self.sync_text_model_profiles();
+    }
+
+    /// 日报生成的 AI 请求预算（秒）：外层截止时间预留 60 秒给回退模板与收尾，
+    /// 外层配置很小时至少保留 30 秒请求预算。
+    pub fn report_ai_request_timeout_secs(&self) -> u64 {
+        self.report_generation_timeout_secs
+            .saturating_sub(60)
+            .max(30)
     }
 
     /// 从文件加载配置
@@ -1995,6 +2020,16 @@ fn normalize_break_reminder_interval_minutes(value: u64) -> u64 {
 /// 截屏间隔最低 5 秒，防止配置值过小导致 CPU/磁盘占用过高
 fn normalize_screenshot_interval(value: u64) -> u64 {
     value.clamp(5, 600)
+}
+
+/// 助手问答超时夹取到 30s~900s：过短模型来不及回答，过长前端会一直挂着
+fn normalize_assistant_timeout_secs(value: u64) -> u64 {
+    value.clamp(30, 900)
+}
+
+/// 日报生成超时夹取到 60s~1800s：本地大模型生成慢，但不应无限等待
+fn normalize_report_generation_timeout_secs(value: u64) -> u64 {
+    value.clamp(60, 1800)
 }
 
 fn default_idle_threshold_minutes() -> u32 {

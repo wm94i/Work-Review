@@ -788,6 +788,54 @@
       </div>
     {/if}
 
+    <!-- 生成超时：模型回答/日报生成的等待上限，本地大模型慢时可调大 -->
+    <div class="settings-block p-3.5 space-y-3">
+      <div class="flex items-center justify-between gap-3">
+        <div class="min-w-0">
+          <span class="settings-text text-sm">{t('settingsAI.timeouts.assistant')}</span>
+          <p class="settings-muted mt-0.5">{t('settingsAI.timeouts.assistantHint')}</p>
+        </div>
+        <div class="flex shrink-0 items-center gap-2">
+          <input
+            type="number"
+            aria-label={t('settingsAI.timeouts.assistant')}
+            min="30"
+            max="900"
+            step="10"
+            bind:value={config.assistant_timeout_secs}
+            on:change={() => {
+              config.assistant_timeout_secs = Math.max(30, Math.min(900, Number(config.assistant_timeout_secs) || 120));
+              handleChange();
+            }}
+            class="w-20 rounded-md border border-slate-200 bg-white px-2 py-1 text-center text-sm dark:border-[#484f58] dark:bg-[#21262d]"
+          />
+          <span class="text-xs settings-subtle">{t('settingsAI.timeouts.secondsUnit')}</span>
+        </div>
+      </div>
+      <div class="flex items-center justify-between gap-3">
+        <div class="min-w-0">
+          <span class="settings-text text-sm">{t('settingsAI.timeouts.report')}</span>
+          <p class="settings-muted mt-0.5">{t('settingsAI.timeouts.reportHint')}</p>
+        </div>
+        <div class="flex shrink-0 items-center gap-2">
+          <input
+            type="number"
+            aria-label={t('settingsAI.timeouts.report')}
+            min="60"
+            max="1800"
+            step="30"
+            bind:value={config.report_generation_timeout_secs}
+            on:change={() => {
+              config.report_generation_timeout_secs = Math.max(60, Math.min(1800, Number(config.report_generation_timeout_secs) || 300));
+              handleChange();
+            }}
+            class="w-20 rounded-md border border-slate-200 bg-white px-2 py-1 text-center text-sm dark:border-[#484f58] dark:bg-[#21262d]"
+          />
+          <span class="text-xs settings-subtle">{t('settingsAI.timeouts.secondsUnit')}</span>
+        </div>
+      </div>
+    </div>
+
       </div>
     </div>
 
