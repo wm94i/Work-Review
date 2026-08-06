@@ -854,7 +854,7 @@ pub(crate) async fn generate_text_answer_with_model(
             } else {
                 format!("{endpoint}/chat/completions")
             };
-            let mut request = client.post(&url).json(&serde_json::json!({
+            let mut body = serde_json::json!({
                 "model": model_config.model,
                 "messages": [
                     {
@@ -868,7 +868,10 @@ pub(crate) async fn generate_text_answer_with_model(
                 ],
                 "max_tokens": 1600,
                 "temperature": 0.2
-            }));
+            });
+            // 用户配置的 max_tokens / 思考模式覆盖默认值
+            crate::agent::model::apply_generation_params(&mut body, model_config);
+            let mut request = client.post(&url).json(&body);
 
             if let Some(api_key) = &model_config.api_key {
                 if !api_key.is_empty() {

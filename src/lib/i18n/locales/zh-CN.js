@@ -976,6 +976,18 @@ export default {
         reportHint: '日报 AI 生成的总截止时间，超时自动回退基础模板',
         secondsUnit: '秒',
       },
+      generation: {
+        thinkingMode: '思考模式',
+        thinkingModeHint: '思考型模型（Qwen3/DeepSeek-R1 等）会先推理再作答；关闭可避免把 token 全耗在推理上导致正文为空',
+        serverDefault: '跟随服务端',
+        thinkingOn: '开启',
+        thinkingOff: '关闭',
+        thinkingBudget: '思考 token 上限',
+        thinkingBudgetHint: '限制推理阶段可用的 token 数，留空不限制（仅支持该参数的模型生效）',
+        maxOutputTokens: '最大输出 token',
+        maxOutputTokensHint: '单次生成的 token 上限，留空使用服务端默认',
+        unlimited: '不限',
+      },
       aiModeDisabled: '切换到「AI 增强」模式后配置',
       webAccess: {
         title: '助手联网能力',

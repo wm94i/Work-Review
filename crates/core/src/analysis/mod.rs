@@ -111,10 +111,7 @@ pub fn append_custom_prompt_for_locale(
 #[allow(clippy::too_many_arguments)]
 pub fn create_analyzer(
     mode: AiMode,
-    provider: AiProvider,
-    endpoint: &str,
-    model: &str,
-    api_key: Option<&str>,
+    model_config: &crate::config::ModelConfig,
     custom_prompt: &str,
     system_prompt_override: Option<&str>,
     locale: AppLocale,
@@ -125,26 +122,23 @@ pub fn create_analyzer(
     log::info!(
         "create_analyzer: mode={:?}, provider={:?}, endpoint={}, model={}, has_api_key={}, ai_timeout={}s",
         mode,
-        provider,
-        endpoint,
-        model,
-        api_key.is_some(),
+        model_config.provider,
+        model_config.endpoint,
+        model_config.model,
+        model_config.api_key.is_some(),
         ai_request_timeout_secs
     );
     match mode {
         AiMode::Local => Box::new(local::LocalAnalyzer::new(
-            endpoint,
-            model,
+            &model_config.endpoint,
+            &model_config.model,
             custom_prompt,
             locale,
             pinned_blocks,
             ai_request_timeout_secs,
         )),
         AiMode::Summary => Box::new(summary::SummaryAnalyzer::new(
-            provider,
-            endpoint,
-            model,
-            api_key,
+            model_config,
             custom_prompt,
             system_prompt_override,
             locale,
@@ -153,9 +147,9 @@ pub fn create_analyzer(
             ai_request_timeout_secs,
         )),
         AiMode::Cloud => Box::new(cloud::CloudAnalyzer::new(
-            endpoint,
-            api_key.unwrap_or(""),
-            model,
+            &model_config.endpoint,
+            model_config.api_key.as_deref().unwrap_or(""),
+            &model_config.model,
             custom_prompt,
             locale,
             ai_request_timeout_secs,

@@ -375,16 +375,19 @@ pub struct SummaryAnalyzer {
     cached_ai_order: Option<Vec<String>>,
     /// AI 请求预算（来自用户配置的日报生成超时）
     ai_request_timeout: Duration,
+    /// 是否启用思考模式（None = 沿用服务端默认）
+    enable_thinking: Option<bool>,
+    /// 思考 token 预算上限（None = 不限制）
+    thinking_budget: Option<u32>,
+    /// 单次生成最大 token 数（None = 沿用服务端默认）
+    max_output_tokens: Option<u32>,
     client: Client,
 }
 
 impl SummaryAnalyzer {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        provider: AiProvider,
-        endpoint: &str,
-        model: &str,
-        api_key: Option<&str>,
+        model_config: &crate::config::ModelConfig,
         custom_prompt: &str,
         system_prompt_override: Option<&str>,
         locale: AppLocale,
@@ -399,16 +402,19 @@ impl SummaryAnalyzer {
             .unwrap_or_else(|_| Client::new());
 
         Self {
-            provider,
-            endpoint: endpoint.to_string(),
-            model: model.to_string(),
-            api_key: api_key.map(|value| value.to_string()),
+            provider: model_config.provider,
+            endpoint: model_config.endpoint.clone(),
+            model: model_config.model.clone(),
+            api_key: model_config.api_key.clone(),
             custom_prompt: custom_prompt.to_string(),
             system_prompt_override: system_prompt_override.map(|s| s.to_string()),
             locale,
             pinned_blocks,
             cached_ai_order,
             ai_request_timeout: Duration::from_secs(ai_request_timeout_secs),
+            enable_thinking: model_config.enable_thinking,
+            thinking_budget: model_config.thinking_budget,
+            max_output_tokens: model_config.max_output_tokens,
             client,
         }
     }
@@ -436,6 +442,10 @@ impl SummaryAnalyzer {
         Ok(extract_ollama_text(&result))
     }
     async fn generate_with_openai_compatible(&self, prompt: &str) -> Result<String> {
+        // 用户显式配置了最大 token 数：直接使用，不再自动降档
+        if let Some(configured) = self.max_output_tokens {
+            return self.try_openai_compatible_request(prompt, Some(configured)).await;
+        }
         // 第一轮：不设 max_tokens，让模型用自身默认值
         match self.try_openai_compatible_request(prompt, None).await {
             Ok(content) => return Ok(content),
@@ -482,6 +492,17 @@ impl SummaryAnalyzer {
         });
         if let Some(tokens) = max_tokens {
             payload["max_tokens"] = json!(tokens);
+        }
+        // 思考模式参数（仅用户显式配置时发送，避免不支持的服务端拒绝未知字段）
+        let mut chat_template_kwargs = serde_json::Map::new();
+        if let Some(enable) = self.enable_thinking {
+            chat_template_kwargs.insert("enable_thinking".to_string(), json!(enable));
+        }
+        if let Some(budget) = self.thinking_budget {
+            chat_template_kwargs.insert("thinking_budget".to_string(), json!(budget));
+        }
+        if !chat_template_kwargs.is_empty() {
+            payload["chat_template_kwargs"] = json!(chat_template_kwargs);
         }
 
         let mut last_error: Option<String> = None;
@@ -1278,6 +1299,9 @@ mod tests {
             pinned_blocks: Vec::new(),
             cached_ai_order: None,
             ai_request_timeout: Duration::from_secs(240),
+            enable_thinking: None,
+            thinking_budget: None,
+            max_output_tokens: None,
             client: reqwest::Client::builder()
                 .no_proxy()
                 .build()

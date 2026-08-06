@@ -5194,6 +5194,9 @@ mod tests {
             endpoint: "http://localhost:11434".to_string(),
             api_key: None,
             model: "qwen3".to_string(),
+            enable_thinking: None,
+            thinking_budget: None,
+            max_output_tokens: None,
         };
 
         assert!(avatar_proactive_ai_should_run(

@@ -977,6 +977,18 @@ export default {
         reportHint: '日報 AI 生成的總截止時間，逾時自動退回基礎模板',
         secondsUnit: '秒',
       },
+      generation: {
+        thinkingMode: '思考模式',
+        thinkingModeHint: '思考型模型（Qwen3/DeepSeek-R1 等）會先推理再作答；關閉可避免把 token 全耗在推理上導致正文為空',
+        serverDefault: '跟隨伺服器',
+        thinkingOn: '開啟',
+        thinkingOff: '關閉',
+        thinkingBudget: '思考 token 上限',
+        thinkingBudgetHint: '限制推理階段可用的 token 數，留空不限制（僅支援該參數的模型生效）',
+        maxOutputTokens: '最大輸出 token',
+        maxOutputTokensHint: '單次生成的 token 上限，留空使用伺服器預設',
+        unlimited: '不限',
+      },
       aiModeDisabled: '切換到「AI 增強」模式後可配置 AI 模型',
       webAccess: {
         title: '助手聯網能力',

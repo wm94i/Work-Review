@@ -239,6 +239,24 @@ pub async fn chat_with_tools(
 // 第三部分：各家 Provider 的实现 — 格式翻译
 // ══════════════════════════════════════════════════════════
 
+/// 把用户配置的生成参数（max_tokens / 思考模式）应用到 OpenAI 兼容请求体。
+/// 仅在用户显式配置时发送对应字段，避免不支持的服务端拒绝未知字段。
+pub(crate) fn apply_generation_params(body: &mut Value, model_config: &ModelConfig) {
+    if let Some(max_tokens) = model_config.max_output_tokens {
+        body["max_tokens"] = json!(max_tokens);
+    }
+    let mut chat_template_kwargs = serde_json::Map::new();
+    if let Some(enable) = model_config.enable_thinking {
+        chat_template_kwargs.insert("enable_thinking".to_string(), json!(enable));
+    }
+    if let Some(budget) = model_config.thinking_budget {
+        chat_template_kwargs.insert("thinking_budget".to_string(), json!(budget));
+    }
+    if !chat_template_kwargs.is_empty() {
+        body["chat_template_kwargs"] = json!(chat_template_kwargs);
+    }
+}
+
 /// OpenAI 兼容格式（覆盖 8 个提供商：OpenAI/SiliconFlow/DeepSeek/Qwen/Zhipu/Moonshot/Doubao/MiniMax）
 ///
 /// 面试要点：这些提供商都用相同的 API 格式，所以一个实现覆盖全部。
@@ -262,6 +280,9 @@ async fn chat_openai_compatible(
         "max_tokens": 1600,
         "temperature": 0.2
     });
+
+    // 用户配置的 max_tokens / 思考模式覆盖默认值
+    apply_generation_params(&mut body, model_config);
 
     // 只有提供了工具定义时才加 tools 参数
     if !tools.is_empty() {
@@ -1006,6 +1027,7 @@ async fn chat_openai_compatible_streaming(
         "temperature": 0.2,
         "stream": true
     });
+    apply_generation_params(&mut body, model_config);
     if !tools.is_empty() {
         body["tools"] = json!(tools);
     }

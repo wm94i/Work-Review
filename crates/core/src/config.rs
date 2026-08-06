@@ -191,6 +191,18 @@ pub struct ModelConfig {
     pub api_key: Option<String>,
     /// 模型名称
     pub model: String,
+    /// 是否启用思考模式（thinking）。None = 不发送参数，沿用服务端默认；
+    /// 思考模型（Qwen3/DeepSeek-R1 等）开启时可能把整个 token 预算耗在推理上，
+    /// 导致正文为空，此时可关闭思考或限制思考预算。
+    #[serde(default)]
+    pub enable_thinking: Option<bool>,
+    /// 思考 token 预算上限（thinking_budget）。None = 不限制。
+    /// 仅对支持该参数的思考模型生效（如 Qwen3）。
+    #[serde(default)]
+    pub thinking_budget: Option<u32>,
+    /// 单次生成最大 token 数（max_tokens）。None = 不发送参数，沿用服务端默认。
+    #[serde(default)]
+    pub max_output_tokens: Option<u32>,
 }
 
 impl ModelConfig {
@@ -202,6 +214,9 @@ impl ModelConfig {
             endpoint: AiProvider::Ollama.default_endpoint().to_string(),
             api_key: None,
             model: String::new(), // 默认为空，用户需手动填写
+            enable_thinking: None,
+            thinking_budget: None,
+            max_output_tokens: None,
         }
     }
 
@@ -212,6 +227,9 @@ impl ModelConfig {
             endpoint: AiProvider::Ollama.default_endpoint().to_string(),
             api_key: None,
             model: "llava".to_string(),
+            enable_thinking: None,
+            thinking_budget: None,
+            max_output_tokens: None,
         }
     }
 }
@@ -1580,6 +1598,9 @@ impl AppConfig {
                 endpoint: self.ai_provider.endpoint.clone(),
                 api_key: self.ai_provider.api_key.clone(),
                 model: self.ai_provider.model.clone(),
+                enable_thinking: None,
+                thinking_budget: None,
+                max_output_tokens: None,
             };
         }
 
@@ -1590,6 +1611,9 @@ impl AppConfig {
                     endpoint: self.ai_provider.endpoint.clone(),
                     api_key: self.ai_provider.api_key.clone(),
                     model: vision_model.clone(),
+                    enable_thinking: None,
+                    thinking_budget: None,
+                    max_output_tokens: None,
                 };
             }
         }

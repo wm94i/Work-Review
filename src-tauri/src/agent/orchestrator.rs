@@ -967,6 +967,9 @@ mod tests {
             endpoint: "not-a-valid-url".to_string(),
             api_key: None,
             model: "test-model".to_string(),
+            enable_thinking: None,
+            thinking_budget: None,
+            max_output_tokens: None,
         };
         let (tx, rx) = StreamEventSender::channel(1);
         drop(rx);

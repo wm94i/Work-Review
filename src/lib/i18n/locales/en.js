@@ -992,6 +992,18 @@ export default {
         reportHint: 'Overall deadline for AI report generation; falls back to the base template on timeout',
         secondsUnit: 'sec',
       },
+      generation: {
+        thinkingMode: 'Thinking mode',
+        thinkingModeHint: 'Thinking models (Qwen3/DeepSeek-R1, etc.) reason before answering; turning it off avoids spending all tokens on reasoning and ending up with an empty answer',
+        serverDefault: 'Server default',
+        thinkingOn: 'On',
+        thinkingOff: 'Off',
+        thinkingBudget: 'Thinking token budget',
+        thinkingBudgetHint: 'Caps the tokens available to the reasoning stage; leave empty for unlimited (only effective on models that support it)',
+        maxOutputTokens: 'Max output tokens',
+        maxOutputTokensHint: 'Token cap per generation; leave empty to use the server default',
+        unlimited: 'Unlimited',
+      },
       aiModeDisabled: 'Switch to AI Enhanced mode to configure',
       webAccess: {
         title: 'Assistant web access',

@@ -15,6 +15,15 @@
   // 三入口分区：模型配置 / 助手联网 / 语义记忆（点击切换，互不打扰）
   let aiSection = 'model';
 
+  // 思考模式下拉框的字符串表示（'default' | 'on' | 'off'），跟随配置回显
+  let thinkingMode = 'default';
+  $: thinkingMode =
+    config?.text_model?.enable_thinking === true
+      ? 'on'
+      : config?.text_model?.enable_thinking === false
+        ? 'off'
+        : 'default';
+
   // ══════════ 语义记忆索引管理（查询走助手，管理入口在这里）══════════
   const emptySemanticState = () => ({
     status: 'idle',
@@ -832,6 +841,83 @@
             class="w-20 rounded-md border border-slate-200 bg-white px-2 py-1 text-center text-sm dark:border-[#484f58] dark:bg-[#21262d]"
           />
           <span class="text-xs settings-subtle">{t('settingsAI.timeouts.secondsUnit')}</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- 生成参数：思考模式与 token 上限，针对思考型模型（Qwen3/DeepSeek-R1 等） -->
+    <div class="settings-block p-3.5 space-y-3">
+      <div class="flex items-center justify-between gap-3">
+        <div class="min-w-0">
+          <span class="settings-text text-sm">{t('settingsAI.generation.thinkingMode')}</span>
+          <p class="settings-muted mt-0.5">{t('settingsAI.generation.thinkingModeHint')}</p>
+        </div>
+        <select
+          aria-label={t('settingsAI.generation.thinkingMode')}
+          value={thinkingMode}
+          on:change={(e) => {
+            thinkingMode = e.target.value;
+            config.text_model.enable_thinking =
+              thinkingMode === 'default' ? null : thinkingMode === 'on';
+            handleChange();
+          }}
+          class="w-36 rounded-md border border-slate-200 bg-white px-2 py-1 text-sm dark:border-[#484f58] dark:bg-[#21262d]"
+        >
+          <option value="default">{t('settingsAI.generation.serverDefault')}</option>
+          <option value="on">{t('settingsAI.generation.thinkingOn')}</option>
+          <option value="off">{t('settingsAI.generation.thinkingOff')}</option>
+        </select>
+      </div>
+      <div class="flex items-center justify-between gap-3">
+        <div class="min-w-0">
+          <span class="settings-text text-sm">{t('settingsAI.generation.thinkingBudget')}</span>
+          <p class="settings-muted mt-0.5">{t('settingsAI.generation.thinkingBudgetHint')}</p>
+        </div>
+        <div class="flex shrink-0 items-center gap-2">
+          <input
+            type="number"
+            aria-label={t('settingsAI.generation.thinkingBudget')}
+            min="0"
+            max="32768"
+            step="64"
+            value={config.text_model.thinking_budget ?? ''}
+            placeholder={t('settingsAI.generation.unlimited')}
+            on:change={(e) => {
+              const raw = e.target.value;
+              const val = raw === '' ? null : Math.max(0, Math.min(32768, Number(raw) || 0));
+              config.text_model.thinking_budget = val;
+              e.target.value = val ?? '';
+              handleChange();
+            }}
+            class="w-24 rounded-md border border-slate-200 bg-white px-2 py-1 text-center text-sm dark:border-[#484f58] dark:bg-[#21262d]"
+          />
+          <span class="text-xs settings-subtle">tokens</span>
+        </div>
+      </div>
+      <div class="flex items-center justify-between gap-3">
+        <div class="min-w-0">
+          <span class="settings-text text-sm">{t('settingsAI.generation.maxOutputTokens')}</span>
+          <p class="settings-muted mt-0.5">{t('settingsAI.generation.maxOutputTokensHint')}</p>
+        </div>
+        <div class="flex shrink-0 items-center gap-2">
+          <input
+            type="number"
+            aria-label={t('settingsAI.generation.maxOutputTokens')}
+            min="0"
+            max="131072"
+            step="256"
+            value={config.text_model.max_output_tokens ?? ''}
+            placeholder={t('settingsAI.generation.unlimited')}
+            on:change={(e) => {
+              const raw = e.target.value;
+              const val = raw === '' ? null : Math.max(0, Math.min(131072, Number(raw) || 0));
+              config.text_model.max_output_tokens = val;
+              e.target.value = val ?? '';
+              handleChange();
+            }}
+            class="w-24 rounded-md border border-slate-200 bg-white px-2 py-1 text-center text-sm dark:border-[#484f58] dark:bg-[#21262d]"
+          />
+          <span class="text-xs settings-subtle">tokens</span>
         </div>
       </div>
     </div>

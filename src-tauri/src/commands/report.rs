@@ -183,10 +183,7 @@ pub(crate) async fn generate_report_inner(
     // 创建分析器（使用 text_model 配置；AI 请求预算来自用户配置的日报生成超时）
     let analyzer = crate::analysis::create_analyzer(
         config.ai_mode,
-        config.text_model.provider,
-        &config.text_model.endpoint,
-        &config.text_model.model,
-        config.text_model.api_key.as_deref(),
+        &config.text_model,
         &config.daily_report_custom_prompt,
         config.daily_report_system_prompt_override.as_deref(),
         report_locale,
