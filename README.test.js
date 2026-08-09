@@ -130,6 +130,9 @@ test('多语言 README 底部都应展示 Star History，并在 License 后加�
     assert.match(source, /srcset="docs\/star-history\.svg"/);
     assert.match(source, /<img alt="Star History" src="docs\/star-history\.svg" width="720" \/>/);
   }
+  // README 引用的两个 SVG 资源必须真实存在于仓库内
+  await access(new URL('./docs/star-history.svg', import.meta.url));
+  await access(new URL('./docs/star-history-dark.svg', import.meta.url));
 });
 
 test('README 不应把默认关闭的 Localhost API 描述为启动后自动开放', async () => {

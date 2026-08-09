@@ -988,6 +988,7 @@ export default {
         maxOutputTokens: '最大輸出 token',
         maxOutputTokensHint: '單次生成的 token 上限，留空使用伺服器預設',
         unlimited: '不限',
+        unsupportedProvider: '目前供應商未確認支援這些生成參數，已停用設定，避免儲存後被忽略或請求被拒絕',
       },
       aiModeDisabled: '切換到「AI 增強」模式後可配置 AI 模型',
       webAccess: {

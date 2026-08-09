@@ -52,11 +52,12 @@ pub(crate) enum AgentRunError {
 /// 默认最大迭代次数
 const DEFAULT_MAX_ITERATIONS: usize = 8;
 
-// Agent 循环总时长预算来自用户配置的助手回答超时（ModelTimeouts::loop_wall_clock）。
-// 只在"新一轮开始前"检查——不打断在途轮次，超预算时走
+// Agent 循环与所有模型/确认等待共用同一个绝对 deadline（用户配置的助手
+// 回答超时）。只在"新一轮开始前"检查——不打断在途轮次，超预算时走
 // 收束路径（基于已有工具结果强制产出答案），而不是丢弃全部进展。
 
 /// 用户确认等待上限（秒）：前端确认卡片无人响应时按"未批准"收束该操作。
+/// 实际等待窗口还受剩余总预算约束（两者取小），不会突破整体超时。
 const CONFIRM_WAIT_SECS: u64 = 180;
 
 /// 用户点击"停止"后的终态文案（前端据此在已流式内容后追加标记，而非整体替换）。
@@ -137,7 +138,7 @@ impl AgentExecutor {
         web_tools: Option<WebToolsConfig>,
         runtime: AssistantRuntime,
         event_tx: Option<StreamEventSender>,
-        timeouts: model::ModelTimeouts,
+        deadline: model::Deadline,
     ) -> Result<AgentResult, AgentRunError> {
         // 注入当前日期上下文（issue #122）：让模型能正确理解"今天/本周/上周"
         // 等相对时间词，避免工具调用时把日期算错。
@@ -193,7 +194,6 @@ impl AgentExecutor {
         messages.push(Message::user(question));
 
         let mut tool_labels = Vec::new();
-        let start = Instant::now();
 
         for _ in 0..max_iter {
             ensure_event_receiver_open(&event_tx)?;
@@ -209,9 +209,10 @@ impl AgentExecutor {
                 });
             }
 
-            // 时长预算：只在新一轮开始前检查。超预算且已有工具结果 → 收束路径
-            // （最后一次无工具调用，强制模型基于已有结果作答），而不是丢弃进展。
-            if start.elapsed() > timeouts.loop_wall_clock {
+            // 时长预算：只在新一轮开始前检查（同一个 deadline，模型调用、
+            // 确认等待都在消费它）。超预算 → 收束路径（最后一次无工具调用，
+            // 强制模型基于已有结果作答），而不是丢弃进展。
+            if deadline.is_elapsed() {
                 return Self::wrap_up(
                     model_config,
                     &sys,
@@ -219,7 +220,7 @@ impl AgentExecutor {
                     &tool_context,
                     tool_labels,
                     &event_tx,
-                    timeouts,
+                    deadline,
                 )
                 .await;
             }
@@ -237,7 +238,7 @@ impl AgentExecutor {
                             &sys,
                             &messages,
                             &tools,
-                            timeouts,
+                            deadline,
                             &mut on_text,
                         )
                         .await
@@ -245,7 +246,7 @@ impl AgentExecutor {
                     batcher.flush(&event_tx);
                     result
                 } else {
-                    model::chat_with_tools(model_config, &sys, &messages, &tools, timeouts).await
+                    model::chat_with_tools(model_config, &sys, &messages, &tools, deadline).await
                 }
             })
             .await?;
@@ -337,6 +338,7 @@ impl AgentExecutor {
                                     &tool_context,
                                     &event_tx,
                                     &mut cancel_rx,
+                                    deadline,
                                 )
                                 .await?
                                 {
@@ -443,7 +445,7 @@ impl AgentExecutor {
             &tool_context,
             tool_labels,
             &event_tx,
-            timeouts,
+            deadline,
         )
         .await
     }
@@ -458,7 +460,7 @@ impl AgentExecutor {
         tool_context: &super::tools::ToolContext<'_>,
         tool_labels: Vec<String>,
         event_tx: &Option<StreamEventSender>,
-        timeouts: model::ModelTimeouts,
+        deadline: model::Deadline,
     ) -> Result<AgentResult, AgentRunError> {
         let fallback = if tool_labels.is_empty() {
             "处理超时，请尝试更具体的问题。".to_string()
@@ -468,6 +470,17 @@ impl AgentExecutor {
 
         // 没有任何工具结果可总结 → 直接返回固定文案
         if tool_labels.is_empty() {
+            let references = tool_context.take_all_references();
+            emit_done(event_tx, &fallback, &references, &tool_labels).await?;
+            return Ok(AgentResult {
+                answer: fallback,
+                tool_labels,
+                references,
+            });
+        }
+
+        // 预算已耗尽 → 不再发起收束调用，直接固定文案
+        if deadline.is_elapsed() {
             let references = tool_context.take_all_references();
             emit_done(event_tx, &fallback, &references, &tool_labels).await?;
             return Ok(AgentResult {
@@ -492,7 +505,7 @@ impl AgentExecutor {
                         sys,
                         &*messages,
                         &no_tools,
-                        timeouts,
+                        deadline,
                         &mut on_text,
                     )
                     .await
@@ -500,7 +513,7 @@ impl AgentExecutor {
                 batcher.flush(event_tx);
                 result
             } else {
-                model::chat_with_tools(model_config, sys, &*messages, &no_tools, timeouts).await
+                model::chat_with_tools(model_config, sys, &*messages, &no_tools, deadline).await
             }
         })
         .await?;
@@ -526,6 +539,7 @@ impl AgentExecutor {
         tool_context: &super::tools::ToolContext<'_>,
         event_tx: &Option<StreamEventSender>,
         cancel_rx: &mut Option<tokio::sync::watch::Receiver<bool>>,
+        deadline: model::Deadline,
     ) -> Result<ConfirmDecision, AgentRunError> {
         let Some(confirm) = tool_context.runtime.confirm.clone() else {
             return Ok(ConfirmDecision::Denied);
@@ -544,8 +558,11 @@ impl AgentExecutor {
         .await?;
 
         let wait = (confirm.wait)(confirm_id);
+        // 确认等待窗口 = min(固定上限, 剩余总预算)：确认等待也消费同一个
+        // deadline，不会让整体耗时突破用户配置的助手回答超时。
+        let confirm_window = Duration::from_secs(CONFIRM_WAIT_SECS).min(deadline.remaining());
         let outcome = await_or_cancelled(event_tx, cancel_rx, async {
-            tokio::time::timeout(Duration::from_secs(CONFIRM_WAIT_SECS), wait)
+            tokio::time::timeout(confirm_window, wait)
                 .await
                 .unwrap_or(ConfirmDecision::TimedOut)
         })

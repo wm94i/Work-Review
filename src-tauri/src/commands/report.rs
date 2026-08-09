@@ -196,8 +196,9 @@ pub(crate) async fn generate_report_inner(
         config.report_ai_request_timeout_secs(),
     );
 
-    // 生成报告（spawn 隔离 panic，防止内部错误杀死整个 tokio 线程）
-    // 外层总超时来自用户配置，防止 AI 调用卡死后前端永远等待
+    // 生成报告（spawn 隔离 panic，防止内部错误杀死整个 tokio 线程）。
+    // 外层总超时来自用户配置；超时时显式 abort 并等待任务终止，
+    // 保证命令返回后旧任务不会继续跑、不会与下一次生成并发。
     let screenshots_dir = data_dir.clone();
     let date_gen = date.clone();
     let category_name_overrides: std::collections::HashMap<String, String> = config
@@ -210,52 +211,51 @@ pub(crate) async fn generate_report_inner(
         .iter()
         .map(|c| (c.key.clone(), c.name.clone()))
         .collect();
-    let spawn_result = tokio::spawn(async move {
-        analyzer
-            .generate_report(
-                &date_gen,
-                &stats,
-                &activities,
-                &screenshots_dir,
-                report_locale,
-                category_name_overrides,
-                semantic_name_overrides,
-            )
-            .await
-    });
 
-    let report_result = match tokio::time::timeout(
+    let report_result = match await_report_task(
+        async move {
+            analyzer
+                .generate_report(
+                    &date_gen,
+                    &stats,
+                    &activities,
+                    &screenshots_dir,
+                    report_locale,
+                    category_name_overrides,
+                    semantic_name_overrides,
+                )
+                .await
+        },
         std::time::Duration::from_secs(config.report_generation_timeout_secs),
-        spawn_result,
     )
     .await
     {
-            Ok(Ok(result)) => result,
-            Ok(Err(_)) => Err(work_review_core::error::AppError::Analysis(
-                match report_locale {
-                    AppLocale::ZhCn => "日报生成过程中发生内部错误，请重试".to_string(),
-                    AppLocale::ZhTw => "日報生成過程中發生內部錯誤，請重試".to_string(),
-                    AppLocale::En => {
-                        "Internal error during report generation, please retry".to_string()
-                    }
-                    AppLocale::Ar => {
-                        "حدث خطأ داخلي أثناء إنشاء التقرير، يرجى المحاولة مرة أخرى".to_string()
-                    }
-                },
-            )),
-            Err(_) => Err(work_review_core::error::AppError::Analysis(
-                match report_locale {
-                    AppLocale::ZhCn => "日报生成超时，请稍后重试".to_string(),
-                    AppLocale::ZhTw => "日報生成逾時，請稍後重試".to_string(),
-                    AppLocale::En => {
-                        "Report generation timed out, please try again later".to_string()
-                    }
-                    AppLocale::Ar => {
-                        "انتهت مهلة إنشاء التقرير، يرجى المحاولة مرة أخرى لاحقاً".to_string()
-                    }
-                },
-            )),
-        };
+        Ok(result) => result,
+        Err(ReportTaskFailure::Panic) => Err(work_review_core::error::AppError::Analysis(
+            match report_locale {
+                AppLocale::ZhCn => "日报生成过程中发生内部错误，请重试".to_string(),
+                AppLocale::ZhTw => "日報生成過程中發生內部錯誤，請重試".to_string(),
+                AppLocale::En => {
+                    "Internal error during report generation, please retry".to_string()
+                }
+                AppLocale::Ar => {
+                    "حدث خطأ داخلي أثناء إنشاء التقرير، يرجى المحاولة مرة أخرى".to_string()
+                }
+            },
+        )),
+        Err(ReportTaskFailure::Timeout) => Err(work_review_core::error::AppError::Analysis(
+            match report_locale {
+                AppLocale::ZhCn => "日报生成超时，请稍后重试".to_string(),
+                AppLocale::ZhTw => "日報生成逾時，請稍後重試".to_string(),
+                AppLocale::En => {
+                    "Report generation timed out, please try again later".to_string()
+                }
+                AppLocale::Ar => {
+                    "انتهت مهلة إنشاء التقرير، يرجى المحاولة مرة أخرى لاحقاً".to_string()
+                }
+            },
+        )),
+    };
 
     let avatar_finish_state = {
         let mut state = state.lock().map_err(|e| AppError::Unknown(e.to_string()))?;
@@ -353,6 +353,39 @@ pub(crate) async fn generate_report_inner(
     }
 
     Ok(report)
+}
+
+/// 日报生成任务未能产出结果的原因。
+enum ReportTaskFailure {
+    /// 任务 panic（spawn 隔离捕获，用户可重试）
+    Panic,
+    /// 外层截止时间耗尽；任务已被 abort 并等待终止
+    Timeout,
+}
+
+/// 在外层截止时间内等待日报生成任务（内部 spawn 隔离 panic）。
+///
+/// 超时后不能只丢弃 JoinHandle——那只是 detach，任务会继续运行，
+/// 命令返回后用户再次生成会出现两个并发任务。这里显式 `abort()`
+/// 并 await 到 JoinError，确认任务实际终止后才返回。
+async fn await_report_task<T, F>(future: F, timeout: std::time::Duration) -> Result<T, ReportTaskFailure>
+where
+    T: Send + 'static,
+    F: std::future::Future<Output = T> + Send + 'static,
+{
+    let mut task = tokio::spawn(future);
+    tokio::select! {
+        join_result = &mut task => match join_result {
+            Ok(result) => Ok(result),
+            Err(_) => Err(ReportTaskFailure::Panic),
+        },
+        _ = tokio::time::sleep(timeout) => {
+            task.abort();
+            // abort 在任务的下一个 await 点生效；await 到 JoinError 即确认终止
+            let _ = task.await;
+            Err(ReportTaskFailure::Timeout)
+        }
+    }
 }
 
 struct ReportGenerationGuard {
@@ -835,6 +868,63 @@ mod tests {
             "/nonexistent-work-review-export-dir-a1b2c3"
         ))
         .is_err());
+    }
+
+    // ── 日报生成任务超时语义（await_report_task）──────────────────
+
+    #[tokio::test]
+    async fn 日报任务在截止时间内完成应返回结果() {
+        let result = await_report_task(async { 42u32 }, std::time::Duration::from_secs(60)).await;
+        assert!(matches!(result, Ok(42)));
+    }
+
+    #[tokio::test]
+    async fn 日报任务超时应被abort且确认终止而非detach() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        // 任务在 abort 点之后若继续执行会置位此标志；abort 生效后它永远是 false
+        let survived = Arc::new(AtomicBool::new(false));
+        let flag = survived.clone();
+
+        let result = await_report_task(
+            async move {
+                // 永不完成的 future：abort 在其下一个 await 点生效
+                std::future::pending::<()>().await;
+                flag.store(true, Ordering::SeqCst);
+                1u32
+            },
+            std::time::Duration::from_millis(50),
+        )
+        .await;
+
+        assert!(matches!(result, Err(ReportTaskFailure::Timeout)));
+        // await_report_task 返回时任务已终止：abort 点之后的代码从未执行
+        assert!(
+            !survived.load(Ordering::SeqCst),
+            "超时后任务必须真正停止，而不是 detach 继续运行"
+        );
+
+        // 返回后立刻再发起一次"生成"（同一 helper）不会与旧任务并发：
+        // 旧任务已确认终止，新任务独立完成。
+        let second =
+            await_report_task(async { 7u32 }, std::time::Duration::from_secs(60)).await;
+        assert!(matches!(second, Ok(7)));
+        assert!(!survived.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn 日报任务panic应归类为内部错误而非超时() {
+        let result = await_report_task(
+            async {
+                panic!("内部错误");
+                #[allow(unreachable_code)]
+                1u32
+            },
+            std::time::Duration::from_secs(60),
+        )
+        .await;
+        assert!(matches!(result, Err(ReportTaskFailure::Panic)));
     }
 
 }

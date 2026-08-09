@@ -4,7 +4,7 @@
 //! 要不要开口、说什么、什么语气/表情、以及"下次什么时候再来问我"。
 //! 没配模型时整条链路由主循环短路，本模块不会被调用。
 
-use crate::agent::model::{chat_with_tools, Message, ModelTimeouts};
+use crate::agent::model::{chat_with_tools, Deadline, Message};
 use crate::avatar_engine::{emit_avatar_bubble, AvatarBubblePayload};
 use crate::config::ModelConfig;
 use tauri::AppHandle;
@@ -70,7 +70,7 @@ pub async fn decide_and_speak(
         &system,
         &[Message::user(&event)],
         &[],
-        ModelTimeouts::from_assistant_timeout_secs(timeout_secs),
+        Deadline::from_assistant_timeout_secs(timeout_secs),
     )
     .await
     {

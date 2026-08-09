@@ -4,7 +4,7 @@ pub mod local;
 pub mod report_blocks;
 pub mod summary;
 
-use crate::config::{AiMode, AiProvider};
+use crate::config::AiMode;
 use crate::database::{Activity, DailyStats};
 use crate::error::Result;
 use async_trait::async_trait;

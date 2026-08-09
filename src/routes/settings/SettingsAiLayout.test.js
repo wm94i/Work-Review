@@ -90,3 +90,22 @@ test('select 列表应渲染所有已获取模型并提供手动输入选项', a
   assert.match(source, /__manual__/);
   assert.doesNotMatch(source, /MANUAL_MODEL_VALUE/);
 });
+
+test('生成参数设置应按提供商能力映射禁用，避免保存成功但实际忽略', async () => {
+  const source = await readFile(
+    new URL('./components/SettingsAI.svelte', import.meta.url),
+    'utf8'
+  );
+
+  // 能力来自 get_ai_providers 的 generation_capabilities（唯一来源在后端 core）
+  assert.match(source, /generation_capabilities/);
+  assert.match(source, /supportsThinkingToggle/);
+  assert.match(source, /supportsThinkingBudget/);
+  assert.match(source, /supportsMaxOutputTokens/);
+  // 三个生成参数控件都受能力门控
+  assert.match(source, /disabled=\{!supportsThinkingToggle\}/);
+  assert.match(source, /disabled=\{!supportsThinkingBudget\}/);
+  assert.match(source, /disabled=\{!supportsMaxOutputTokens\}/);
+  // 不支持时给出明确提示而非静默忽略
+  assert.match(source, /settingsAI\.generation\.unsupportedProvider/);
+});

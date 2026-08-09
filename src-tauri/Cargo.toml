@@ -91,6 +91,10 @@ x11 = { version = "2.21.0", features = ["xlib", "xinput"] }
 [target.'cfg(any(target_os = "macos", target_os = "linux"))'.dependencies]
 tauri-plugin-autostart = "2.5.1"
 
+# 测试：暂停时钟（tokio test-util）用于超时语义的确定性验证
+[dev-dependencies]
+tokio = { version = "1.35", features = ["test-util"] }
+
 [features]
 default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]

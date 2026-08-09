@@ -236,9 +236,66 @@ fn request_ai_fallback_reason(locale: AppLocale, error_text: &str) -> String {
     reason.to_string()
 }
 
-/// 截断 JSON 用于日志，避免把整个大响应塞进日志。
-fn preview_json(value: &serde_json::Value) -> String {
-    value.to_string().chars().take(300).collect()
+/// 空正文响应的脱敏元数据（供日志）：只记录候选数量、finish reason、
+/// 字段存在性等结构事实，绝不序列化原始内容——响应里可能包含
+/// reasoning_content / thinking / thought 等隐藏推理原文。
+fn openai_response_metadata(response: &serde_json::Value) -> String {
+    let choices = response["choices"].as_array().map(|a| a.len()).unwrap_or(0);
+    let message = &response["choices"][0]["message"];
+    format!(
+        "choices={choices} finish_reason={:?} has_content={} content_is_string={} has_reasoning_content={} has_tool_calls={}",
+        response["choices"][0]["finish_reason"].as_str(),
+        message.get("content").is_some(),
+        message["content"].is_string(),
+        message.get("reasoning_content").is_some(),
+        message.get("tool_calls").is_some(),
+    )
+}
+
+fn ollama_response_metadata(response: &serde_json::Value) -> String {
+    format!(
+        "has_response={} response_is_string={} has_thinking={} done_reason={:?}",
+        response.get("response").is_some(),
+        response["response"].is_string(),
+        response.get("thinking").is_some(),
+        response["done_reason"].as_str(),
+    )
+}
+
+fn claude_response_metadata(response: &serde_json::Value) -> String {
+    let block_types: Vec<&str> = response["content"]
+        .as_array()
+        .map(|blocks| {
+            blocks
+                .iter()
+                .filter_map(|b| b["type"].as_str())
+                .collect()
+        })
+        .unwrap_or_default();
+    format!(
+        "block_types={block_types:?} stop_reason={:?}",
+        response["stop_reason"].as_str(),
+    )
+}
+
+fn gemini_response_metadata(response: &serde_json::Value) -> String {
+    let candidates = response["candidates"].as_array().map(|a| a.len()).unwrap_or(0);
+    let parts = response["candidates"][0]["content"]["parts"]
+        .as_array()
+        .map(|a| a.len())
+        .unwrap_or(0);
+    let thought_parts = response["candidates"][0]["content"]["parts"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter(|p| p["thought"].as_bool() == Some(true))
+                .count()
+        })
+        .unwrap_or(0);
+    format!(
+        "candidates={candidates} parts={parts} thought_parts={thought_parts} finish_reason={:?}",
+        response["candidates"][0]["finishReason"].as_str(),
+    )
 }
 
 /// 从 OpenAI 兼容响应中提取正文。
@@ -261,7 +318,7 @@ fn extract_openai_text(response: &serde_json::Value) -> String {
     if text.is_empty() {
         log::warn!(
             "OpenAI 兼容响应未提取到可用正文: {}",
-            preview_json(response)
+            openai_response_metadata(response)
         );
     }
     text
@@ -271,7 +328,10 @@ fn extract_openai_text(response: &serde_json::Value) -> String {
 fn extract_ollama_text(response: &serde_json::Value) -> String {
     let text = response["response"].as_str().unwrap_or("").trim().to_string();
     if text.is_empty() {
-        log::warn!("Ollama 响应未提取到可用正文: {}", preview_json(response));
+        log::warn!(
+            "Ollama 响应未提取到可用正文: {}",
+            ollama_response_metadata(response)
+        );
     }
     text
 }
@@ -290,7 +350,10 @@ fn extract_claude_text(response: &serde_json::Value) -> String {
     }
     let text = text.trim().to_string();
     if text.is_empty() {
-        log::warn!("Claude 响应未提取到可用正文: {}", preview_json(response));
+        log::warn!(
+            "Claude 响应未提取到可用正文: {}",
+            claude_response_metadata(response)
+        );
     }
     text
 }
@@ -311,7 +374,10 @@ fn extract_gemini_text(response: &serde_json::Value) -> String {
     }
     let text = text.trim().to_string();
     if text.is_empty() {
-        log::warn!("Gemini 响应未提取到可用正文: {}", preview_json(response));
+        log::warn!(
+            "Gemini 响应未提取到可用正文: {}",
+            gemini_response_metadata(response)
+        );
     }
     text
 }
@@ -419,15 +485,37 @@ impl SummaryAnalyzer {
         }
     }
 
+    /// 完整生成参数（含 max_output_tokens），用于 Ollama/Claude/Gemini 路径。
+    fn generation_params(&self) -> crate::generation_params::GenerationParams {
+        crate::generation_params::GenerationParams {
+            enable_thinking: self.enable_thinking,
+            thinking_budget: self.thinking_budget,
+            max_output_tokens: self.max_output_tokens,
+        }
+    }
+
+    /// 仅思考字段（不含 max_output_tokens）：OpenAI 兼容路径的 max_tokens
+    /// 由降档阶梯管理，思考字段才走能力映射。
+    fn thinking_params(&self) -> crate::generation_params::GenerationParams {
+        crate::generation_params::GenerationParams {
+            enable_thinking: self.enable_thinking,
+            thinking_budget: self.thinking_budget,
+            max_output_tokens: None,
+        }
+    }
+
     async fn generate_with_ollama(&self, prompt: &str) -> Result<String> {
+        let mut body = json!({
+            "model": self.model,
+            "prompt": format!("{}\n\n{}", ai_system_prompt(self.locale), prompt),
+            "stream": false,
+        });
+        // 思考开关（think）与输出上限（options.num_predict）按 Ollama 协议映射
+        self.generation_params().apply_to_ollama(&mut body);
         let response = self
             .client
             .post(format!("{}/api/generate", self.endpoint))
-            .json(&json!({
-                "model": self.model,
-                "prompt": format!("{}\n\n{}", ai_system_prompt(self.locale), prompt),
-                "stream": false,
-            }))
+            .json(&body)
             .send()
             .await?;
 
@@ -493,17 +581,11 @@ impl SummaryAnalyzer {
         if let Some(tokens) = max_tokens {
             payload["max_tokens"] = json!(tokens);
         }
-        // 思考模式参数（仅用户显式配置时发送，避免不支持的服务端拒绝未知字段）
-        let mut chat_template_kwargs = serde_json::Map::new();
-        if let Some(enable) = self.enable_thinking {
-            chat_template_kwargs.insert("enable_thinking".to_string(), json!(enable));
-        }
-        if let Some(budget) = self.thinking_budget {
-            chat_template_kwargs.insert("thinking_budget".to_string(), json!(budget));
-        }
-        if !chat_template_kwargs.is_empty() {
-            payload["chat_template_kwargs"] = json!(chat_template_kwargs);
-        }
+        // 思考模式参数按提供商协议映射（Qwen 顶层字段 / SiliconFlow
+        // chat_template_kwargs / 其余未确认支持的提供商不发送）。
+        // max_tokens 由上方降档阶梯管理，这里只应用思考字段。
+        self.thinking_params()
+            .apply_to_openai_compatible(self.provider, &mut payload, false);
 
         let mut last_error: Option<String> = None;
 
@@ -549,27 +631,36 @@ impl SummaryAnalyzer {
             return Err(AppError::Analysis("Claude API Key 未配置".to_string()));
         }
 
-        // Claude API 强制要求 max_tokens，先 4096，过大则 2048 → 1024
-        let max_tokens_steps: &[u32] = &[4096, 2048, 1024];
+        // Claude API 强制要求 max_tokens。用户显式配置了上限时直接使用，
+        // 否则走 4096 → 2048 → 1024 降档阶梯。
+        let max_tokens_steps: Vec<u32> = if let Some(configured) = self.max_output_tokens {
+            vec![configured]
+        } else {
+            vec![4096, 2048, 1024]
+        };
+        let thinking = self.thinking_params();
 
-        for &max_tokens in max_tokens_steps {
+        for &base_max_tokens in &max_tokens_steps {
+            let mut body = json!({
+                "model": self.model,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": prompt
+                    }
+                ],
+                "system": ai_system_prompt(self.locale)
+            });
+            // 思考模式（thinking 块）与 max_tokens 按 Anthropic 协议映射；
+            // 自动保证 max_tokens > budget_tokens（Anthropic 硬性要求）
+            let effective_max_tokens = thinking.apply_to_claude(&mut body, base_max_tokens);
             let response = self
                 .client
                 .post(format!("{}/messages", self.endpoint))
                 .header("x-api-key", api_key)
                 .header("anthropic-version", "2023-06-01")
                 .header("content-type", "application/json")
-                .json(&json!({
-                    "model": self.model,
-                    "max_tokens": max_tokens,
-                    "messages": [
-                        {
-                            "role": "user",
-                            "content": prompt
-                        }
-                    ],
-                    "system": ai_system_prompt(self.locale)
-                }))
+                .json(&body)
                 .send()
                 .await?;
 
@@ -581,7 +672,7 @@ impl SummaryAnalyzer {
             let status = response.status();
             let error_text = response.text().await.unwrap_or_default();
             if is_max_tokens_too_large(&error_text) {
-                log::info!("Claude max_tokens={max_tokens} 超限，降档重试");
+                log::info!("Claude max_tokens={effective_max_tokens} 超限，降档重试");
                 continue;
             }
             return Err(api_response_error("Claude", status, &error_text));
@@ -604,6 +695,10 @@ impl SummaryAnalyzer {
 
         let text = format!("{}\n\n{}", ai_system_prompt(self.locale), prompt);
 
+        // 用户显式配置了最大 token 数：直接使用，不再自动降档
+        if let Some(configured) = self.max_output_tokens {
+            return self.try_gemini_request(&url, &text, Some(configured)).await;
+        }
         // 第一轮：不设 maxOutputTokens
         match self.try_gemini_request(&url, &text, None).await {
             Ok(content) => return Ok(content),
@@ -638,6 +733,9 @@ impl SummaryAnalyzer {
         if let Some(tokens) = max_output_tokens {
             config["maxOutputTokens"] = json!(tokens);
         }
+        // 思考模式按 Gemini 协议映射（generationConfig.thinkingConfig）
+        self.thinking_params()
+            .apply_to_gemini_generation_config(&mut config);
 
         let response = self
             .client
@@ -1246,9 +1344,11 @@ impl Analyzer for SummaryAnalyzer {
 #[cfg(test)]
 mod tests {
     use super::{
-        api_response_error, empty_ai_fallback_reason, extract_claude_text, extract_gemini_text,
-        extract_ollama_text, extract_openai_text, openai_compatible_chat_completion_urls,
-        request_ai_fallback_reason, summary_request_timeout, SummaryAnalyzer,
+        api_response_error, claude_response_metadata, empty_ai_fallback_reason,
+        extract_claude_text, extract_gemini_text, extract_ollama_text, extract_openai_text,
+        gemini_response_metadata, ollama_response_metadata, openai_compatible_chat_completion_urls,
+        openai_response_metadata, request_ai_fallback_reason, summary_request_timeout,
+        SummaryAnalyzer,
     };
     use crate::analysis::Analyzer;
     use crate::analysis::AppLocale;
@@ -1564,5 +1664,78 @@ mod tests {
             .contains("<!-- WR_BLOCK_START:AI_ANALYSIS -->"));
         assert!(report.content.contains("## 四、AI 分析"));
         assert!(report.content.contains("<!-- WR_BLOCK_END:AI_ANALYSIS -->"));
+    }
+
+    #[test]
+    fn 空正文日志元数据不得包含原始推理内容() {
+        // OpenAI 兼容：仅含 reasoning_content 的响应
+        let openai = serde_json::json!({
+            "choices": [{
+                "message": { "content": null, "reasoning_content": "隐藏的推理原文-OPENAI" },
+                "finish_reason": "stop"
+            }]
+        });
+        let meta = openai_response_metadata(&openai);
+        assert!(!meta.contains("隐藏的推理原文"), "日志元数据泄漏了推理内容: {meta}");
+        assert!(meta.contains("has_reasoning_content=true"), "应记录字段存在性: {meta}");
+
+        // Ollama：仅含 thinking 的响应
+        let ollama = serde_json::json!({
+            "response": "",
+            "thinking": "隐藏的推理原文-OLLAMA"
+        });
+        let meta = ollama_response_metadata(&ollama);
+        assert!(!meta.contains("隐藏的推理原文"), "日志元数据泄漏了推理内容: {meta}");
+        assert!(meta.contains("has_thinking=true"), "应记录字段存在性: {meta}");
+
+        // Claude：仅含 thinking 块的响应
+        let claude = serde_json::json!({
+            "content": [{ "type": "thinking", "thinking": "隐藏的推理原文-CLAUDE" }],
+            "stop_reason": "end_turn"
+        });
+        let meta = claude_response_metadata(&claude);
+        assert!(!meta.contains("隐藏的推理原文"), "日志元数据泄漏了推理内容: {meta}");
+        assert!(meta.contains("thinking"), "应记录块类型: {meta}");
+
+        // Gemini：仅含 thought part 的响应
+        let gemini = serde_json::json!({
+            "candidates": [{
+                "content": { "parts": [{ "text": "隐藏的推理原文-GEMINI", "thought": true }] },
+                "finishReason": "STOP"
+            }]
+        });
+        let meta = gemini_response_metadata(&gemini);
+        assert!(!meta.contains("隐藏的推理原文"), "日志元数据泄漏了推理内容: {meta}");
+        assert!(meta.contains("thought_parts=1"), "应记录 thought part 数量: {meta}");
+    }
+
+    #[test]
+    fn 仅含推理内容的响应应提取空正文走友好回退() {
+        // OpenAI 兼容：content=null 且仅含 reasoning_content → 空串
+        assert_eq!(
+            extract_openai_text(&serde_json::json!({
+                "choices": [{ "message": { "content": null, "reasoning_content": "推理" } }]
+            })),
+            ""
+        );
+        // Claude：仅 thinking 块 → 空串
+        assert_eq!(
+            extract_claude_text(&serde_json::json!({
+                "content": [{ "type": "thinking", "thinking": "推理" }]
+            })),
+            ""
+        );
+        // Gemini：仅 thought part → 空串
+        assert_eq!(
+            extract_gemini_text(&serde_json::json!({
+                "candidates": [{ "content": { "parts": [{ "text": "推理", "thought": true }] } }]
+            })),
+            ""
+        );
+        // Ollama：仅 thinking → 空串
+        assert_eq!(
+            extract_ollama_text(&serde_json::json!({ "response": "", "thinking": "推理" })),
+            ""
+        );
     }
 }

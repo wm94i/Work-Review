@@ -260,6 +260,14 @@
   $: currentProvider = localizedProviders.find(p => p.id === config?.text_model?.provider) || localizedProviders[0];
   $: requiresApiKey = currentProvider?.requires_api_key ?? true;
 
+  // 生成参数能力映射（get_ai_providers → generation_capabilities，唯一来源在
+  // 后端 core）：不支持的提供商禁用对应设置项并给出提示，
+  // 避免"保存成功但实际忽略"。
+  $: generationCaps = currentProvider?.generation_capabilities || {};
+  $: supportsThinkingToggle = generationCaps.thinking_toggle === true;
+  $: supportsThinkingBudget = generationCaps.thinking_budget === true;
+  $: supportsMaxOutputTokens = generationCaps.max_output_tokens === true;
+
   // 是否选择了 AI 增强模式（决定是否展开配置面板）
   $: isAiMode = config.ai_mode === 'summary';
 
@@ -845,8 +853,12 @@
       </div>
     </div>
 
-    <!-- 生成参数：思考模式与 token 上限，针对思考型模型（Qwen3/DeepSeek-R1 等） -->
+    <!-- 生成参数：思考模式与 token 上限，针对思考型模型（Qwen3/DeepSeek-R1 等）。
+         按提供商能力映射禁用不支持的项，避免"保存成功但实际忽略"。 -->
     <div class="settings-block p-3.5 space-y-3">
+      {#if !supportsThinkingToggle && !supportsMaxOutputTokens}
+        <p class="settings-note settings-muted">{t('settingsAI.generation.unsupportedProvider')}</p>
+      {/if}
       <div class="flex items-center justify-between gap-3">
         <div class="min-w-0">
           <span class="settings-text text-sm">{t('settingsAI.generation.thinkingMode')}</span>
@@ -855,13 +867,14 @@
         <select
           aria-label={t('settingsAI.generation.thinkingMode')}
           value={thinkingMode}
+          disabled={!supportsThinkingToggle}
           on:change={(e) => {
             thinkingMode = e.target.value;
             config.text_model.enable_thinking =
               thinkingMode === 'default' ? null : thinkingMode === 'on';
             handleChange();
           }}
-          class="w-36 rounded-md border border-slate-200 bg-white px-2 py-1 text-sm dark:border-[#484f58] dark:bg-[#21262d]"
+          class="w-36 rounded-md border border-slate-200 bg-white px-2 py-1 text-sm dark:border-[#484f58] dark:bg-[#21262d] disabled:opacity-40 disabled:cursor-not-allowed"
         >
           <option value="default">{t('settingsAI.generation.serverDefault')}</option>
           <option value="on">{t('settingsAI.generation.thinkingOn')}</option>
@@ -880,6 +893,7 @@
             min="0"
             max="32768"
             step="64"
+            disabled={!supportsThinkingBudget}
             value={config.text_model.thinking_budget ?? ''}
             placeholder={t('settingsAI.generation.unlimited')}
             on:change={(e) => {
@@ -889,7 +903,7 @@
               e.target.value = val ?? '';
               handleChange();
             }}
-            class="w-24 rounded-md border border-slate-200 bg-white px-2 py-1 text-center text-sm dark:border-[#484f58] dark:bg-[#21262d]"
+            class="w-24 rounded-md border border-slate-200 bg-white px-2 py-1 text-center text-sm dark:border-[#484f58] dark:bg-[#21262d] disabled:opacity-40 disabled:cursor-not-allowed"
           />
           <span class="text-xs settings-subtle">tokens</span>
         </div>
@@ -906,6 +920,7 @@
             min="0"
             max="131072"
             step="256"
+            disabled={!supportsMaxOutputTokens}
             value={config.text_model.max_output_tokens ?? ''}
             placeholder={t('settingsAI.generation.unlimited')}
             on:change={(e) => {
@@ -915,7 +930,7 @@
               e.target.value = val ?? '';
               handleChange();
             }}
-            class="w-24 rounded-md border border-slate-200 bg-white px-2 py-1 text-center text-sm dark:border-[#484f58] dark:bg-[#21262d]"
+            class="w-24 rounded-md border border-slate-200 bg-white px-2 py-1 text-center text-sm dark:border-[#484f58] dark:bg-[#21262d] disabled:opacity-40 disabled:cursor-not-allowed"
           />
           <span class="text-xs settings-subtle">tokens</span>
         </div>

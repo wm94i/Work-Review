@@ -711,24 +711,26 @@ pub(crate) async fn generate_text_answer_with_model(
             } else {
                 format!("{ollama_base}/api/chat")
             };
-            let response = client
-                .post(&ollama_url)
-                .json(&serde_json::json!({
-                    "model": model_config.model,
-                    "messages": [
-                        {
-                            "role": "system",
-                            "content": system_prompt
-                        },
-                        {
-                            "role": "user",
-                            "content": prompt
-                        }
-                    ],
-                    "stream": false
-                }))
-                .send()
-                .await?;
+            let mut body = serde_json::json!({
+                "model": model_config.model,
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": system_prompt
+                    },
+                    {
+                        "role": "user",
+                        "content": prompt
+                    }
+                ],
+                "stream": false
+            });
+            // 思考开关与输出上限按 Ollama 协议映射
+            work_review_core::generation_params::GenerationParams::from_model_config(
+                model_config,
+            )
+            .apply_to_ollama(&mut body);
+            let response = client.post(&ollama_url).json(&body).send().await?;
 
             if !response.status().is_success() {
                 return Err(AppError::Analysis(format!(
@@ -738,6 +740,7 @@ pub(crate) async fn generate_text_answer_with_model(
             }
 
             let result: serde_json::Value = response.json().await?;
+            // 思考内容在 message.thinking 字段，只读 message.content，推理不外泄
             let answer = result["message"]["content"]
                 .as_str()
                 .unwrap_or("")
@@ -760,22 +763,27 @@ pub(crate) async fn generate_text_answer_with_model(
             } else {
                 format!("{claude_base}/messages")
             };
+            let mut body = serde_json::json!({
+                "model": model_config.model,
+                "system": system_prompt,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": prompt
+                    }
+                ]
+            });
+            // 思考模式与 max_tokens 按 Anthropic 协议映射
+            work_review_core::generation_params::GenerationParams::from_model_config(
+                model_config,
+            )
+            .apply_to_claude(&mut body, 1600);
             let response = client
                 .post(&claude_url)
                 .header("x-api-key", api_key)
                 .header("anthropic-version", "2023-06-01")
                 .header("content-type", "application/json")
-                .json(&serde_json::json!({
-                    "model": model_config.model,
-                    "max_tokens": 1600,
-                    "system": system_prompt,
-                    "messages": [
-                        {
-                            "role": "user",
-                            "content": prompt
-                        }
-                    ]
-                }))
+                .json(&body)
                 .send()
                 .await?;
 
@@ -787,11 +795,18 @@ pub(crate) async fn generate_text_answer_with_model(
             }
 
             let result: serde_json::Value = response.json().await?;
-            let answer = result["content"][0]["text"]
-                .as_str()
-                .unwrap_or("")
-                .trim()
-                .to_string();
+            // 拼接 text 块；thinking 块是内部推理，跳过（其文本在 thinking 字段）
+            let mut answer = String::new();
+            if let Some(blocks) = result["content"].as_array() {
+                for block in blocks {
+                    if block["type"].as_str() == Some("text") {
+                        if let Some(text) = block["text"].as_str() {
+                            answer.push_str(text);
+                        }
+                    }
+                }
+            }
+            let answer = answer.trim().to_string();
             if answer.is_empty() {
                 return Err(AppError::Analysis("Claude 返回空内容".to_string()));
             }
@@ -809,6 +824,13 @@ pub(crate) async fn generate_text_answer_with_model(
                 "{}/models/{}:generateContent",
                 gemini_base, model_config.model
             );
+            let mut generation_config =
+                serde_json::json!({ "temperature": 0.2, "maxOutputTokens": 1600 });
+            // maxOutputTokens / thinkingConfig 按 Gemini 协议映射
+            work_review_core::generation_params::GenerationParams::from_model_config(
+                model_config,
+            )
+            .apply_to_gemini_generation_config(&mut generation_config);
             let response = client
                 .post(&gemini_url)
                 .header("x-goog-api-key", api_key)
@@ -821,10 +843,7 @@ pub(crate) async fn generate_text_answer_with_model(
                     "systemInstruction": {
                         "parts": [{ "text": system_prompt }]
                     },
-                    "generationConfig": {
-                        "temperature": 0.2,
-                        "maxOutputTokens": 1600
-                    }
+                    "generationConfig": generation_config
                 }))
                 .send()
                 .await?;
@@ -837,11 +856,19 @@ pub(crate) async fn generate_text_answer_with_model(
             }
 
             let result: serde_json::Value = response.json().await?;
-            let answer = result["candidates"][0]["content"]["parts"][0]["text"]
-                .as_str()
-                .unwrap_or("")
-                .trim()
-                .to_string();
+            // 跳过 thought: true 的 part（内部推理），只拼接正文 part
+            let mut answer = String::new();
+            if let Some(parts) = result["candidates"][0]["content"]["parts"].as_array() {
+                for part in parts {
+                    if part["thought"].as_bool() == Some(true) {
+                        continue;
+                    }
+                    if let Some(text) = part["text"].as_str() {
+                        answer.push_str(text);
+                    }
+                }
+            }
+            let answer = answer.trim().to_string();
             if answer.is_empty() {
                 return Err(AppError::Analysis("Gemini 返回空内容".to_string()));
             }
@@ -869,8 +896,11 @@ pub(crate) async fn generate_text_answer_with_model(
                 "max_tokens": 1600,
                 "temperature": 0.2
             });
-            // 用户配置的 max_tokens / 思考模式覆盖默认值
-            crate::agent::model::apply_generation_params(&mut body, model_config);
+            // 用户配置的 max_tokens / 思考模式按提供商协议覆盖默认值
+            work_review_core::generation_params::GenerationParams::from_model_config(
+                model_config,
+            )
+            .apply_to_openai_compatible(model_config.provider, &mut body, false);
             let mut request = client.post(&url).json(&body);
 
             if let Some(api_key) = &model_config.api_key {
@@ -1401,7 +1431,7 @@ pub async fn chat_work_assistant(
             web_tools,
             s.config.avatar_followups.clone(),
             s.config.assistant_memory_enabled,
-            crate::agent::model::ModelTimeouts::from_assistant_timeout_secs(
+            crate::agent::model::Deadline::from_assistant_timeout_secs(
                 s.config.assistant_timeout_secs,
             ),
         )

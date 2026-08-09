@@ -1771,7 +1771,10 @@ struct WindowsBrowserUrlWorker {
 #[cfg(target_os = "windows")]
 impl WindowsBrowserUrlWorker {
     fn new() -> Self {
-        let queue = Arc::new((Mutex::new(LatestOnlySlot::default()), Condvar::new()));
+        let queue = Arc::new((
+            Mutex::new(LatestOnlySlot::<BrowserUrlQueryJob>::default()),
+            Condvar::new(),
+        ));
         let worker_queue = Arc::clone(&queue);
         let available = thread::Builder::new()
             .name("work-review-browser-uia".to_string())

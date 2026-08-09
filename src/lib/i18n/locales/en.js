@@ -1003,6 +1003,7 @@ export default {
         maxOutputTokens: 'Max output tokens',
         maxOutputTokensHint: 'Token cap per generation; leave empty to use the server default',
         unlimited: 'Unlimited',
+        unsupportedProvider: 'This provider has no confirmed support for these generation settings; they are disabled so saved values are never silently ignored or rejected',
       },
       aiModeDisabled: 'Switch to AI Enhanced mode to configure',
       webAccess: {

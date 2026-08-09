@@ -67,3 +67,13 @@ test('Ask 生成期间禁止清空或删除会话，但仍允许打开历史抽�
   assert.match(deleteButton, /disabled=\{sending\}/);
   assert.doesNotMatch(askSource, /class="ask-header-action ask-header-history"[\s\S]{0,240}disabled=\{sending\}/);
 });
+
+test('Ask 兜底超时应通知后端取消，不能只结束 UI 等待让任务继续跑', () => {
+  // withTimeout 支持超时回调；chat_work_assistant 的超时兜底绑定了
+  // cancel_assistant_request，避免后端任务在 UI 超时后继续消耗模型配额。
+  assert.match(askSource, /function withTimeout\(promise, ms, onTimeout\)/);
+  assert.match(
+    askSource,
+    /await withTimeout\([\s\S]*?chat_work_assistant[\s\S]*?askTimeoutMs,\s*\(\) => invoke\('cancel_assistant_request', \{ requestId: assistantMessageId \}\)\s*\)/,
+  );
+});

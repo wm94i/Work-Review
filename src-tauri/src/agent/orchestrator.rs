@@ -241,7 +241,7 @@ impl Orchestrator {
         web_tools: Option<super::tools::WebToolsConfig>,
         runtime: super::tools::AssistantRuntime,
         event_tx: Option<StreamEventSender>,
-        timeouts: super::model::ModelTimeouts,
+        deadline: super::model::Deadline,
     ) -> Result<OrchestratorResult, AppError> {
         let has_model = model_config
             .map(|c| !c.endpoint.trim().is_empty() && !c.model.trim().is_empty())
@@ -295,7 +295,7 @@ impl Orchestrator {
                     web_tools,
                     runtime,
                     event_tx.clone(),
-                    timeouts,
+                    deadline,
                 )
                 .await
                 {

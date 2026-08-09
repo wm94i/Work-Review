@@ -596,10 +596,20 @@
   // 30s，让后端收束路径（基于已有工具结果产出答案）能正常返回，而不是被前端先掐断。
   let askTimeoutMs = 150_000;
 
-  function withTimeout(promise, ms) {
+  function withTimeout(promise, ms, onTimeout) {
     let timer;
     const timeout = new Promise((_, reject) => {
-      timer = setTimeout(() => reject(new Error(t('ask.timeoutError'))), ms);
+      timer = setTimeout(() => {
+        // 兜底超时触发时通知后端取消：不能只结束 UI 等待而让后端任务
+        // 继续跑（否则用户可再发起新请求，两个任务并发消耗模型配额）。
+        // invoke 返回 Promise，其拒绝需显式捕获，避免 unhandledrejection。
+        Promise.resolve()
+          .then(() => onTimeout?.())
+          .catch((callbackError) => {
+            console.warn('超时回调执行失败:', callbackError);
+          });
+        reject(new Error(t('ask.timeoutError')));
+      }, ms);
     });
     return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
   }
@@ -668,7 +678,8 @@
           requestId: assistantMessageId,
           onEvent: channel,
         }),
-        askTimeoutMs
+        askTimeoutMs,
+        () => invoke('cancel_assistant_request', { requestId: assistantMessageId })
       );
 
       // 事件优先：已收到 done/error 则保留事件内容；否则用 await 返回值兜底。

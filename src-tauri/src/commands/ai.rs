@@ -821,7 +821,7 @@ pub async fn test_assistant_search(
 
 #[tauri::command]
 pub async fn get_ai_providers() -> Result<Vec<serde_json::Value>, AppError> {
-    Ok(vec![
+    let mut providers = vec![
         serde_json::json!({
             "id": "ollama",
             "name": "Ollama (本地)",
@@ -975,7 +975,21 @@ pub async fn get_ai_providers() -> Result<Vec<serde_json::Value>, AppError> {
             "requires_api_key": true,
             "supports_vision": false,
         }),
-    ])
+    ];
+
+    // 生成参数能力映射（唯一来源在 core）：前端据此禁用不支持的设置项，
+    // 避免"保存成功但实际忽略"。
+    for provider in &mut providers {
+        let id = provider["id"].as_str().unwrap_or("");
+        let capabilities = serde_json::from_value::<work_review_core::config::AiProvider>(
+            serde_json::json!(id),
+        )
+        .map(|p| p.generation_capabilities())
+        .unwrap_or_default();
+        provider["generation_capabilities"] = serde_json::to_value(capabilities)
+            .unwrap_or_default();
+    }
+    Ok(providers)
 }
 
 
@@ -1155,6 +1169,42 @@ mod tests {
             Some(&embedding_show)
         ));
         assert!(!ollama_model_should_be_listed(&heuristic_only, None));
+    }
+
+    #[tokio::test]
+    async fn 提供商列表应携带生成参数能力映射供前端禁用不支持的设置() {
+        let providers = get_ai_providers().await.expect("应能返回提供商列表");
+        assert!(!providers.is_empty());
+
+        let caps_of = |id: &str| {
+            providers
+                .iter()
+                .find(|p| p["id"] == id)
+                .unwrap_or_else(|| panic!("提供商 {id} 应存在"))["generation_capabilities"]
+                .clone()
+        };
+
+        // Ollama：支持思考开关与输出上限，但没有思考预算参数
+        let ollama = caps_of("ollama");
+        assert_eq!(ollama["thinking_toggle"], serde_json::json!(true));
+        assert_eq!(ollama["thinking_budget"], serde_json::json!(false));
+        assert_eq!(ollama["max_output_tokens"], serde_json::json!(true));
+
+        // Qwen / Claude / Gemini / SiliconFlow：三项全支持
+        for id in ["qwen", "claude", "gemini", "siliconflow"] {
+            let caps = caps_of(id);
+            assert_eq!(caps["thinking_toggle"], serde_json::json!(true), "{id}");
+            assert_eq!(caps["thinking_budget"], serde_json::json!(true), "{id}");
+            assert_eq!(caps["max_output_tokens"], serde_json::json!(true), "{id}");
+        }
+
+        // 未确认支持的提供商：思考字段一律 false，仅保留通用 max_tokens
+        for id in ["openai", "deepseek", "moonshot", "custom"] {
+            let caps = caps_of(id);
+            assert_eq!(caps["thinking_toggle"], serde_json::json!(false), "{id}");
+            assert_eq!(caps["thinking_budget"], serde_json::json!(false), "{id}");
+            assert_eq!(caps["max_output_tokens"], serde_json::json!(true), "{id}");
+        }
     }
 
 }
