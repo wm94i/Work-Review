@@ -41,6 +41,10 @@ src/lib/components/Avatar/AvatarCanvasLive2D.svelte
 src-tauri/target/
 src-tauri/WixTools/
 
+# Tauri updater 私有签名密钥绝不入库（公钥 tauri-updater-key.pub 有意跟踪；
+# 私钥只存在于 Actions secrets）。锚定根目录精确文件名，不会误伤 .pub。
+/tauri-updater-key
+
 # Python
 __pycache__/
 *.pyc
