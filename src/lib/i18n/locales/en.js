@@ -1004,6 +1004,7 @@ export default {
         maxOutputTokensHint: 'Token cap per generation; leave empty to use the server default',
         unlimited: 'Unlimited',
         unsupportedProvider: 'This provider has no confirmed support for these generation settings; they are disabled so saved values are never silently ignored or rejected',
+        thinkingStreamingOnly: 'This provider (DashScope) only supports the thinking switch on streaming calls: it applies to assistant chat; non-streaming paths like the daily report keep the server default and never send the parameter',
       },
       aiModeDisabled: 'Switch to AI Enhanced mode to configure',
       webAccess: {

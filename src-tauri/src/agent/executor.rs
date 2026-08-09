@@ -360,6 +360,9 @@ impl AgentExecutor {
 
                             // 执行工具（Stage 1；联网/行动工具为异步）
                             // 保留 ok 标志：StepResult 需要区分真正失败 vs 成功但 0 引用。
+                            // 工具执行同样只消费剩余 deadline：异步工具（联网/行动/
+                            // 语义检索）在下一个 await 点被截断，不会让单个工具把
+                            // 整体预算偷跑掉；超限按失败处理，下一轮统一收束。
                             ensure_event_receiver_open(&event_tx)?;
                             let (result, ok) = if let Some(denied) = denied_result {
                                 (denied, false)
@@ -367,7 +370,24 @@ impl AgentExecutor {
                                 let execution_result = await_or_cancelled(
                                     &event_tx,
                                     &mut cancel_rx,
-                                    registry.execute(&tc.name, tc.arguments.clone(), &tool_context),
+                                    async {
+                                        match tokio::time::timeout_at(
+                                            deadline.at(),
+                                            registry.execute(
+                                                &tc.name,
+                                                tc.arguments.clone(),
+                                                &tool_context,
+                                            ),
+                                        )
+                                        .await
+                                        {
+                                            Ok(inner) => inner,
+                                            Err(_) => Err(
+                                                "工具执行超出剩余时间预算 (deadline exceeded)"
+                                                    .to_string(),
+                                            ),
+                                        }
+                                    },
                                 )
                                 .await?;
                                 match execution_result {
@@ -962,5 +982,128 @@ mod tests {
             suffix.contains("亚日级") || suffix.contains("暂不支持"),
             "suffix 应说明亚日级粒度限制，实际: {suffix}"
         );
+    }
+
+    // ── Executor 级超时语义 e2e（假模型 + 挂起工具 + 暂停时钟）────
+    //
+    // 证明工具执行也消费同一个 deadline：模型调用一个永不返回的异步工具
+    // （semantic_search 桥挂起）时，工具在 deadline 处被截断，循环在下一轮
+    // 检测到预算耗尽走 wrap_up 收束，整体在预算内结束——而不是挂死或超限。
+    mod executor_deadline_e2e {
+        use super::*;
+        use crate::config::AiProvider;
+        use serde_json::json;
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+
+        /// 假模型：非流式返回一个 semantic_search 的 tool_call。
+        async fn start_fake_model() -> String {
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("应能绑定本机端口");
+            let addr = listener.local_addr().expect("应能取得端口");
+            tokio::spawn(async move {
+                loop {
+                    let Ok((mut socket, _)) = listener.accept().await else {
+                        return;
+                    };
+                    tokio::spawn(async move {
+                        let body = serde_json::to_string(&json!({
+                            "choices": [{
+                                "message": {
+                                    "role": "assistant",
+                                    "content": null,
+                                    "tool_calls": [{
+                                        "id": "call_1",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "semantic_search",
+                                            "arguments": "{\"query\":\"测试\",\"limit\":5}"
+                                        }
+                                    }]
+                                },
+                                "finish_reason": "tool_calls"
+                            }]
+                        }))
+                        .expect("响应体序列化失败");
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        let _ = socket.write_all(response.as_bytes()).await;
+                        let _ = socket.flush().await;
+                        // content-length 已满足读取；保持连接不关闭即可
+                        let _ = std::future::pending::<()>().await;
+                        drop(socket);
+                    });
+                }
+            });
+            format!("http://{addr}/v1")
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn 挂起工具应被deadline截断且循环在预算内收束() {
+            let endpoint = start_fake_model().await;
+            let db = Database::new(std::path::Path::new(":memory:"))
+                .expect("内存数据库创建失败");
+            let config = ModelConfig {
+                provider: AiProvider::OpenAI,
+                endpoint,
+                api_key: Some("test-key".to_string()),
+                model: "test-model".to_string(),
+                enable_thinking: None,
+                thinking_budget: None,
+                max_output_tokens: None,
+            };
+            // 永不返回的语义检索桥：模拟挂起的异步工具
+            let runtime = AssistantRuntime {
+                semantic_search: Some(Arc::new(|_query: String, _limit: usize| {
+                    Box::pin(async {
+                        let _ = std::future::pending::<()>().await;
+                        unreachable!("挂起工具应被 deadline 截断，不会走到这里")
+                    })
+                })),
+                ..Default::default()
+            };
+
+            let budget = Duration::from_secs(6);
+            let started = tokio::time::Instant::now();
+            let result = AgentExecutor::run(
+                "帮我找那篇讲 XX 的文章",
+                &config,
+                &db,
+                None,
+                &[],
+                None,
+                vec![],
+                vec![],
+                None,
+                runtime,
+                None, // 无事件通道 → 非流式路径
+                model::Deadline::from_total(budget),
+            )
+            .await;
+
+            let elapsed = started.elapsed();
+            let agent_result = result.expect("循环应正常收束返回，而不是报错");
+            // 工具被截断（记入 tool_labels）→ 下一轮预算耗尽 → wrap_up 固定文案
+            assert!(
+                agent_result
+                    .tool_labels
+                    .contains(&"semantic_search".to_string()),
+                "挂起工具应已发起并计入步骤: {:?}",
+                agent_result.tool_labels
+            );
+            assert_eq!(
+                agent_result.answer,
+                "抱歉，处理这个问题需要过多步骤。请尝试更具体地描述。",
+                "预算耗尽后应收束到固定文案"
+            );
+            assert!(
+                elapsed <= budget + Duration::from_millis(200),
+                "循环总耗时 {elapsed:?} 不应突破预算 {budget:?}（挂起工具未受 deadline 约束则会永远不返回）"
+            );
+        }
     }
 }

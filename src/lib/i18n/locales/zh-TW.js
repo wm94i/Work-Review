@@ -989,6 +989,7 @@ export default {
         maxOutputTokensHint: '單次生成的 token 上限，留空使用伺服器預設',
         unlimited: '不限',
         unsupportedProvider: '目前供應商未確認支援這些生成參數，已停用設定，避免儲存後被忽略或請求被拒絕',
+        thinkingStreamingOnly: '此供應商（DashScope）僅在串流呼叫中支援思考開關：助手對話生效；日報等非串流場景沿用伺服器預設，不會傳送此參數',
       },
       aiModeDisabled: '切換到「AI 增強」模式後可配置 AI 模型',
       webAccess: {

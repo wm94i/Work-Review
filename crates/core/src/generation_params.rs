@@ -32,6 +32,9 @@ pub struct GenerationCapabilities {
     pub thinking_budget: bool,
     /// 支持限制单次生成 token 上限（max_output_tokens 语义）
     pub max_output_tokens: bool,
+    /// 思考参数仅在流式调用中生效（DashScope 非流式禁止 enable_thinking=true）。
+    /// 前端据此提示"日报等非流式路径沿用服务端默认"，避免误以为全场景生效。
+    pub thinking_streaming_only: bool,
 }
 
 impl AiProvider {
@@ -43,30 +46,35 @@ impl AiProvider {
                 thinking_toggle: true,
                 thinking_budget: false,
                 max_output_tokens: true,
+                thinking_streaming_only: false,
             },
             // DashScope 兼容模式：顶层 enable_thinking / thinking_budget
             AiProvider::Qwen => GenerationCapabilities {
                 thinking_toggle: true,
                 thinking_budget: true,
                 max_output_tokens: true,
+                thinking_streaming_only: true,
             },
             // vLLM/SGLang 托管：chat_template_kwargs
             AiProvider::SiliconFlow => GenerationCapabilities {
                 thinking_toggle: true,
                 thinking_budget: true,
                 max_output_tokens: true,
+                thinking_streaming_only: false,
             },
             // Anthropic：thinking.{type,budget_tokens}
             AiProvider::Claude => GenerationCapabilities {
                 thinking_toggle: true,
                 thinking_budget: true,
                 max_output_tokens: true,
+                thinking_streaming_only: false,
             },
             // Gemini：generationConfig.thinkingConfig
             AiProvider::Gemini => GenerationCapabilities {
                 thinking_toggle: true,
                 thinking_budget: true,
                 max_output_tokens: true,
+                thinking_streaming_only: false,
             },
             // 其余 OpenAI 兼容提供商未确认支持扩展字段：一律不发送，
             // 前端禁用设置项，避免严格端点 400 或静默失效。
@@ -74,6 +82,7 @@ impl AiProvider {
                 thinking_toggle: false,
                 thinking_budget: false,
                 max_output_tokens: true,
+                thinking_streaming_only: false,
             },
         }
     }
@@ -250,6 +259,19 @@ mod tests {
         }
         // Ollama 没有思考预算参数
         assert!(!AiProvider::Ollama.generation_capabilities().thinking_budget);
+        // 只有 DashScope（Qwen）声明"思考仅流式生效"：非流式 enable_thinking=true 会 400
+        assert!(AiProvider::Qwen.generation_capabilities().thinking_streaming_only);
+        for provider in [
+            AiProvider::Ollama,
+            AiProvider::SiliconFlow,
+            AiProvider::Claude,
+            AiProvider::Gemini,
+        ] {
+            assert!(
+                !provider.generation_capabilities().thinking_streaming_only,
+                "{provider:?} 思考参数不应标记为仅流式"
+            );
+        }
         // 未确认支持的提供商一律不发送扩展字段
         for provider in [
             AiProvider::OpenAI,
@@ -269,6 +291,10 @@ mod tests {
             assert!(!caps.thinking_toggle, "{provider:?} 不应声明支持思考开关");
             assert!(!caps.thinking_budget, "{provider:?} 不应声明支持思考预算");
             assert!(caps.max_output_tokens, "{provider:?} 应支持 max_tokens");
+            assert!(
+                !caps.thinking_streaming_only,
+                "{provider:?} 不支持思考时不应声明仅流式"
+            );
         }
     }
 

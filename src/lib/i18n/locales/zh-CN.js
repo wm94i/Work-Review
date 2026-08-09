@@ -988,6 +988,7 @@ export default {
         maxOutputTokensHint: '单次生成的 token 上限，留空使用服务端默认',
         unlimited: '不限',
         unsupportedProvider: '当前提供商未确认支持这些生成参数，已隐藏发送，避免保存后被忽略或请求被拒绝',
+        thinkingStreamingOnly: '该提供商（DashScope）仅在流式调用中支持思考开关：助手对话生效；日报等非流式场景沿用服务端默认，不会发送此参数',
       },
       aiModeDisabled: '切换到「AI 增强」模式后配置',
       webAccess: {

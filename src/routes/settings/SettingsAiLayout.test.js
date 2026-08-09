@@ -108,4 +108,7 @@ test('生成参数设置应按提供商能力映射禁用，避免保存成功�
   assert.match(source, /disabled=\{!supportsMaxOutputTokens\}/);
   // 不支持时给出明确提示而非静默忽略
   assert.match(source, /settingsAI\.generation\.unsupportedProvider/);
+  // DashScope 类"思考仅流式生效"的提供商应给出明确范围提示
+  assert.match(source, /thinkingStreamingOnly/);
+  assert.match(source, /settingsAI\.generation\.thinkingStreamingOnly/);
 });

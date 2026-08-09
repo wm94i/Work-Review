@@ -1197,6 +1197,15 @@ mod tests {
             assert_eq!(caps["thinking_budget"], serde_json::json!(true), "{id}");
             assert_eq!(caps["max_output_tokens"], serde_json::json!(true), "{id}");
         }
+        // Qwen（DashScope）：思考参数仅流式生效，前端据此给出提示
+        assert_eq!(caps_of("qwen")["thinking_streaming_only"], serde_json::json!(true));
+        for id in ["claude", "gemini", "siliconflow", "ollama"] {
+            assert_eq!(
+                caps_of(id)["thinking_streaming_only"],
+                serde_json::json!(false),
+                "{id}"
+            );
+        }
 
         // 未确认支持的提供商：思考字段一律 false，仅保留通用 max_tokens
         for id in ["openai", "deepseek", "moonshot", "custom"] {

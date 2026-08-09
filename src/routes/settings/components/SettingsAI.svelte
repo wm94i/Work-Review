@@ -267,6 +267,7 @@
   $: supportsThinkingToggle = generationCaps.thinking_toggle === true;
   $: supportsThinkingBudget = generationCaps.thinking_budget === true;
   $: supportsMaxOutputTokens = generationCaps.max_output_tokens === true;
+  $: thinkingStreamingOnly = generationCaps.thinking_streaming_only === true;
 
   // 是否选择了 AI 增强模式（决定是否展开配置面板）
   $: isAiMode = config.ai_mode === 'summary';
@@ -881,6 +882,9 @@
           <option value="off">{t('settingsAI.generation.thinkingOff')}</option>
         </select>
       </div>
+      {#if thinkingStreamingOnly && supportsThinkingToggle}
+        <p class="settings-note settings-muted">{t('settingsAI.generation.thinkingStreamingOnly')}</p>
+      {/if}
       <div class="flex items-center justify-between gap-3">
         <div class="min-w-0">
           <span class="settings-text text-sm">{t('settingsAI.generation.thinkingBudget')}</span>
