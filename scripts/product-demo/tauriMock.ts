@@ -238,8 +238,7 @@ function normalizeHistory(value: unknown): DemoAssistantHistoryMessage[] {
 }
 
 function chunkAnswer(answer: string): string[] {
-  const chunks = answer.match(/.{1,18}(?:[，。；]|$)/gu) ?? [answer];
-  return chunks.filter(Boolean);
+  return Array.from(answer.matchAll(/[\s\S]{1,18}/gu), (match) => match[0]);
 }
 
 function buildAssistantEvents(
@@ -324,6 +323,8 @@ export async function handleDemoInvoke(
       return null;
     case 'plugin:window|is_visible':
       return true;
+    case 'plugin:app|version':
+      return '1.1.1-demo';
     case 'get_platform':
     case 'get_runtime_platform':
       return 'macos';

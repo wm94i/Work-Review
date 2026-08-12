@@ -213,10 +213,19 @@ test('助手 Channel 按步骤、令牌、完成、结束顺序发送，活动�
     references: [],
     digest: '已检查今天的活动记录',
   });
-  assert.equal(events.some((event) => event.message?.type === 'token'), true);
+  const streamedAnswer = events
+    .filter((event) => event.message?.type === 'token')
+    .map((event) => String(event.message?.token ?? ''))
+    .join('');
+  assert.equal(streamedAnswer, state.fixtures.assistant.aiAnswer);
   assert.equal(events.at(-2)?.message?.type, 'done');
   assert.equal(events.at(-1)?.end, true);
   assert.deepEqual(events.map((event) => event.index), events.map((_, index) => index));
+});
+
+test('关于页读取固定演示版本号', async () => {
+  const state = createState();
+  assert.equal(await handleDemoInvoke(state, 'plugin:app|version', {}), '1.1.1-demo');
 });
 
 test('动态问题生成固定 JSON，未知命令明确抛错', async () => {
