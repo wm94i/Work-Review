@@ -16,16 +16,28 @@ test('演示夹具锁定日期、时区、活动和统计', () => {
     { time: '16:40', app: 'Terminal', title: 'npm run verify:frontend' },
   ]);
   assert.equal(fixtures.stats.workTimeDuration, 19_800);
-  assert.equal(
-    fixtures.stats.categories.reduce((total, item) => total + item.duration, 0),
-    fixtures.stats.workTimeDuration,
-  );
+  const totals = {
+    activities: fixtures.activities.reduce((total, item) => total + item.duration, 0),
+    apps: fixtures.stats.apps.reduce((total, item) => total + item.duration, 0),
+    categories: fixtures.stats.categories.reduce((total, item) => total + item.duration, 0),
+    hourly: fixtures.stats.hourlyActivity.reduce((total, item) => total + item.duration, 0),
+  };
+  assert.deepEqual(totals, {
+    activities: fixtures.stats.workTimeDuration,
+    apps: fixtures.stats.workTimeDuration,
+    categories: fixtures.stats.workTimeDuration,
+    hourly: fixtures.stats.workTimeDuration,
+  });
 });
 
 test('日报和助手回答符合批准规格', () => {
   const fixtures = createDemoFixtures();
   assert.ok(fixtures.report.sections.length >= 4);
   assert.match(fixtures.assistant.basicAnswer, /5 小时 30 分钟/);
+  assert.match(fixtures.assistant.basicAnswer, /开发 3 小时 10 分钟（57\.6%）/);
+  assert.match(fixtures.assistant.basicAnswer, /办公 1 小时 10 分钟（21\.2%）/);
+  assert.match(fixtures.assistant.basicAnswer, /沟通 45 分钟（13\.6%）/);
+  assert.match(fixtures.assistant.basicAnswer, /浏览 25 分钟（7\.6%）/);
   assert.match(fixtures.assistant.basicAnswer, /Cursor/);
   assert.match(fixtures.assistant.aiAnswer, /16:40/);
   assert.equal(fixtures.activities.find((activity) => activity.time === '16:40')?.title, 'npm run verify:frontend');

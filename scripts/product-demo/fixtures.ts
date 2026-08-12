@@ -45,7 +45,7 @@ const TEMPLATE: DemoFixtures = {
     { id: 103, time: '11:18', timestamp: epoch('11:18'), app: '文档', title: 'Aurora Board 发布检查清单', category: 'office', duration: 2_700, browserUrl: null, screenshotPath: `${SAFE_ROOT}screenshots/release-checklist.png`, ocrText: '发布检查清单：导出、验证、回归' },
     { id: 104, time: '14:03', timestamp: epoch('14:03'), app: '会议', title: 'Aurora Board 周会', category: 'communication', duration: 2_700, browserUrl: null, screenshotPath: `${SAFE_ROOT}screenshots/weekly-meeting.png`, ocrText: 'Aurora Board 周会 · 发布范围同步' },
     { id: 105, time: '15:24', timestamp: epoch('15:24'), app: 'Figma', title: '日报空态与竖屏构图', category: 'office', duration: 1_500, browserUrl: null, screenshotPath: `${SAFE_ROOT}screenshots/vertical-layout.png`, ocrText: '日报空态 · 9:16 构图' },
-    { id: 106, time: '16:40', timestamp: epoch('16:40'), app: 'Terminal', title: 'npm run verify:frontend', category: 'development', duration: 3_600, browserUrl: null, screenshotPath: `${SAFE_ROOT}screenshots/frontend-verify.png`, ocrText: 'svelte-check 0 errors · tests passed · vite build complete' },
+    { id: 106, time: '16:40', timestamp: epoch('16:40'), app: 'Terminal', title: 'npm run verify:frontend', category: 'development', duration: 5_100, browserUrl: null, screenshotPath: `${SAFE_ROOT}screenshots/frontend-verify.png`, ocrText: 'svelte-check 0 errors · tests passed · vite build complete' },
   ],
   stats: {
     totalDuration: 19_800,
@@ -59,7 +59,7 @@ const TEMPLATE: DemoFixtures = {
     ],
     apps: [
       { appName: 'Cursor', duration: 6_300, count: 42 },
-      { appName: 'Terminal', duration: 3_600, count: 18 },
+      { appName: 'Terminal', duration: 5_100, count: 18 },
       { appName: '文档', duration: 2_700, count: 16 },
       { appName: '会议', duration: 2_700, count: 6 },
       { appName: '浏览器', duration: 1_500, count: 12 },
@@ -78,7 +78,7 @@ const TEMPLATE: DemoFixtures = {
   assistant: {
     conversationId: 7_001,
     basicQuestion: '今天主要做了什么？',
-    basicAnswer: '今天共记录有效工作 5 小时 30 分钟。开发 3 小时 10 分钟，办公 1 小时 10 分钟，沟通 45 分钟，浏览 25 分钟。使用最多的应用包括 Cursor、Terminal 和文档；当天还使用了浏览器、会议与 Figma。',
+    basicAnswer: '今天共记录有效工作 5 小时 30 分钟。开发 3 小时 10 分钟（57.6%），办公 1 小时 10 分钟（21.2%），沟通 45 分钟（13.6%），浏览 25 分钟（7.6%）。使用最多的应用包括 Cursor、Terminal 和文档；当天还使用了浏览器、会议与 Figma。',
     aiQuestion: '结合刚才的今日记录，再查今天的活动，提炼一项有依据的日报成果。',
     aiAnswer: '最值得写进日报的成果，是完成 Aurora Board 导出流程的端到端验证，并整理发布检查清单。依据包括上午的实现与文档记录，以及 16:40 执行的前端验证。',
     modelProfile: {
