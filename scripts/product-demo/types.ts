@@ -126,8 +126,28 @@ export interface DemoStoredAssistantMessage {
   createdAt: number;
 }
 
+export interface DemoAssistantHistoryMessage {
+  role: 'user' | 'assistant';
+  content: string;
+}
+
+export interface DemoAssistantRequest {
+  question: string;
+  history: DemoAssistantHistoryMessage[];
+  modelConfig: DemoFixtures['assistant']['modelProfile']['model_config'] | null;
+  requestId: string;
+  channelId: number | null;
+}
+
+export interface DemoChannelEnvelope {
+  index: number;
+  message?: Record<string, unknown>;
+  end?: true;
+}
+
 export interface DemoMockState {
   fixtures: DemoFixtures;
+  config: Record<string, unknown>;
   reportGenerated: boolean;
   reportContent: string;
   selectedAssistantModel: '__basic__' | 'demo-ai';
@@ -139,6 +159,11 @@ export interface DemoMockState {
   openedDirectories: string[];
   invokeLog: DemoInvokeLogEntry[];
   nextMessageId: number;
+  conversationCreateCalls: number;
+  chatCalls: number;
+  appendCalls: number;
+  chatRequests: DemoAssistantRequest[];
+  pendingChannelEvents: Record<number, DemoChannelEnvelope[]>;
 }
 
 export interface ShotContext {
