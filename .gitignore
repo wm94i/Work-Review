@@ -82,3 +82,6 @@ src-tauri/icons.backup/
 /plan.md
 .claude/
 .zcode/
+
+# 产品演示生成产物
+/artifacts/product-demo/

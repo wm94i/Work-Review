@@ -212,7 +212,7 @@ test('全部第一方前端测试应迁移到 TypeScript', async () => {
   const typeScriptTests = testFiles.filter((path) => path.endsWith('.test.ts'));
 
   assert.deepEqual(legacyTests, []);
-  assert.equal(typeScriptTests.length, 115);
+  assert.ok(typeScriptTests.length >= 115, `TypeScript 测试数量意外回退：${typeScriptTests.length}`);
 });
 
 test('全部第一方 Node 工具脚本应迁移到 TypeScript', async () => {
