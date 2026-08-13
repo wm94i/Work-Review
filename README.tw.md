@@ -216,7 +216,7 @@ Work Review 的核心始終是**本地記錄**。AI 的作用是讓記錄更容�
 | macOS (Apple Silicon / Intel) | `.dmg` |
 | Windows | `.exe` / 便攜版 `.zip` |
 | Linux x86_64 (X11 / Wayland) | `.deb` / `.rpm` / `.AppImage` |
-| Linux ARM64 (aarch64) | `.deb` |
+| Linux ARM64 (aarch64) | `.deb` / `.rpm` / `.AppImage` |
 
 **macOS：** 截圖需「螢幕錄製」權限，桌寵聯動需「輔助功能 + 輸入監控」。首次提示"已損壞"時：`sudo xattr -rd com.apple.quarantine "/Applications/Work Review.app"`
 
@@ -240,6 +240,8 @@ sudo zypper install xprintidle tesseract-ocr xdotool xorg-x11-tools gnome-screen
 ```
 
 </details>
+
+AppImage 並非適用於任意 Linux 發行版的萬用套件。GLIBC 相容性門檻只檢查每個 Linux 發布套件內的主程式 ELF，不代表掃描套件內所有函式庫或外掛程式。目前允許的 GLIBC 版本上限為 2.35。每次建置的實際需求以發布工作流程中的 GLIBC 檢測輸出為準。
 
 Ubuntu 24.04 / 24.10 Wayland (GNOME 46–47) 用戶如遇截圖閃屏/快門聲問題，可使用一鍵安裝腳本自動修復：
 

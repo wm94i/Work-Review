@@ -68,8 +68,8 @@ jobs:
           - platform: ubuntu-22.04
             args: "--target x86_64-unknown-linux-gnu --bundles deb,rpm,appimage"
             target: x86_64-unknown-linux-gnu
-          - platform: ubuntu-24.04-arm
-            args: "--target aarch64-unknown-linux-gnu --bundles deb"
+          - platform: ubuntu-22.04-arm
+            args: "--target aarch64-unknown-linux-gnu --bundles deb,rpm,appimage"
             target: aarch64-unknown-linux-gnu
           - platform: windows-latest
             args: ""
@@ -113,7 +113,10 @@ jobs:
             librsvg2-dev \
             patchelf \
             libfuse2 \
-            rpm
+            rpm \
+            rpm2cpio \
+            cpio \
+            binutils
 
       - name: Install frontend dependencies
         run: npm ci
@@ -341,7 +344,9 @@ jobs:
               require_file "*/release/bundle/rpm/*.rpm" "Linux x64 RPM"
               ;;
             aarch64-unknown-linux-gnu)
+              require_file "*/release/bundle/appimage/*.AppImage" "Linux ARM64 AppImage"
               require_file "*/release/bundle/deb/*.deb" "Linux ARM64 DEB"
+              require_file "*/release/bundle/rpm/*.rpm" "Linux ARM64 RPM"
               ;;
             x86_64-pc-windows-msvc)
               require_file "*/release/bundle/nsis/*.exe" "Windows 安装包"
@@ -349,6 +354,29 @@ jobs:
               require_file "*/release/Work_Review_portable_x64.zip" "Windows 便携包"
               ;;
           esac
+
+      - name: Verify Linux GLIBC compatibility
+        if: startsWith(matrix.platform, 'ubuntu')
+        shell: bash
+        env:
+          MAX_GLIBC_VERSION: "2.35"
+        run: |
+          set -euo pipefail
+          mapfile -t artifacts < <(
+            find target -type f \
+              \( -path "*/release/bundle/appimage/*.AppImage" \
+              -o -path "*/release/bundle/deb/*.deb" \
+              -o -path "*/release/bundle/rpm/*.rpm" \) \
+              | sort
+          )
+          if ((${#artifacts[@]} == 0)); then
+            echo "没有可检查的 Linux 发布产物" >&2
+            exit 1
+          fi
+          bash scripts/check-linux-glibc.sh \
+            --max "$MAX_GLIBC_VERSION" \
+            --binary-name Work_Review \
+            "${artifacts[@]}"
 
       - name: Upload release assets
         uses: actions/upload-artifact@v7

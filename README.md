@@ -216,7 +216,7 @@ Supported providers: Ollama (local) / LM Studio (local) / OpenAI compatible / De
 | macOS (Apple Silicon / Intel) | `.dmg` |
 | Windows | `.exe` / portable `.zip` |
 | Linux x86_64 (X11 / Wayland) | `.deb` / `.rpm` / `.AppImage` |
-| Linux ARM64 (aarch64) | `.deb` |
+| Linux ARM64 (aarch64) | `.deb` / `.rpm` / `.AppImage` |
 
 **macOS:** Screenshots require the "Screen Recording" permission, and avatar linkage requires "Accessibility + Input Monitoring". If you see a "damaged" warning on first launch: `sudo xattr -rd com.apple.quarantine "/Applications/Work Review.app"`
 
@@ -240,6 +240,8 @@ sudo zypper install xprintidle tesseract-ocr xdotool xorg-x11-tools gnome-screen
 ```
 
 </details>
+
+AppImage is not a universal package for every Linux distribution. The GLIBC compatibility gate checks only the main program ELF inside each Linux release package; it does not scan every bundled library or plugin. The current maximum allowed GLIBC version is 2.35. The actual requirement of each build is shown in the release workflow's GLIBC check output.
 
 Ubuntu 24.04 / 24.10 Wayland (GNOME 46–47) users experiencing screenshot flash or shutter sound can use the one-click install script to fix it automatically:
 

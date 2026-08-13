@@ -185,6 +185,72 @@ test('多语言 README 应覆盖当前版本关键能力和安装资产', async 
   }
 });
 
+test('英文 README 应说明 Linux 安装包与 GLIBC 兼容性边界', async () => {
+  const source = await readFile(new URL('./README.md', import.meta.url), 'utf8');
+
+  assert.match(
+    source,
+    /\| Linux x86_64 \(X11 \/ Wayland\) \| `\.deb` \/ `\.rpm` \/ `\.AppImage` \|/,
+  );
+  assert.match(
+    source,
+    /\| Linux ARM64 \(aarch64\) \| `\.deb` \/ `\.rpm` \/ `\.AppImage` \|/,
+  );
+  assert.match(source, /AppImage is not a universal package for every Linux distribution\./);
+  assert.match(
+    source,
+    /The GLIBC compatibility gate checks only the main program ELF inside each Linux release package; it does not scan every bundled library or plugin\./,
+  );
+  assert.match(
+    source,
+    /The current maximum allowed GLIBC version is 2\.35\./,
+  );
+  assert.match(
+    source,
+    /The actual requirement of each build is shown in the release workflow's GLIBC check output\./,
+  );
+});
+
+test('简体中文 README 应说明 Linux 安装包与 GLIBC 兼容性边界', async () => {
+  const source = await readFile(new URL('./README.zh.md', import.meta.url), 'utf8');
+
+  assert.match(
+    source,
+    /\| Linux x86_64 \(X11 \/ Wayland\) \| `\.deb` \/ `\.rpm` \/ `\.AppImage` \|/,
+  );
+  assert.match(
+    source,
+    /\| Linux ARM64 \(aarch64\) \| `\.deb` \/ `\.rpm` \/ `\.AppImage` \|/,
+  );
+  assert.match(source, /AppImage 并非适用于任意 Linux 发行版的万能包。/);
+  assert.match(
+    source,
+    /GLIBC 兼容性门禁只检查每个 Linux 发布包内的主程序 ELF，不代表扫描包内所有库或插件。/,
+  );
+  assert.match(source, /当前允许的 GLIBC 版本上限为 2\.35。/);
+  assert.match(source, /每次构建的实际要求以发布工作流中的 GLIBC 检测输出为准。/);
+});
+
+test('繁体中文 README 应说明 Linux 安装包与 GLIBC 兼容性边界', async () => {
+  const source = await readFile(new URL('./README.tw.md', import.meta.url), 'utf8');
+
+  assert.match(
+    source,
+    /\| Linux x86_64 \(X11 \/ Wayland\) \| `\.deb` \/ `\.rpm` \/ `\.AppImage` \|/,
+  );
+  assert.match(
+    source,
+    /\| Linux ARM64 \(aarch64\) \| `\.deb` \/ `\.rpm` \/ `\.AppImage` \|/,
+  );
+  assert.match(source, /AppImage 並非適用於任意 Linux 發行版的萬用套件。/);
+  assert.match(
+    source,
+    /GLIBC 相容性門檻只檢查每個 Linux 發布套件內的主程式 ELF，不代表掃描套件內所有函式庫或外掛程式。/,
+  );
+  assert.match(source, /目前允許的 GLIBC 版本上限為 2\.35。/);
+  assert.match(source, /每次建置的實際需求以發布工作流程中的 GLIBC 檢測輸出為準。/);
+});
+
 test('多语言 README 应展示完整界面预览截图且图片文件存在', async () => {
   const readmes = [
     {

@@ -123,11 +123,99 @@ test('macOS release 应保持 ad-hoc 签名且不导入自签证书', () => {
   assert.doesNotMatch(source, /Verify stable macOS code signature/);
 });
 
+test('Release workflow 两种 Linux 架构应使用 Ubuntu 22.04 并构建三种包', () => {
+  const source = readFileSync(new URL('./.github/workflows/release.yml', import.meta.url), 'utf8');
+  const x64MatrixEntry = source.match(
+    /- platform: ubuntu[^\n]*\n\s+args: "[^"]*x86_64-unknown-linux-gnu[^"]*"\n\s+target: x86_64-unknown-linux-gnu/,
+  )?.[0] ?? '';
+  const arm64MatrixEntry = source.match(
+    /- platform: ubuntu[^\n]*\n\s+args: "[^"]*aarch64-unknown-linux-gnu[^"]*"\n\s+target: aarch64-unknown-linux-gnu/,
+  )?.[0] ?? '';
+
+  assert.ok(x64MatrixEntry, '应能读取 Linux x86_64 构建矩阵配置');
+  assert.match(x64MatrixEntry, /platform:\s*ubuntu-22\.04/);
+  assert.match(
+    x64MatrixEntry,
+    /args:\s*"--target x86_64-unknown-linux-gnu --bundles deb,rpm,appimage"/,
+  );
+  assert.ok(arm64MatrixEntry, '应能读取 Linux ARM64 构建矩阵配置');
+  assert.match(arm64MatrixEntry, /platform:\s*ubuntu-22\.04-arm/);
+  assert.match(
+    arm64MatrixEntry,
+    /args:\s*"--target aarch64-unknown-linux-gnu --bundles deb,rpm,appimage"/,
+  );
+  assert.doesNotMatch(source, /platform:\s*ubuntu-24\.04-arm/);
+});
+
+test('Release workflow ARM64 应校验 AppImage、DEB 和 RPM', () => {
+  const source = readFileSync(new URL('./.github/workflows/release.yml', import.meta.url), 'utf8');
+  const arm64Verification = source.match(
+    /aarch64-unknown-linux-gnu\)([\s\S]*?)\n\s*;;/,
+  )?.[1] ?? '';
+
+  assert.ok(arm64Verification, '应能读取 Linux ARM64 产物校验分支');
+  assert.match(
+    arm64Verification,
+    /require_file "\*\/release\/bundle\/appimage\/\*\.AppImage" "Linux ARM64 AppImage"/,
+  );
+  assert.match(
+    arm64Verification,
+    /require_file "\*\/release\/bundle\/deb\/\*\.deb" "Linux ARM64 DEB"/,
+  );
+  assert.match(
+    arm64Verification,
+    /require_file "\*\/release\/bundle\/rpm\/\*\.rpm" "Linux ARM64 RPM"/,
+  );
+});
+
+test('Release workflow 应在产物校验后上传前执行带版本上限的 GLIBC 检查', () => {
+  const source = readFileSync(new URL('./.github/workflows/release.yml', import.meta.url), 'utf8');
+  const glibcStep = source.match(
+    /- name: [^\n]*GLIBC[^\n]*[\s\S]*?(?=\n\s+- name:)/i,
+  )?.[0] ?? '';
+  const verifyIndex = source.indexOf('name: Verify required artifacts');
+  const glibcIndex = glibcStep ? source.indexOf(glibcStep) : -1;
+  const uploadIndex = source.indexOf('name: Upload release assets');
+
+  assert.notEqual(verifyIndex, -1, '应存在产物校验步骤');
+  assert.ok(glibcStep, '应存在 Linux GLIBC 兼容性检查步骤');
+  assert.match(
+    glibcStep,
+    /if:\s*startsWith\(matrix\.platform,\s*'ubuntu'\)/,
+    'GLIBC 检查只能在 Linux 构建矩阵中执行',
+  );
+  assert.match(
+    glibcStep,
+    /MAX_GLIBC_VERSION:\s*["']?2\.35["']?/,
+    'GLIBC 检查必须将最大允许版本精确锁定为 2.35',
+  );
+  assert.match(
+    glibcStep,
+    /-path "\*\/release\/bundle\/appimage\/\*\.AppImage"/,
+  );
+  assert.match(
+    glibcStep,
+    /-path "\*\/release\/bundle\/deb\/\*\.deb"/,
+  );
+  assert.match(
+    glibcStep,
+    /-path "\*\/release\/bundle\/rpm\/\*\.rpm"/,
+  );
+  assert.match(
+    glibcStep,
+    /bash scripts\/check-linux-glibc\.sh\s+\\\s+--max "\$MAX_GLIBC_VERSION"\s+\\\s+--binary-name Work_Review\s+\\\s+"\$\{artifacts\[@\]\}"/,
+    'GLIBC 检查必须以完整参数调用真实门禁脚本',
+  );
+  assert.notEqual(uploadIndex, -1, '应存在发布附件上传步骤');
+  assert.ok(verifyIndex < glibcIndex, 'GLIBC 检查必须位于产物校验之后');
+  assert.ok(glibcIndex < uploadIndex, 'GLIBC 检查必须位于发布附件上传之前');
+});
+
 test('Release workflow 应构建并上传 Linux RPM 产物', () => {
   const source = readFileSync(new URL('./.github/workflows/release.yml', import.meta.url), 'utf8');
 
   assert.match(source, /args:\s*"--target x86_64-unknown-linux-gnu --bundles deb,rpm,appimage"[\s\S]*target:\s*x86_64-unknown-linux-gnu/);
-  assert.match(source, /args:\s*"--target aarch64-unknown-linux-gnu --bundles deb"[\s\S]*target:\s*aarch64-unknown-linux-gnu/);
+  assert.match(source, /args:\s*"--target aarch64-unknown-linux-gnu --bundles deb,rpm,appimage"[\s\S]*target:\s*aarch64-unknown-linux-gnu/);
   assert.match(source, /sudo apt-get install -y[\s\S]*\brpm\b/);
   assert.match(source, /-name "\*\.rpm"/);
   assert.match(source, /release\/bundle\/rpm\/\*\.rpm/);

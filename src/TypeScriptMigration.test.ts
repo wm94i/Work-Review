@@ -213,6 +213,10 @@ test('全部第一方前端测试应迁移到 TypeScript', async () => {
 
   assert.deepEqual(legacyTests, []);
   assert.ok(typeScriptTests.length >= 115, `TypeScript 测试数量意外回退：${typeScriptTests.length}`);
+  assert.ok(
+    typeScriptTests.includes(join('scripts', 'check-linux-glibc.test.ts')),
+    'GLIBC 门禁测试应作为第一方 TypeScript 测试存在',
+  );
 });
 
 test('全部第一方 Node 工具脚本应迁移到 TypeScript', async () => {
