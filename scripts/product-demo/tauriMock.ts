@@ -1,3 +1,5 @@
+import { deflateSync } from 'node:zlib';
+
 import type { BrowserContext } from 'playwright';
 
 import type {
@@ -9,8 +11,55 @@ import type {
   DemoStoredAssistantMessage,
 } from './types.ts';
 
-const TINY_JPEG_BASE64 =
-  '/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAP//////////////////////////////////////////////////////////////////////////////////////2wBDAf//////////////////////////////////////////////////////////////////////////////////////wAARCAABAAEDASIAAhEBAxEB/8QAFQABAQAAAAAAAAAAAAAAAAAAAAX/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/9oADAMBAAIQAxAAAAF//8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABBQJ//8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAgBAwEBPwF//8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAgBAgEBPwF//8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQAGPwJ//8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABPyF//9oADAMBAAIAAwAAABD/xAAUEQEAAAAAAAAAAAAAAAAAAAAA/9oACAEDAQE/EB//xAAUEQEAAAAAAAAAAAAAAAAAAAAA/9oACAECAQE/EB//xAAUEAEAAAAAAAAAAAAAAAAAAAAA/9oACAEBAAE/EB//2Q==';
+const REPORT_GENERATION_DELAY_MS = 700;
+const ASSISTANT_STREAM_DELAY_MS = 140;
+const PREVIEW_WIDTH = 640;
+const PREVIEW_HEIGHT = 360;
+const PREVIEW_DEFINITION = [
+  { app: 'Nebula IDE', context: 'Export flow implementation', accent: [79, 70, 229] },
+  { app: 'Atlas Browser', context: 'Product specification review', accent: [14, 165, 233] },
+  { app: 'Paperwork Docs', context: 'Release checklist notes', accent: [16, 185, 129] },
+  { app: 'Orbit Meet', context: 'Weekly release sync', accent: [245, 158, 11] },
+  { app: 'Canvas Lab', context: 'Vertical layout concept', accent: [236, 72, 153] },
+  { app: 'Nova Console', context: 'Frontend verification', accent: [139, 92, 246] },
+] as const;
+
+const REDACTED_GLYPHS = [
+  [0x0, 0x0, 0x1ffe0, 0x20, 0x20, 0x20, 0x18020, 0x1ffe0, 0x18020, 0x18020, 0x18000, 0x18000, 0x18000, 0x18008, 0x18018, 0xfff0, 0x0, 0x0, 0x0, 0x0],
+  [0x0, 0x10, 0x630, 0x1f320, 0x11160, 0x117f8, 0x11408, 0x1f408, 0x11408, 0x11408, 0x1f7f8, 0x11160, 0x11160, 0x11160, 0x31360, 0x31764, 0x27e3c, 0x6400, 0x0, 0x0],
+  [0x0, 0xc0c0, 0x80c0, 0x1fe80, 0x10080, 0x201fc, 0x1fd18, 0x14f10, 0x12d90, 0x10890, 0x3fe90, 0x14890, 0x128e0, 0x10860, 0x1fe60, 0x8b0, 0x3b1c, 0x2604, 0x0, 0x0],
+] as const;
+
+
+const BITMAP_FONT: Record<string, readonly number[]> = {
+  ' ': [0, 0, 0, 0, 0, 0, 0],
+  A: [0b01110, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001],
+  B: [0b11110, 0b10001, 0b10001, 0b11110, 0b10001, 0b10001, 0b11110],
+  C: [0b01111, 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b01111],
+  D: [0b11110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b11110],
+  E: [0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b11111],
+  F: [0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b10000],
+  G: [0b01111, 0b10000, 0b10000, 0b10111, 0b10001, 0b10001, 0b01111],
+  H: [0b10001, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001],
+  I: [0b11111, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b11111],
+  J: [0b00111, 0b00010, 0b00010, 0b00010, 0b10010, 0b10010, 0b01100],
+  K: [0b10001, 0b10010, 0b10100, 0b11000, 0b10100, 0b10010, 0b10001],
+  L: [0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b11111],
+  M: [0b10001, 0b11011, 0b10101, 0b10101, 0b10001, 0b10001, 0b10001],
+  N: [0b10001, 0b11001, 0b10101, 0b10011, 0b10001, 0b10001, 0b10001],
+  O: [0b01110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110],
+  P: [0b11110, 0b10001, 0b10001, 0b11110, 0b10000, 0b10000, 0b10000],
+  Q: [0b01110, 0b10001, 0b10001, 0b10001, 0b10101, 0b10010, 0b01101],
+  R: [0b11110, 0b10001, 0b10001, 0b11110, 0b10100, 0b10010, 0b10001],
+  S: [0b01111, 0b10000, 0b10000, 0b01110, 0b00001, 0b00001, 0b11110],
+  T: [0b11111, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100],
+  U: [0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110],
+  V: [0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01010, 0b00100],
+  W: [0b10001, 0b10001, 0b10001, 0b10101, 0b10101, 0b10101, 0b01010],
+  X: [0b10001, 0b10001, 0b01010, 0b00100, 0b01010, 0b10001, 0b10001],
+  Y: [0b10001, 0b10001, 0b01010, 0b00100, 0b00100, 0b00100, 0b00100],
+  Z: [0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b10000, 0b11111],
+};
 
 interface AssistantAnswer {
   answer: string;
@@ -18,6 +67,208 @@ interface AssistantAnswer {
   usedAi: boolean;
   modelName: string | null;
   toolLabels: string[];
+}
+
+interface DemoAssistantReference {
+  sourceType: 'activity';
+  sourceId: number;
+  date: string;
+  timestamp: number;
+  title: string;
+  excerpt: string;
+  appName: string;
+  browserUrl: null;
+  duration: number;
+  score: number;
+}
+
+function sleep(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+function crc32(bytes: Uint8Array): number {
+  let crc = 0xffffffff;
+  for (const byte of bytes) {
+    crc ^= byte;
+    for (let bit = 0; bit < 8; bit += 1) {
+      crc = (crc >>> 1) ^ ((crc & 1) === 1 ? 0xedb88320 : 0);
+    }
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+function pngChunk(type: string, data: Uint8Array): Buffer {
+  const typeBytes = Buffer.from(type, 'ascii');
+  const body = Buffer.concat([typeBytes, data]);
+  const chunk = Buffer.alloc(data.length + 12);
+  chunk.writeUInt32BE(data.length, 0);
+  body.copy(chunk, 4);
+  chunk.writeUInt32BE(crc32(body), data.length + 8);
+  return chunk;
+}
+
+function createInternationalTextChunk(text: string): Buffer {
+  return pngChunk(
+    'iTXt',
+    Buffer.concat([
+      Buffer.from('Description', 'ascii'),
+      Buffer.from([0, 0, 0, 0, 0]),
+      Buffer.from(text, 'utf8'),
+    ]),
+  );
+}
+
+function fillRect(
+  pixels: Buffer,
+  x: number,
+  y: number,
+  width: number,
+  height: number,
+  color: readonly number[],
+): void {
+  const startX = Math.max(0, x);
+  const startY = Math.max(0, y);
+  const endX = Math.min(PREVIEW_WIDTH, x + width);
+  const endY = Math.min(PREVIEW_HEIGHT, y + height);
+  for (let row = startY; row < endY; row += 1) {
+    for (let column = startX; column < endX; column += 1) {
+      const offset = (row * PREVIEW_WIDTH + column) * 4;
+      pixels[offset] = color[0] ?? 0;
+      pixels[offset + 1] = color[1] ?? 0;
+      pixels[offset + 2] = color[2] ?? 0;
+      pixels[offset + 3] = color[3] ?? 255;
+    }
+  }
+}
+
+function drawBitmapText(
+  pixels: Buffer,
+  x: number,
+  y: number,
+  text: string,
+  scale: number,
+  color: readonly number[],
+): void {
+  let cursorX = x;
+  for (const character of text.toUpperCase()) {
+    const rows = BITMAP_FONT[character] ?? BITMAP_FONT[' '];
+    for (const [rowIndex, rowBits] of rows.entries()) {
+      for (let column = 0; column < 5; column += 1) {
+        if ((rowBits & (1 << (4 - column))) === 0) continue;
+        fillRect(
+          pixels,
+          cursorX + column * scale,
+          y + rowIndex * scale,
+          scale,
+          scale,
+          color,
+        );
+      }
+    }
+    cursorX += 6 * scale;
+  }
+}
+
+function drawRedactedBadge(pixels: Buffer): void {
+  const scale = 3;
+  const glyphWidth = 20 * scale;
+  const gap = 8;
+  const badgeWidth = REDACTED_GLYPHS.length * glyphWidth + (REDACTED_GLYPHS.length - 1) * gap + 48;
+  const badgeX = PREVIEW_WIDTH - badgeWidth - 28;
+  const badgeY = 24;
+  fillRect(pixels, badgeX, badgeY, badgeWidth, 84, [15, 23, 42, 235]);
+  for (const [glyphIndex, rows] of REDACTED_GLYPHS.entries()) {
+    const glyphX = badgeX + 24 + glyphIndex * (glyphWidth + gap);
+    for (const [rowIndex, rowBits] of rows.entries()) {
+      for (let column = 0; column < 20; column += 1) {
+        if ((rowBits & (1 << (19 - column))) === 0) continue;
+        fillRect(
+          pixels,
+          glyphX + column * scale,
+          badgeY + 12 + rowIndex * scale,
+          scale,
+          scale,
+          [255, 255, 255, 255],
+        );
+      }
+    }
+  }
+}
+
+function buildPreviewPng(metadata: string, accent: readonly number[], variant: number): string {
+  const pixels = Buffer.alloc(PREVIEW_WIDTH * PREVIEW_HEIGHT * 4);
+  fillRect(pixels, 0, 0, PREVIEW_WIDTH, PREVIEW_HEIGHT, [241, 245, 249, 255]);
+  fillRect(pixels, 0, 0, PREVIEW_WIDTH, 48, [15, 23, 42, 255]);
+  drawBitmapText(pixels, 24, 16, 'Aurora Board', 2, [255, 255, 255, 255]);
+  fillRect(pixels, 24, 76, 592, 260, [255, 255, 255, 255]);
+  fillRect(pixels, 24, 76, 12, 260, [...accent, 255]);
+  drawBitmapText(
+    pixels,
+    62,
+    102,
+    PREVIEW_DEFINITION[variant % PREVIEW_DEFINITION.length].app,
+    3,
+    [51, 65, 85, 255],
+  );
+  fillRect(pixels, 62, 138, 420 - variant * 13, 12, [148, 163, 184, 255]);
+  fillRect(pixels, 62, 168, 360 + variant * 17, 12, [203, 213, 225, 255]);
+  fillRect(pixels, 62, 214, 128, 88, [...accent, 42]);
+  fillRect(pixels, 210, 214, 174, 88, [226, 232, 240, 255]);
+  fillRect(pixels, 404, 214, 170, 88, [226, 232, 240, 255]);
+  drawRedactedBadge(pixels);
+
+  const scanlines = Buffer.alloc(PREVIEW_HEIGHT * (PREVIEW_WIDTH * 4 + 1));
+  for (let row = 0; row < PREVIEW_HEIGHT; row += 1) {
+    const destination = row * (PREVIEW_WIDTH * 4 + 1);
+    scanlines[destination] = 0;
+    pixels.copy(scanlines, destination + 1, row * PREVIEW_WIDTH * 4, (row + 1) * PREVIEW_WIDTH * 4);
+  }
+  const header = Buffer.alloc(13);
+  header.writeUInt32BE(PREVIEW_WIDTH, 0);
+  header.writeUInt32BE(PREVIEW_HEIGHT, 4);
+  header[8] = 8;
+  header[9] = 6;
+  return Buffer.concat([
+    Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]),
+    pngChunk('IHDR', header),
+    createInternationalTextChunk(metadata),
+    pngChunk('IDAT', deflateSync(scanlines, { level: 9 })),
+    pngChunk('IEND', Buffer.alloc(0)),
+  ]).toString('base64');
+}
+
+function buildSafePreview(fixtures: DemoFixtures, path: unknown): string {
+  const index = fixtures.activities.findIndex((activity) => activity.screenshotPath === path);
+  const variant = index >= 0 ? index : 0;
+  const definition = PREVIEW_DEFINITION[variant % PREVIEW_DEFINITION.length];
+  const metadata = `已脱敏 | Aurora Board | ${definition.app} | ${definition.context}`;
+  return buildPreviewPng(metadata, definition.accent, variant);
+}
+
+function buildAiReferences(fixtures: DemoFixtures): DemoAssistantReference[] {
+  const selected = [fixtures.activities[0], fixtures.activities[2], fixtures.activities[5]];
+  const titles = [
+    'Aurora Board 上午导出流程实现',
+    'Aurora Board 上午发布检查清单文档',
+    '16:40 Aurora Board 前端验证通过',
+  ];
+  const excerpts = [
+    '上午完成导出流程实现与端到端整理。',
+    '上午补充发布检查清单与文档记录。',
+    '16:40 完成前端验证，检查结果通过。',
+  ];
+  return selected.map((activity, index) => ({
+    sourceType: 'activity',
+    sourceId: activity.id,
+    date: fixtures.date,
+    timestamp: activity.timestamp,
+    title: titles[index],
+    excerpt: excerpts[index],
+    appName: PREVIEW_DEFINITION[[0, 2, 5][index]].app,
+    browserUrl: null,
+    duration: activity.duration,
+    score: 1 - index * 0.05,
+  }));
 }
 
 function createDemoConfig(fixtures: DemoFixtures): Record<string, unknown> {
@@ -152,6 +403,7 @@ export function createDemoMockState(fixtures: DemoFixtures): DemoMockState {
     appendCalls: 0,
     chatRequests: [],
     pendingChannelEvents: {},
+    unhandledCommands: [],
   };
 }
 
@@ -248,7 +500,10 @@ function buildAssistantEvents(
 ): DemoChannelEnvelope[] {
   const tool = isAi ? 'query_activities' : 'get_today_stats';
   const label = isAi ? '查询今日活动' : '汇总今日统计';
-  const digest = isAi ? '已检查今天的活动记录' : '已汇总今天的工作统计';
+  const digest = isAi
+    ? '命中 3 条 Aurora Board 记录：上午实现、上午文档和 16:40 前端验证。'
+    : '已汇总今天的工作统计';
+  const references = answer.references;
   const messages: Array<Record<string, unknown>> = [
     {
       type: 'stepStart',
@@ -261,8 +516,8 @@ function buildAssistantEvents(
       requestId: request.requestId,
       tool,
       ok: true,
-      hits: 0,
-      references: [],
+      hits: references.length,
+      references,
       digest,
     },
     ...chunkAnswer(answer.answer).map((token) => ({
@@ -274,7 +529,7 @@ function buildAssistantEvents(
       type: 'done',
       requestId: request.requestId,
       answer: answer.answer,
-      references: [],
+      references,
       toolLabels: [label],
       usedAi: answer.usedAi,
       modelName: answer.modelName,
@@ -328,8 +583,28 @@ export async function handleDemoInvoke(
     case 'get_platform':
     case 'get_runtime_platform':
       return 'macos';
+    case 'check_permissions':
+      return {
+        screen_capture: true,
+        accessibility: true,
+        input_monitoring: true,
+        screenshot_supported: true,
+        avatar_input_supported: true,
+        all_granted: true,
+        platform: 'macos',
+      };
     case 'get_config':
       return clone(state.config);
+    case 'get_update_settings':
+      return {
+        autoCheck: true,
+        lastCheckTime: 0,
+        checkIntervalHours: 24,
+      };
+    case 'save_update_settings':
+      return null;
+    case 'should_check_updates':
+      return false;
     case 'save_config': {
       const config = args.config;
       if (typeof config !== 'object' || config === null || Array.isArray(config)) {
@@ -374,9 +649,12 @@ export async function handleDemoInvoke(
           duration: activity.duration,
         }],
       }));
+    case 'get_app_icon':
+      // 演示不读取宿主机应用图标；返回空值让前端使用确定性的内置回退图标。
+      return '';
     case 'get_screenshot_thumbnail':
     case 'get_screenshot_full':
-      return TINY_JPEG_BASE64;
+      return buildSafePreview(state.fixtures, args.path);
     case 'get_saved_report':
       if (!state.reportGenerated || args.date !== state.fixtures.date) return null;
       return {
@@ -386,6 +664,7 @@ export async function handleDemoInvoke(
         ai_mode: 'local',
       };
     case 'generate_report':
+      await sleep(REPORT_GENERATION_DELAY_MS);
       state.reportGenerated = true;
       state.reportContent = state.fixtures.report.content;
       return null;
@@ -497,7 +776,7 @@ export async function handleDemoInvoke(
       if (isAi) assertAiHistory(state, request.history);
       const answer: AssistantAnswer = {
         answer: isAi ? state.fixtures.assistant.aiAnswer : state.fixtures.assistant.basicAnswer,
-        references: [],
+        references: isAi ? buildAiReferences(state.fixtures) : [],
         usedAi: isAi,
         modelName: isAi ? state.fixtures.assistant.modelProfile.name : null,
         toolLabels: [isAi ? '查询今日活动' : '汇总今日统计'],
@@ -514,6 +793,7 @@ export async function handleDemoInvoke(
     case 'confirm_assistant_action':
       return null;
     default:
+      state.unhandledCommands.push(command);
       throw new Error(`产品演示 Tauri Mock 未实现命令：${command}`);
   }
 }
@@ -574,8 +854,10 @@ function buildDemoTauriInitScript(locale: DemoFixtures['locale']): string {
         }
         const response = await window.__WORK_REVIEW_DEMO_INVOKE__(command, normalizedArgs);
         if (response.channelId !== null) {
+          const deliver = callbacks.get(response.channelId);
           for (const event of response.events) {
-            callbacks.get(response.channelId)?.(event);
+            await new Promise((resolve) => setTimeout(resolve, ${ASSISTANT_STREAM_DELAY_MS}));
+            deliver?.(event);
           }
         }
         return response.result;
@@ -601,6 +883,20 @@ export async function installDemoTauriMock(
         events: channelId === null ? [] : takePendingChannelEvents(state, channelId),
       };
     },
+  );
+
+  await context.exposeFunction(
+    '__WORK_REVIEW_DEMO_SHOT_INVOKES__',
+    async () => clone(state.invokeLog),
+  );
+
+  await context.exposeFunction(
+    '__WORK_REVIEW_DEMO_EXPORTED_FILES__',
+    async () => clone(Object.entries(state.exportedFiles).map(([path, content]) => ({
+      path,
+      content,
+      kind: 'markdown' as const,
+    }))),
   );
 
   // 通过纯 JavaScript 字符串注入，避免 tsx/esbuild 给序列化函数插入浏览器中不存在的 __name 辅助函数。

@@ -73,7 +73,7 @@ export const STORYBOARD: readonly StoryboardScene[] = [
     start: 68,
     end: 78,
     route: '/settings',
-    voiceoverZh: '活动记录和截图默认保存在本机；目录可以查看，日报也能导出为 Markdown。外部 AI 与远程存储按配置使用。',
+    voiceoverZh: '活动记录和截图默认本机；查目录、导出 Markdown；外部 AI、远程存储按配置使用。',
     subtitleEn: 'Activity records and screenshots stay on your device by default. Inspect the folder and export reports as Markdown; external AI and remote storage follow your configuration.',
     composition: {
       '16x9': { crop: '1920:1080:0:0', scale: '1920:1080', focus: '本地数据目录与导出成功提示' },

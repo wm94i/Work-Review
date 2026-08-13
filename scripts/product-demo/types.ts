@@ -164,6 +164,7 @@ export interface DemoMockState {
   appendCalls: number;
   chatRequests: DemoAssistantRequest[];
   pendingChannelEvents: Record<number, DemoChannelEnvelope[]>;
+  unhandledCommands: string[];
 }
 
 export interface ShotContext {
@@ -171,6 +172,10 @@ export interface ShotContext {
   aspect: DemoAspect;
   scene: StoryboardScene;
   fixtures: DemoFixtures;
+  /** 标记源录屏中正式内容开始的位置，合成时会跳过导航和字体加载预卷。 */
+  markContentStart?: () => void;
+  /** 在弹窗、三档隐私等关键瞬态仍可见时主动保存动作验收帧。 */
+  captureActionFrame?: () => Promise<void>;
 }
 
 export type ShotRunner = (context: ShotContext) => Promise<void>;

@@ -20,7 +20,14 @@
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
     "tauri:build": "tauri build",
-    "tauri:build:local-mac": "tauri build --target aarch64-apple-darwin --bundles app --config src-tauri/tauri.local.conf.json"
+    "tauri:build:local-mac": "tauri build --target aarch64-apple-darwin --bundles app --config src-tauri/tauri.local.conf.json",
+    "demo:check": "node --test-timeout=60000 --import tsx --test \"scripts/product-demo/*.test.ts\"",
+    "demo:capture": "node --import tsx scripts/product-demo/cli.ts capture",
+    "demo:subtitles": "node --import tsx scripts/product-demo/cli.ts subtitles",
+    "demo:audio": "node --import tsx scripts/product-demo/cli.ts audio",
+    "demo:compose": "node --import tsx scripts/product-demo/cli.ts compose",
+    "demo:validate": "node --import tsx scripts/product-demo/cli.ts validate",
+    "demo:build": "node --import tsx scripts/product-demo/cli.ts build"
   },
   "devDependencies": {
     "@sveltejs/vite-plugin-svelte": "^3.0.0",
