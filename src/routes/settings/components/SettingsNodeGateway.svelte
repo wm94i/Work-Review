@@ -2,6 +2,8 @@
   import { createEventDispatcher, onMount, onDestroy } from 'svelte';
   import { invoke } from '@tauri-apps/api/core';
   import { locale, t } from '$lib/i18n/index.ts';
+  import { updateConfigQueued } from '$lib/utils/configSaveQueue.ts';
+  import { applyConfigFields } from '$lib/utils/appearancePersistence.ts';
   import CollapsibleSection from '../../../lib/components/CollapsibleSection.svelte';
 
   import McpServerPanel from './nodeGateway/McpServerPanel.svelte';
@@ -45,6 +47,30 @@
     dingtalk_bot_enabled: boolean;
     dingtalk_app_secret: string;
   }
+
+
+  const NODE_GATEWAY_CONFIG_FIELDS = [
+    'node_gateway',
+    'node_devices',
+    'mcp_server_enabled',
+    'localhost_api_enabled',
+    'localhost_api_host',
+    'localhost_api_port',
+    'telegram_bot_enabled',
+    'telegram_bot_token',
+    'telegram_bot_proxy',
+    'telegram_bot_allowed_chat_ids',
+    'feishu_bot_enabled',
+    'feishu_app_id',
+    'feishu_app_secret',
+    'feishu_verification_token',
+    'wecom_bot_enabled',
+    'wecom_corp_id',
+    'wecom_token',
+    'wecom_encoding_aes_key',
+    'dingtalk_bot_enabled',
+    'dingtalk_app_secret',
+  ] as const satisfies readonly (keyof NodeGatewayConfig)[];
 
   interface NodeGatewayStatus {
     deviceId: string;
@@ -175,8 +201,11 @@
   async function persistConfig() {
     saving = true;
     normalizeConfig();
+    const configSnapshot = structuredClone(config);
     try {
-      await invoke<void>('save_config', { config });
+      await updateConfigQueued<NodeGatewayConfig>((latestConfig) =>
+        applyConfigFields(latestConfig, configSnapshot, NODE_GATEWAY_CONFIG_FIELDS)
+      );
       dispatch('change', config);
       // Reload status after save
       const [node, local, tg] = await Promise.all([

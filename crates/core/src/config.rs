@@ -1037,6 +1037,9 @@ pub struct AppConfig {
     pub last_app_version: Option<String>,
     /// 主题模式: system, light, dark
     pub theme: String,
+    /// 界面模板: classic / evidence-star-map
+    #[serde(default = "default_ui_template")]
+    pub ui_template: String,
     /// 界面风格: a=Quiet Pro, b=当前柔和层次, c=Compact Data
     #[serde(default = "default_ui_visual_style")]
     pub ui_visual_style: String,
@@ -1232,6 +1235,9 @@ fn default_avatar_preset() -> String {
 fn default_avatar_persona() -> String {
     "assistant".to_string()
 }
+fn default_ui_template() -> String {
+    "classic".to_string()
+}
 fn default_ui_visual_style() -> String {
     "c".to_string()
 }
@@ -1292,6 +1298,7 @@ impl Default for AppConfig {
             macos_screen_capture_permission_prompted: false,
             last_app_version: None,
             theme: "system".to_string(),
+            ui_template: default_ui_template(),
             ui_visual_style: default_ui_visual_style(),
             work_start_hour: 9,
             work_end_hour: 18,
@@ -1377,6 +1384,7 @@ impl AppConfig {
         );
         self.screenshot_interval = normalize_screenshot_interval(self.screenshot_interval);
         self.idle_threshold_minutes = normalize_idle_threshold_minutes(self.idle_threshold_minutes);
+        self.ui_template = normalize_ui_template(&self.ui_template);
         self.ui_visual_style = normalize_ui_visual_style(&self.ui_visual_style);
         self.avatar_scale = normalize_avatar_scale(self.avatar_scale);
         self.avatar_opacity = normalize_avatar_opacity(self.avatar_opacity);
@@ -1943,6 +1951,13 @@ fn normalize_avatar_persona(value: &str) -> String {
     }
 }
 
+fn normalize_ui_template(value: &str) -> String {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "classic" | "evidence-star-map" => value.trim().to_ascii_lowercase(),
+        _ => default_ui_template(),
+    }
+}
+
 fn normalize_ui_visual_style(value: &str) -> String {
     match value.trim().to_ascii_lowercase().as_str() {
         "a" | "b" | "c" => value.trim().to_ascii_lowercase(),
@@ -2022,12 +2037,14 @@ mod tests {
 
     use super::{
         commit_pending_config, config_backup_path, default_avatar_opacity, default_avatar_persona,
-        default_avatar_preset, default_avatar_scale, default_ui_visual_style,
+        default_avatar_preset, default_avatar_scale, default_ui_template,
+        default_ui_visual_style,
         normalize_app_category_rules, normalize_avatar_followups, normalize_avatar_opacity,
         normalize_avatar_persona, normalize_avatar_preset, normalize_avatar_scale,
-        normalize_ui_visual_style, update_config_backup_with_sync, AiProvider, AppCategoryRule,
-        AppConfig, AvatarFollowupItem, ConfigLoadStatus, PendingConfigFile, RemoteStorageProvider,
-        ScreenshotDisplayMode, WebsiteSemanticRule, DEFAULT_LOCALHOST_API_PORT,
+        normalize_ui_template, normalize_ui_visual_style, update_config_backup_with_sync,
+        AiProvider, AppCategoryRule, AppConfig, AvatarFollowupItem, ConfigLoadStatus,
+        PendingConfigFile, RemoteStorageProvider, ScreenshotDisplayMode, WebsiteSemanticRule,
+        DEFAULT_LOCALHOST_API_PORT,
     };
     use std::io::{self, Write};
     use std::path::PathBuf;
@@ -2495,6 +2512,32 @@ mod tests {
         assert_eq!(normalize_ui_visual_style("B"), "b");
         assert_eq!(normalize_ui_visual_style("c"), "c");
         assert_eq!(normalize_ui_visual_style("unknown"), "c");
+    }
+
+    #[test]
+    fn 界面模板默认应为经典模式且只允许两种模板() {
+        let config = AppConfig::default();
+
+        assert_eq!(config.ui_template, default_ui_template());
+        assert_eq!(config.ui_template, "classic");
+        assert_eq!(normalize_ui_template(" classic "), "classic");
+        assert_eq!(
+            normalize_ui_template("EVIDENCE-STAR-MAP"),
+            "evidence-star-map"
+        );
+        assert_eq!(normalize_ui_template("unknown"), "classic");
+    }
+
+    #[test]
+    fn 配置规范化应修复非法界面模板() {
+        let mut config = AppConfig {
+            ui_template: " experimental ".to_string(),
+            ..AppConfig::default()
+        };
+
+        config.normalize();
+
+        assert_eq!(config.ui_template, "classic");
     }
 
     #[test]

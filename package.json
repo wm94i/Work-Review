@@ -51,6 +51,7 @@
     "@tauri-apps/plugin-process": "^2.3.1",
     "@tauri-apps/plugin-shell": "^2.3.4",
     "dompurify": "^3.4.12",
+    "lucide-svelte": "^1.0.1",
     "marked": "^11.0.0",
     "svelte-spa-router": "^4.0.0"
   }

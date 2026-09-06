@@ -2,7 +2,13 @@
   import { createEventDispatcher, onDestroy, onMount } from 'svelte';
   import { invoke } from '@tauri-apps/api/core';
   import { showToast } from '$lib/stores/toast.ts';
+  import { cache } from '$lib/stores/cache.ts';
   import { locale, t } from '$lib/i18n/index.ts';
+  import { updateConfigQueued } from '$lib/utils/configSaveQueue.ts';
+  import {
+    applyConfigFields,
+    createPersistedConfigSnapshot,
+  } from '$lib/utils/appearancePersistence.ts';
   import {
     AVATAR_OPACITY_DEFAULT,
     AVATAR_SCALE_DEFAULT,
@@ -26,6 +32,7 @@
   type AppearanceMode = 'full' | 'avatar-only' | 'background-only';
   type AvatarPersona = 'companion' | 'assistant' | 'coach';
   type UiVisualStyle = 'a' | 'b' | 'c';
+  type UiTemplate = 'classic' | 'evidence-star-map';
 
   interface AppearanceConfig {
     avatar_enabled: boolean;
@@ -39,15 +46,22 @@
     break_reminder_enabled: boolean;
     break_reminder_interval_minutes: number;
     ui_visual_style: UiVisualStyle;
+    ui_template: UiTemplate;
     background_image: string | null;
     background_opacity?: number | null;
     background_blur?: number | null;
   }
 
+  type AppearanceConfigField = keyof AppearanceConfig;
+
   type AppearanceChangeDetail = AppearanceConfig | {
     autosaved: true;
     config: AppearanceConfig;
   };
+
+  function configsMatch(current: AppearanceConfig, snapshot: AppearanceConfig): boolean {
+    return JSON.stringify(current) === JSON.stringify(snapshot);
+  }
 
   export let config: AppearanceConfig;
   export let mode: AppearanceMode = 'full';
@@ -57,16 +71,42 @@
   $: showAvatarControls = mode === 'full' || mode === 'avatar-only';
   $: showInterfaceStyleSettings = mode === 'full' || mode === 'background-only';
   $: showBackgroundSettings = mode === 'full' || mode === 'background-only';
-
   let avatarSaving = false;
   let avatarScaleSaving = false;
   let avatarOpacitySaving = false;
   let avatarPersonaSaving = false;
   let avatarPresetSaving = false;
   let uiVisualStyleSaving = false;
+  let uiTemplateSaving = false;
+  let pendingUiTemplate: UiTemplate | null = null;
+  let persistedUiTemplate: UiTemplate = config.ui_template || 'classic';
+  const persistedConfigSnapshot = createPersistedConfigSnapshot(config);
+  let observedConfig = config;
+
+  async function saveAppearanceConfig(
+    nextConfig: AppearanceConfig,
+    fields: readonly AppearanceConfigField[],
+  ): Promise<AppearanceConfig> {
+    const configSnapshot = structuredClone(nextConfig);
+    const savedConfig = await updateConfigQueued<AppearanceConfig>((latestConfig) => (
+      applyConfigFields(latestConfig, configSnapshot, fields)
+    ));
+    persistedConfigSnapshot.recordSuccessfulSave(savedConfig);
+    return savedConfig;
+  }
+  $: if (config !== observedConfig && !uiTemplateSaving && pendingUiTemplate === null) {
+    observedConfig = config;
+    persistedUiTemplate = config.ui_template || 'classic';
+    persistedConfigSnapshot.recordSuccessfulSave(config);
+  }
+
   let avatarScaleTimer: ReturnType<typeof setTimeout> | null = null;
   let avatarOpacityTimer: ReturnType<typeof setTimeout> | null = null;
   const breakReminderIntervals = [30, 45, 50, 60, 90, 120];
+  const UI_TEMPLATE_OPTIONS: readonly { id: UiTemplate; titleKey: string; descriptionKey: string }[] = [
+    { id: 'classic', titleKey: 'settingsAppearance.uiTemplateClassic', descriptionKey: 'settingsAppearance.uiTemplateClassicDesc' },
+    { id: 'evidence-star-map', titleKey: 'settingsAppearance.evidenceStarMap', descriptionKey: 'settingsAppearance.evidenceStarMapDesc' },
+  ];
   const UI_VISUAL_STYLE_OPTIONS: readonly {
     id: UiVisualStyle;
     titleKey: string;
@@ -168,7 +208,7 @@
       }
 
       const enabled = await toggleAvatarSetting(config, async (nextConfig) => {
-        await invoke<void>('save_config', { config: nextConfig });
+        await saveAppearanceConfig(nextConfig, ['avatar_enabled', 'break_reminder_enabled']);
       });
 
       dispatch('change', config);
@@ -188,7 +228,7 @@
 
       try {
         const savedScale = await updateAvatarScaleSetting(config, nextScale, async (nextConfig) => {
-          await invoke<void>('save_config', { config: nextConfig });
+          await saveAppearanceConfig(nextConfig, ['avatar_scale']);
         });
         config.avatar_scale = savedScale;
         dispatch('change', config);
@@ -220,7 +260,7 @@
           config,
           nextOpacity,
           async (nextConfig) => {
-            await invoke<void>('save_config', { config: nextConfig });
+            await saveAppearanceConfig(nextConfig, ['avatar_opacity']);
           }
         );
         config.avatar_opacity = savedOpacity;
@@ -254,7 +294,7 @@
     dispatch('change', config);
 
     try {
-      await invoke<void>('save_config', { config });
+      await saveAppearanceConfig(config, ['avatar_preset']);
     } catch (e) {
       config.avatar_preset = previousPreset;
       dispatch('change', config);
@@ -276,7 +316,7 @@
     dispatch('change', config);
 
     try {
-      await invoke<void>('save_config', { config });
+      await saveAppearanceConfig(config, ['avatar_persona']);
     } catch (e) {
       config.avatar_persona = previousPersona;
       dispatch('change', config);
@@ -284,6 +324,54 @@
       showToast(t('settingsAppearance.avatarPersonaSaveFailed', { error: e }), 'error');
     } finally {
       avatarPersonaSaving = false;
+    }
+  }
+
+  async function selectUiTemplate(templateId: UiTemplate) {
+    if (config.ui_template === templateId && pendingUiTemplate === null) return;
+
+    pendingUiTemplate = templateId;
+    config.ui_template = templateId;
+    dispatch('change', config);
+    window.dispatchEvent(new CustomEvent('ui-template-changed', { detail: { template: templateId } }));
+
+    if (uiTemplateSaving) return;
+
+    uiTemplateSaving = true;
+    try {
+      while (pendingUiTemplate !== null) {
+        const templateToSave = pendingUiTemplate;
+        pendingUiTemplate = null;
+        const previousTemplate = persistedUiTemplate;
+        const configSnapshot = structuredClone(config);
+        configSnapshot.ui_template = templateToSave;
+
+        try {
+          const savedConfig = await saveAppearanceConfig(configSnapshot, ['ui_template']);
+          persistedUiTemplate = templateToSave;
+
+          if (pendingUiTemplate === null && configsMatch(config, configSnapshot)) {
+            cache.setConfig(structuredClone(savedConfig));
+            dispatch('change', { autosaved: true, config });
+          } else {
+            dispatch('change', config);
+          }
+        } catch (e) {
+          if (pendingUiTemplate !== null) {
+            console.warn('较早的界面模板保存失败，继续保存最新选择:', e);
+            continue;
+          }
+
+          config.ui_template = previousTemplate;
+          persistedUiTemplate = previousTemplate;
+          cache.setConfig(persistedConfigSnapshot.read());
+          dispatch('change', config);
+          window.dispatchEvent(new CustomEvent('ui-template-changed', { detail: { template: previousTemplate } }));
+          showToast(t('settingsAppearance.uiTemplateSaveFailed', { error: e }), 'error');
+        }
+      }
+    } finally {
+      uiTemplateSaving = false;
     }
   }
 
@@ -302,7 +390,7 @@
     }));
 
     try {
-      await invoke<void>('save_config', { config });
+      await saveAppearanceConfig(config, ['ui_visual_style']);
     } catch (e) {
       config.ui_visual_style = previousStyle;
       dispatch('change', { autosaved: true, config });
@@ -323,7 +411,7 @@
 
     config.break_reminder_enabled = !config.break_reminder_enabled;
     dispatch('change', config);
-    saveConfigQuietly();
+    saveConfigQuietly(['break_reminder_enabled']);
   }
 
   function toggleAvatarProactiveAi() {
@@ -333,12 +421,12 @@
 
     config.avatar_proactive_ai_enabled = !Boolean(config.avatar_proactive_ai_enabled);
     dispatch('change', config);
-    saveConfigQuietly();
+    saveConfigQuietly(['avatar_proactive_ai_enabled']);
   }
 
   function handleBreakReminderIntervalChange() {
     dispatch('change', config);
-    saveConfigQuietly();
+    saveConfigQuietly(['break_reminder_interval_minutes']);
   }
 
   function handleBgFileSelect(event: Event) {
@@ -365,7 +453,7 @@
         await invoke<void>('save_background_image', { data: b64Data });
         if (appearanceDestroyed) return;
         config.background_image = 'background.jpg';
-        await invoke<void>('save_config', { config });
+        await saveAppearanceConfig(config, ['background_image']);
         const freshB64 = await invoke<string | null>('get_background_image');
         if (appearanceDestroyed) return;
         const imageUrl = freshB64 ? `data:image/jpeg;base64,${freshB64}` : null;
@@ -390,7 +478,7 @@
       bgPreview = null;
       config.background_image = null;
       dispatchBgEvent(null);
-      await invoke<void>('save_config', { config });
+      await saveAppearanceConfig(config, ['background_image']);
     } catch (e) {
       console.error('清除背景图失败:', e);
       showToast(t('settingsAppearance.clearFailed', { error: e }), 'error');
@@ -401,14 +489,14 @@
     config.background_opacity = parseFloat(String(val));
     dispatch('change', config);
     dispatchBgEvent(bgPreview);
-    saveConfigQuietly();
+    saveConfigQuietly(['background_opacity']);
   }
 
   function updateBgBlur(val: string | number) {
     config.background_blur = parseInt(String(val), 10);
     dispatch('change', config);
     dispatchBgEvent(bgPreview);
-    saveConfigQuietly();
+    saveConfigQuietly(['background_blur']);
   }
 
   function dispatchBgEvent(image: string | null) {
@@ -421,9 +509,9 @@
     }));
   }
 
-  async function saveConfigQuietly() {
+  async function saveConfigQuietly(fields: readonly AppearanceConfigField[]) {
     try {
-      await invoke<void>('save_config', { config });
+      await saveAppearanceConfig(config, fields);
     } catch (e) {
       console.error('自动保存配置失败:', e);
     }
@@ -695,6 +783,21 @@
 {/if}
 
 {#if showInterfaceStyleSettings}
+<div class="settings-card evidence-template-settings">
+  <div class="flex items-start justify-between gap-4">
+    <div><h3 class="settings-card-title">{t('settingsAppearance.uiTemplate')}</h3><p class="settings-muted mt-1">{t('settingsAppearance.uiTemplateDesc')}</p></div>
+    {#if uiTemplateSaving}<span class="text-xs settings-subtle">{t('settingsAppearance.syncing')}</span>{/if}
+  </div>
+  <div class="mt-4 grid gap-3 md:grid-cols-2">
+    {#each UI_TEMPLATE_OPTIONS as option}
+      <button type="button" class="settings-style-option evidence-template-option" class:settings-style-option-active={config.ui_template === option.id} on:click={() => selectUiTemplate(option.id)} aria-pressed={config.ui_template === option.id}>
+        <div class="evidence-template-preview evidence-template-preview--{option.id}" aria-hidden="true"><span></span><span></span><span></span></div>
+        <div class="mt-3" style="text-align: start;"><div class="text-sm font-semibold settings-text">{t(option.titleKey)}</div><p class="mt-2 text-xs leading-5 settings-muted">{t(option.descriptionKey)}</p></div>
+      </button>
+    {/each}
+  </div>
+</div>
+
 <div class="settings-card" data-locale={currentLocale}>
   <div class="flex items-start justify-between gap-4">
     <div>

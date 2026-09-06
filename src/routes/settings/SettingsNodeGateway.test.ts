@@ -30,7 +30,11 @@ test('节点设置组件应复用设置页配置对象并读取节点与本地 A
   assert.match(source, /invoke(?:<[^>]+>)?\('get_node_gateway_status'\)/);
   assert.match(source, /invoke(?:<[^>]+>)?\('get_localhost_api_status'\)/);
   assert.match(source, /invoke(?:<[^>]+>)?\('get_telegram_bot_status'\)/);
-  assert.match(source, /invoke(?:<[^>]+>)?\('save_config', \{ config \}\)/);
+  assert.match(source, /import \{ updateConfigQueued \} from '\$lib\/utils\/configSaveQueue\.ts'/);
+  assert.match(source, /const configSnapshot = structuredClone\(config\)/);
+  assert.match(source, /updateConfigQueued<NodeGatewayConfig>/);
+  assert.match(source, /applyConfigFields\(latestConfig, configSnapshot, NODE_GATEWAY_CONFIG_FIELDS\)/);
+  assert.doesNotMatch(source, /saveConfigQueued\(/);
   assert.match(source, /nodeGatewayPage\.title/);
 });
 
@@ -90,4 +94,38 @@ test('拆分后应包含三个分组的 CollapsibleSection', async () => {
   assert.match(source, /LocalApiPanel/);
   assert.match(source, /TelegramBotPanel/);
   assert.match(source, /BotCredentialsPanel/);
+});
+
+
+test('节点网关保存只应合并节点网关、本地 API 与机器人字段', async () => {
+  const source = await readFile(
+    new URL('./components/SettingsNodeGateway.svelte', import.meta.url),
+    'utf8'
+  );
+  const match = source.match(/const NODE_GATEWAY_CONFIG_FIELDS = \[([\s\S]*?)\] as const/);
+  assert.ok(match, '缺少 NODE_GATEWAY_CONFIG_FIELDS 字段白名单');
+  const fields = [...match[1].matchAll(/'([^']+)'/g)].map((item) => item[1]);
+
+  assert.deepEqual(fields, [
+    'node_gateway',
+    'node_devices',
+    'mcp_server_enabled',
+    'localhost_api_enabled',
+    'localhost_api_host',
+    'localhost_api_port',
+    'telegram_bot_enabled',
+    'telegram_bot_token',
+    'telegram_bot_proxy',
+    'telegram_bot_allowed_chat_ids',
+    'feishu_bot_enabled',
+    'feishu_app_id',
+    'feishu_app_secret',
+    'feishu_verification_token',
+    'wecom_bot_enabled',
+    'wecom_corp_id',
+    'wecom_token',
+    'wecom_encoding_aes_key',
+    'dingtalk_bot_enabled',
+    'dingtalk_app_secret',
+  ]);
 });

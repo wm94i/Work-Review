@@ -6,6 +6,7 @@ test('时间线详情应支持修改应用默认分类并二次确认后回填�
   const source = await readFile(new URL('./Timeline.svelte', import.meta.url), 'utf8');
 
   assert.match(source, /invoke\('set_app_category_rule'/);
+  assert.match(source, /runConfigMutationQueued\(\(\) => invoke\('set_app_category_rule'/);
   assert.match(source, /timeline\.changeCategoryMessage/);
   assert.match(source, /timeline\.detail\.appCategoryHelp/);
   assert.match(source, /pendingChangeCategory/);
@@ -103,7 +104,7 @@ test('分类确认保存结束后应在按钮重新可用时恢复焦点，且�
   );
 });
 
-test('自定义分类的重命名与删除符号按钮应提供明确名称并隐藏装饰符号', async () => {
+test('自定义分类的重命名与删除按钮应提供明确名称并使用 Lucide 图标', async () => {
   const source = await readFile(new URL('./Timeline.svelte', import.meta.url), 'utf8');
   const actionsStart = source.indexOf('class="timeline-category-option-actions"');
   const actionsEnd = source.indexOf('</div>', actionsStart);
@@ -112,10 +113,28 @@ test('自定义分类的重命名与删除符号按钮应提供明确名称并�
   assert.ok(actionsStart >= 0 && actionsEnd > actionsStart, '应能定位自定义分类操作区');
   assert.match(
     actionsSource,
-    /aria-label=\{t\('timeline\.renameCategory'\)\}[\s\S]*?<span aria-hidden="true">✎<\/span>/
+    /aria-label=\{t\('timeline\.renameCategory'\)\}[\s\S]*?<Pencil\b[\s\S]*?aria-hidden="true"/
   );
   assert.match(
     actionsSource,
-    /aria-label=\{t\('timeline\.deleteCategory'\)\}[\s\S]*?<span aria-hidden="true">×<\/span>/
+    /aria-label=\{t\('timeline\.deleteCategory'\)\}[\s\S]*?<X\b[\s\S]*?aria-hidden="true"/
   );
+});
+
+test('时间线所有会持久化配置的分类命令与隐私更新应共享配置变更队列', async () => {
+  const source = await readFile(new URL('./Timeline.svelte', import.meta.url), 'utf8');
+
+  for (const command of [
+    'set_app_category_rule',
+    'save_custom_category',
+    'delete_custom_category',
+  ]) {
+    assert.match(
+      source,
+      new RegExp(`runConfigMutationQueued\\([\\s\\S]{0,120}invoke(?:<[^>]+>)?\\('${command}'`),
+      `${command} 必须进入共享配置变更队列`,
+    );
+  }
+  assert.match(source, /updateConfigQueued<TimelineConfig>/);
+  assert.doesNotMatch(source, /await invoke<TimelineConfig>\('get_config'\);[\s\S]{0,900}await saveConfigQueued\(config\)/);
 });

@@ -5,6 +5,8 @@
   import { cache } from '../../lib/stores/cache.ts';
   import { locale, t } from '$lib/i18n/index.ts';
   import { formatUserError } from '$lib/utils/errorDisplay.ts';
+  import { updateConfigQueued } from '$lib/utils/configSaveQueue.ts';
+  import { applyConfigFields } from '$lib/utils/appearancePersistence.ts';
   import { showToast } from '../../lib/stores/toast.ts';
 
   import SettingsGeneral from './components/SettingsGeneral.svelte';
@@ -84,6 +86,7 @@
     | 'app_category_rules'
     | 'privacy'
     | 'ui_visual_style'
+    | 'ui_template'
   > & {
     [Key in NullableCredentialKey]: string | null;
   } & {
@@ -102,7 +105,76 @@
     app_category_rules?: unknown[];
     privacy: DraftPrivacySettings | null;
     ui_visual_style: string;
+    ui_template: string;
   };
+
+
+  const SETTINGS_FORM_CONFIG_FIELDS = [
+    'auto_start',
+    'auto_start_silent',
+    'hide_dock_icon',
+    'lightweight_mode',
+    'work_time_enabled',
+    'work_time_segments',
+    'work_start_hour',
+    'work_start_minute',
+    'work_end_hour',
+    'work_end_minute',
+    'standard_work_hours',
+    'idle_threshold_minutes',
+    'daily_work_goal_minutes',
+    'goal_notifications',
+    'memory_enabled',
+    'daily_report_auto_generate_time',
+    'avatar_enabled',
+    'avatar_scale',
+    'avatar_opacity',
+    'avatar_persona',
+    'avatar_preset',
+    'avatar_click_through',
+    'avatar_body_hidden',
+    'avatar_proactive_ai_enabled',
+    'break_reminder_enabled',
+    'break_reminder_interval_minutes',
+    // Appearance(background-only) 独立自动保存字段不得进入全局保存快照。
+    'ai_mode',
+    'text_model',
+    'assistant_web_access_enabled',
+    'assistant_search_provider',
+    'assistant_search_api_key',
+    'memory_semantic_enabled',
+    'embedding_provider',
+    'embedding_endpoint',
+    'embedding_model',
+    'embedding_api_key',
+    'assistant_memory_enabled',
+    'node_gateway',
+    'node_devices',
+    'mcp_server_enabled',
+    'localhost_api_enabled',
+    'localhost_api_host',
+    'localhost_api_port',
+    'telegram_bot_enabled',
+    'telegram_bot_token',
+    'telegram_bot_proxy',
+    'telegram_bot_allowed_chat_ids',
+    'feishu_bot_enabled',
+    'feishu_app_id',
+    'feishu_app_secret',
+    'feishu_verification_token',
+    'wecom_bot_enabled',
+    'wecom_corp_id',
+    'wecom_token',
+    'wecom_encoding_aes_key',
+    'dingtalk_bot_enabled',
+    'dingtalk_app_secret',
+    'privacy',
+    'screenshot_interval',
+    'storage',
+    'daily_report_export_dir',
+    'daily_report_auto_export',
+    'remote_storage',
+  ] as const satisfies readonly (keyof SettingsConfig)[];
 
   type SettingsTabId = 'general' | 'appearance' | 'ai' | 'avatar' | 'privacy' | 'storage' | 'node';
 
@@ -195,6 +267,9 @@
       }
       if (!['a', 'b', 'c'].includes(loadedConfig.ui_visual_style)) {
         loadedConfig.ui_visual_style = 'c';
+      }
+      if (!['classic', 'evidence-star-map'].includes(loadedConfig.ui_template)) {
+        loadedConfig.ui_template = 'classic';
       }
       if (typeof loadedConfig.avatar_proactive_ai_enabled !== 'boolean') {
         loadedConfig.avatar_proactive_ai_enabled = false;
@@ -328,17 +403,20 @@
   // 保存配置
   async function saveConfig() {
     if (!config) return;
-    const currentConfig = config;
+    const configSnapshot = structuredClone(config);
     saving = true;
     error = null;
     success = false;
 
     try {
-      delete currentConfig.privacy?.sensitive_keywords;
-      await invoke<void>('save_config', { config: currentConfig });
+      delete configSnapshot.privacy?.sensitive_keywords;
+      const persistedConfig = await updateConfigQueued<SettingsConfig>((latestConfig) =>
+        applyConfigFields(latestConfig, configSnapshot, SETTINGS_FORM_CONFIG_FIELDS)
+      );
+      config = persistedConfig;
       success = true;
       dirty = false;
-      cache.setConfig(currentConfig);
+      cache.setConfig(persistedConfig);
       showToast(t('settings.saveSuccessToast'), 'success');
       
       if (successTimer !== null) clearTimeout(successTimer);

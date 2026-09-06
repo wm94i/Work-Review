@@ -11,6 +11,7 @@
   import { cache, type CacheState } from '../../lib/stores/cache.ts';
   import { formatLocalizedDate, formatLocalizedTime, formatDurationLocalized, locale, t, tm, translateCategoryLabel } from '$lib/i18n/index.ts';
   import { formatUserError } from '$lib/utils/errorDisplay.ts';
+  import { updateConfigQueued } from '$lib/utils/configSaveQueue.ts';
   import { shouldShowPromptAppliedToast } from './reportPromptFeedback.ts';
   import { resolveReportMeta, type ResolvedReportMeta } from './reportMeta.ts';
   import {
@@ -132,6 +133,8 @@
   const reportGenerationOwnership = createReportGenerationOwnership();
   let exportInProgress = false;
   let promptSaving = false;
+  let pendingReportPrompt: string | null = null;
+  let promptSaveTask: Promise<void> | null = null;
   let cacheData: CacheState | null = null;
   // ── 2026-07 日报改版：页头动作收敛为「导出 ▾」菜单 + 生成设置抽屉 ──
   let showExportMenu = false;
@@ -335,26 +338,59 @@
   }
 
   async function persistReportPrompt() {
-    if (!config || config.ai_mode !== 'summary' || promptSaving) {
+    if (!config || config.ai_mode !== 'summary') {
       return;
     }
 
-    promptSaving = true;
-    try {
-      config.daily_report_custom_prompt = (config.daily_report_custom_prompt || '').trim();
-      await invoke('save_config', { config });
-    } finally {
-      promptSaving = false;
+    const customPrompt = (config.daily_report_custom_prompt || '').trim();
+    config.daily_report_custom_prompt = customPrompt;
+    pendingReportPrompt = customPrompt;
+
+    if (promptSaveTask) {
+      return promptSaveTask;
     }
+
+    promptSaving = true;
+    const drainTask = (async () => {
+      let firstSaveError: unknown;
+      let hasSaveError = false;
+
+      while (pendingReportPrompt !== null) {
+        const promptToSave = pendingReportPrompt;
+        pendingReportPrompt = null;
+        try {
+          await updateConfigQueued<ReportConfig>((latestConfig) => {
+            latestConfig.daily_report_custom_prompt = promptToSave;
+          });
+        } catch (e) {
+          if (!hasSaveError) {
+            firstSaveError = e;
+            hasSaveError = true;
+          }
+        }
+      }
+
+      if (hasSaveError) {
+        throw firstSaveError;
+      }
+    })();
+    promptSaveTask = drainTask.finally(() => {
+      promptSaving = false;
+      promptSaveTask = null;
+    });
+    return promptSaveTask;
   }
 
   /** 预设数量上限：防止胶片区无界增高（与工作时段 MAX_WORK_SEGMENTS 同类防御）。 */
   const MAX_PROMPT_PRESETS = 12;
 
-  async function savePresets() {
+  async function persistPromptPresets() {
     if (!config) return;
+    const promptPresets = structuredClone(config.daily_report_prompt_presets);
     try {
-      await invoke('save_config', { config });
+      await updateConfigQueued<ReportConfig>((latestConfig) => {
+        latestConfig.daily_report_prompt_presets = promptPresets;
+      });
     } catch (e) {
       console.error('保存预设失败:', e);
     }
@@ -573,7 +609,7 @@
       currentConfig.daily_report_custom_prompt = '';
       persistReportPrompt();
     }
-    await savePresets();
+    await persistPromptPresets();
   }
 
   function selectPromptPreset(preset: PromptPreset, active: boolean) {
@@ -598,7 +634,7 @@
         presets.push(entry);
       }
       config.daily_report_prompt_presets = presets;
-      await savePresets();
+      await persistPromptPresets();
       showPresetModal = false;
     } finally {
       presetSaving = false;

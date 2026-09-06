@@ -61,7 +61,7 @@ test('切换开机自启后应立即持久化 config，避免用户忘点保存�
   assert.ok(toggleMatch, '未找到 toggleAutoStart 函数');
   assert.match(
     toggleMatch[0],
-    /invoke(?:<[^>]+>)?\('save_config'\s*,\s*\{\s*config\s*\}\)/,
+    /updateConfigQueued<GeneralConfig>\(\(latestConfig\)\s*=>\s*\{[\s\S]*?latestConfig\.auto_start\s*=\s*autoStartEnabled/,
   );
 });
 
@@ -92,7 +92,7 @@ test('切换"静默驻留"模式后应立即持久化 config，否则开机决�
   assert.match(updateMatch[0], /config\.auto_start_silent\s*=/);
   assert.match(
     updateMatch[0],
-    /invoke(?:<[^>]+>)?\('save_config'\s*,\s*\{\s*config\s*\}\)/,
+    /updateConfigQueued<GeneralConfig>\(\(latestConfig\)\s*=>\s*\{[\s\S]*?latestConfig\.auto_start_silent\s*=\s*silentMode/,
   );
 });
 
@@ -124,8 +124,21 @@ test('onMount 同步注册表与 config 不一致时也应落盘，避免下次�
   assert.match(onMountMatch[0], /config\.auto_start\s*!==\s*autoStartEnabled/);
   assert.match(
     onMountMatch[0],
-    /invoke(?:<[^>]+>)?\('save_config'\s*,\s*\{\s*config\s*\}\)/,
+    /updateConfigQueued<GeneralConfig>\(\(latestConfig\)\s*=>\s*\{[\s\S]*?latestConfig\.auto_start\s*=\s*autoStartEnabled/,
   );
+});
+
+test('基本设置的局部持久化不应排队保存完整旧配置快照', async () => {
+  const source = await readFile(
+    new URL('./components/SettingsGeneral.svelte', import.meta.url),
+    'utf8'
+  );
+
+  assert.match(
+    source,
+    /import\s*\{\s*updateConfigQueued\s*\}\s*from\s*['"]\$lib\/utils\/configSaveQueue\.ts['"]/
+  );
+  assert.doesNotMatch(source, /saveConfigQueued/);
 });
 
 test('基本设置页不应继续直接承载本地 API 管理入口，相关能力应迁入节点 Beta 标签', async () => {

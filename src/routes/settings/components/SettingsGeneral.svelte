@@ -2,6 +2,7 @@
   import { createEventDispatcher, onMount } from 'svelte';
   import { invoke } from '@tauri-apps/api/core';
   import { formatDurationLocalized, locale, t } from '$lib/i18n/index.ts';
+  import { updateConfigQueued } from '$lib/utils/configSaveQueue.ts';
   import CollapsibleSection from '../../../lib/components/CollapsibleSection.svelte';
 
   interface WorkTimeSegment {
@@ -46,7 +47,9 @@
       if (config.auto_start !== autoStartEnabled) {
         config.auto_start = autoStartEnabled;
         try {
-          await invoke<void>('save_config', { config });
+          await updateConfigQueued<GeneralConfig>((latestConfig) => {
+            latestConfig.auto_start = autoStartEnabled;
+          });
         } catch (e) {
           console.error('对齐注册表自启状态时写盘失败:', e);
         }
@@ -213,7 +216,9 @@
       autoStartEnabled = await invoke<boolean>('is_autostart_enabled');
       config.auto_start = autoStartEnabled;
       try {
-        await invoke<void>('save_config', { config });
+        await updateConfigQueued<GeneralConfig>((latestConfig) => {
+          latestConfig.auto_start = autoStartEnabled;
+        });
       } catch (e) {
         console.error('保存开机自启状态失败:', e);
       }
@@ -241,7 +246,9 @@
   async function updateAutoStartLaunchMode(silentMode: boolean) {
     config.auto_start_silent = silentMode;
     try {
-      await invoke<void>('save_config', { config });
+      await updateConfigQueued<GeneralConfig>((latestConfig) => {
+        latestConfig.auto_start_silent = silentMode;
+      });
     } catch (e) {
       console.error('保存启动模式失败:', e);
     }

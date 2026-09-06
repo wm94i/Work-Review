@@ -1,8 +1,11 @@
 <script lang="ts">
   import { onMount, tick, type ComponentType } from 'svelte';
-  import Router, { push } from 'svelte-spa-router';
+  import Router, { location, push } from 'svelte-spa-router';
   import { wrap } from 'svelte-spa-router/wrap';
   import Sidebar from './lib/components/Sidebar.svelte';
+  import EvidenceShell from './lib/components/evidence/EvidenceShell.svelte';
+  import EvidenceNavigation from './lib/components/evidence/EvidenceNavigation.svelte';
+  import { applyUiTemplate, uiTemplate } from './lib/stores/uiTemplate.ts';
   import Toast from './lib/components/Toast.svelte';
   import ConfirmDialog from './lib/components/ConfirmDialog.svelte';
   import { invoke } from '@tauri-apps/api/core';
@@ -12,9 +15,13 @@
   import { recordingStore } from './lib/stores/recording.ts';
   import { applyLocaleToDocument, initializeLocale, locale, t } from '$lib/i18n/index.ts';
   import { preloadAppIcons, type AppIconInvoke } from './lib/stores/iconCache.ts';
+  import { updateConfigQueued } from './lib/utils/configSaveQueue.ts';
   import { runUpdateFlow } from './lib/utils/updater.ts';
   import { isTimelineActivity } from './routes/timeline/timelineData.ts';
   import { timelineGateway } from './routes/timeline/timelineGateway.ts';
+  import Minus from 'lucide-svelte/icons/minus';
+  import Square from 'lucide-svelte/icons/square';
+  import X from 'lucide-svelte/icons/x';
 
   type Theme = 'system' | 'light' | 'dark';
   type UiVisualStyle = 'a' | 'b' | 'c';
@@ -28,6 +35,7 @@
     lightweight_mode?: boolean;
     theme?: Theme;
     ui_visual_style?: string;
+    ui_template?: string;
     background_image?: string | null;
     background_opacity?: number;
     background_blur?: number;
@@ -103,6 +111,7 @@
 
     const optionalStringFields = [
       'ui_visual_style',
+      'ui_template',
       'background_image',
       'daily_report_auto_generate_time',
       'memory_last_synthesis_date',
@@ -281,6 +290,19 @@
     }
   }
 
+  async function toggleEvidenceRecording(): Promise<void> {
+    if (!isRecording || recordingTransitionPending) return;
+
+    recordingTransitionPending = true;
+    try {
+      await invoke(isPaused ? 'resume_recording' : 'pause_recording');
+    } catch (error) {
+      console.error('切换录制状态失败:', error);
+    } finally {
+      recordingTransitionPending = false;
+    }
+  }
+
   // 预加载核心数据
   const invokeAppIcon: AppIconInvoke = (command, args) => invoke<string>(command, {
     appName: args.appName,
@@ -349,6 +371,7 @@
   let isDark = false;
   let isRecording = true;
   let isPaused = false;
+  let recordingTransitionPending = false;
   let platform = '';
   let backgroundImage: string | null = null;
   let backgroundOpacity = 0.25;
@@ -388,10 +411,10 @@
     applyTheme(newTheme);
 
     try {
-      const config = await getRuntimeConfig();
-      config.theme = newTheme;
-      await invoke('save_config', { config });
-      cache.setConfig(config);
+      const savedConfig = await updateConfigQueued<RuntimeConfig>((config) => {
+        config.theme = newTheme;
+      });
+      cache.setConfig(savedConfig);
     } catch (e) {
       console.error('保存主题配置失败:', e);
     }
@@ -546,10 +569,12 @@
         cache.setConfig(config);
         applyTheme(config.theme || 'system');
         applyUiVisualStyle(config.ui_visual_style || 'c');
+        applyUiTemplate(config.ui_template || 'classic');
       } catch (e) {
         console.error('加载配置失败:', e);
         applyTheme('system');
         applyUiVisualStyle('c');
+        applyUiTemplate('classic');
         config = { work_end_hour: 18 };
         runtimeConfig = config;
       }
@@ -590,6 +615,8 @@
         if (state.config.ui_visual_style && state.config.ui_visual_style !== uiVisualStyle) {
           applyUiVisualStyle(state.config.ui_visual_style);
         }
+
+        applyUiTemplate(state.config.ui_template || 'classic');
       });
       pendingCleanup.push(unsubscribeCache);
 
@@ -611,6 +638,7 @@
         (payload) => {
           runtimeConfig = payload;
           applyUiVisualStyle(payload.ui_visual_style || 'c');
+          applyUiTemplate(payload.ui_template || 'classic');
           cache.setConfig(payload);
         },
       );
@@ -654,6 +682,13 @@
       };
       window.addEventListener('ui-visual-style-changed', handleUiVisualStyleChange);
       pendingCleanup.push(() => window.removeEventListener('ui-visual-style-changed', handleUiVisualStyleChange));
+
+      const handleUiTemplateChange = (event: Event) => {
+        const detail = (event as CustomEvent<{ template?: string }>).detail;
+        applyUiTemplate(detail?.template || 'classic');
+      };
+      window.addEventListener('ui-template-changed', handleUiTemplateChange);
+      pendingCleanup.push(() => window.removeEventListener('ui-template-changed', handleUiTemplateChange));
 
       // 启动预加载
       preloadApp();
@@ -722,9 +757,10 @@
               memorySynthRunning = true;
               try {
                 await invoke('synthesize_insights', {});
-                // 合成可能耗时较长，重新拉取最新配置再写入，避免覆盖期间用户改动的其他设置
-                const freshConfig = await getRuntimeConfig();
-                await invoke('save_config', { config: { ...freshConfig, memory_last_synthesis_date: today } });
+                // 在共享队列执行时读取最新配置，只更新合成日期字段。
+                await updateConfigQueued<RuntimeConfig>((config) => {
+                  config.memory_last_synthesis_date = today;
+                });
                 devLog('工作记忆合成完成');
               } finally {
                 memorySynthRunning = false;
@@ -779,7 +815,7 @@
     <svelte:component this={AvatarWindowComponent} />
   {/if}
 {:else}
-<div class="app-shell ui-style-{uiVisualStyle} flex h-screen overflow-hidden relative">
+<div class="app-shell ui-style-{uiVisualStyle} template-{$uiTemplate} flex h-screen overflow-hidden relative">
   <div class="app-shell-ambient pointer-events-none absolute inset-0 z-0 opacity-80">
     <div class="absolute inset-x-0 top-0 h-40 bg-[radial-gradient(circle_at_top,rgba(99,102,241,0.14),transparent_62%)] dark:bg-[radial-gradient(circle_at_top,rgba(99,102,241,0.18),transparent_62%)]"></div>
     <div class="absolute -right-16 top-24 h-48 w-48 rounded-full bg-indigo-200/20 blur-3xl dark:bg-indigo-500/12"></div>
@@ -819,9 +855,7 @@
         class="app-shell-window-btn"
         title={t('window.minimize')}
       >
-        <svg fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
-          <path stroke-linecap="round" stroke-linejoin="round" d="M5 12h14" />
-        </svg>
+        <Minus size={15} strokeWidth={1.8} aria-hidden="true" />
       </button>
 
       <!-- Maximize -->
@@ -830,9 +864,7 @@
         class="app-shell-window-btn"
         title={t('window.maximize')}
       >
-        <svg fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
-          <rect x="4" y="4" width="16" height="16" rx="1" />
-        </svg>
+        <Square size={13} strokeWidth={1.7} aria-hidden="true" />
       </button>
 
       <!-- Close -->
@@ -841,9 +873,7 @@
         class="app-shell-window-btn app-shell-window-btn-close"
         title={t('window.close')}
       >
-        <svg fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
-          <path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12" />
-        </svg>
+        <X size={15} strokeWidth={1.8} aria-hidden="true" />
       </button>
     </div>
     {/if}
@@ -852,6 +882,26 @@
   <!-- 注意：这里不能加 z-index（如 z-10），否则会形成层叠上下文，
        把内部弹窗/Toast（z-[100..210]）整体压到拖拽条 z-50 之下，
        导致弹窗顶部 28px 被拖拽层拦截成"点击变拖动窗口"。 -->
+  {#if $uiTemplate === 'evidence-star-map'}
+    <EvidenceShell>
+      <svelte:fragment slot="navigation">
+        <EvidenceNavigation
+          activeRoute={$location}
+          {isRecording}
+          {isPaused}
+          {recordingTransitionPending}
+          {theme}
+          on:toggle-recording={toggleEvidenceRecording}
+          on:themeChange={handleThemeChange}
+        />
+      </svelte:fragment>
+      <section class="evidence-shell-route" aria-label={t('app.mainContent')}>
+        {#key currentLocale}<Router {routes} />{/key}
+      </section>
+      <svelte:fragment slot="inspector"><div class="evidence-shell-inspector" aria-hidden="true"></div></svelte:fragment>
+    </EvidenceShell>
+    <Toast /><ConfirmDialog />
+  {:else}
   <div class="app-shell-stage relative flex-1 grid grid-cols-[13.5rem_minmax(0,1fr)] gap-3 m-2 {platform !== 'macos' ? 'app-shell-stage--windowbar' : 'app-shell-stage--macos'}">
     <!-- 左侧边栏 -->
     <aside class="app-shell-sidebar-frame min-h-0">
@@ -873,5 +923,6 @@
       </div>
     </section>
   </div>
+  {/if}
 </div>
 {/if}

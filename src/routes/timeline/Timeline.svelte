@@ -6,6 +6,7 @@
   import { ask, save as saveDialog } from '@tauri-apps/plugin-dialog';
   import { cache } from '../../lib/stores/cache.ts';
   import { recordingStore, isActiveRecording } from '../../lib/stores/recording.ts';
+  import { uiTemplate } from '../../lib/stores/uiTemplate.ts';
   import { showToast } from '../../lib/stores/toast.ts';
   import {
     appIconStore,
@@ -22,12 +23,21 @@
   } from '../../lib/stores/categories.ts';
   import {
     formatDurationLocalized,
+    formatLocalizedDate,
     formatLocalizedTime,
     locale,
     t,
     translateCategoryLabel,
   } from '$lib/i18n/index.ts';
   import { formatUserError } from '$lib/utils/errorDisplay.ts';
+  import {
+    runConfigMutationQueued,
+    updateConfigQueued,
+  } from '$lib/utils/configSaveQueue.ts';
+  import {
+    categoryIconOptions,
+    normalizeCategoryIconKey,
+  } from '$lib/utils/categoryIcons.ts';
   import { trapFocus } from '$lib/utils/focusTrap.ts';
   import { isValidLocalDateString } from '$lib/utils/dateValidation.ts';
   import {
@@ -46,8 +56,23 @@
   import { type HourlySummaryRecord } from './summaryPresentation.ts';
   import { timelineGateway } from './timelineGateway.ts';
   import LocalizedDatePicker from '../../lib/components/LocalizedDatePicker.svelte';
+  import CategoryIcon from '../../lib/components/CategoryIcon.svelte';
+  import EvidenceTimelineHeader from '../../lib/components/evidence/EvidenceTimelineHeader.svelte';
   import HourlySummaryDrawer from './HourlySummaryDrawer.svelte';
   import { confirm } from '../../lib/stores/confirm.ts';
+  import ChevronDown from 'lucide-svelte/icons/chevron-down';
+  import ChevronRight from 'lucide-svelte/icons/chevron-right';
+  import Check from 'lucide-svelte/icons/check';
+  import FolderDown from 'lucide-svelte/icons/folder-down';
+  import Inbox from 'lucide-svelte/icons/inbox';
+  import ListFilter from 'lucide-svelte/icons/list-filter';
+  import LoaderCircle from 'lucide-svelte/icons/loader-circle';
+  import Pencil from 'lucide-svelte/icons/pencil';
+  import Plus from 'lucide-svelte/icons/plus';
+  import RefreshCw from 'lucide-svelte/icons/refresh-cw';
+  import Sparkles from 'lucide-svelte/icons/sparkles';
+  import Trash2 from 'lucide-svelte/icons/trash-2';
+  import X from 'lucide-svelte/icons/x';
 
   type PrivacyLevel = 'full' | 'anonymized' | 'ignored';
   type CleanupMode = 'date' | 'range' | 'app';
@@ -108,11 +133,26 @@
     return `${year}-${month}-${day}`;
   }
 
+  function parseTimelineDate(dateValue: string): Date {
+    const [year, month, day] = dateValue.split('-').map(Number);
+    return new Date(year, month - 1, day, 12);
+  }
+
+  function shiftTimelineDate(dateValue: string, offsetDays: number): string {
+    const nextDate = parseTimelineDate(dateValue);
+    nextDate.setDate(nextDate.getDate() + offsetDays);
+    const year = nextDate.getFullYear();
+    const month = String(nextDate.getMonth() + 1).padStart(2, '0');
+    const day = String(nextDate.getDate()).padStart(2, '0');
+    return `${year}-${month}-${day}`;
+  }
+
   let activities: TimelineActivity[] = [];
   let hourlySummaries: HourlySummaryRecord[] = [];
   let loading = true;
   let error: string | null = null;
   let selectedDate = getLocalDateString();
+  let evidenceTimelineViewMode: 'orbit' | 'stream' = 'stream';
   let selectedActivity: TimelineActivityDetail | null = null;
   let showSummaryDrawer = false;
   let summaryRefreshing = false;
@@ -143,6 +183,15 @@
   let fullImageCache: Record<string, string> = {};
   let fullImageKeys: string[] = [];
   $: currentLocale = $locale;
+  $: evidenceTimelineDateLabel = formatLocalizedDate(
+    parseTimelineDate(selectedDate),
+    {
+      year: 'numeric',
+      month: 'long',
+      day: 'numeric',
+      weekday: 'short',
+    },
+  );
 
   // 向 LRU 缓存中写入，超出上限时淘汰最旧条目释放内存
   function lruSet(
@@ -232,25 +281,37 @@
     selectedDate = nextDate;
   }
 
+  function handleEvidenceTimelineView(event: CustomEvent<{ mode: 'orbit' | 'stream' }>) {
+    evidenceTimelineViewMode = event.detail.mode;
+  }
+
+  function stepEvidenceTimelineDate(offsetDays: number) {
+    const nextDate = shiftTimelineDate(selectedDate, offsetDays);
+    if (nextDate > getLocalDateString()) return;
+
+    selectedActivity = null;
+    selectedDate = nextDate;
+  }
+
   // 分类元数据（从 store 动态获取，支持自定义分类）
   let categorySaving = false;
   let showCreateCategory = false;
   let newCategoryName = '';
   let newCategoryColor = '#6366f1';
-  let newCategoryIcon = '🏷️';
+  let newCategoryIcon = 'tag';
 
   // 重命名分类
   let showRenameCategory = false;
   let renameCategoryKey = '';
   let renameCategoryName = '';
   let renameCategoryColor = '#6366f1';
-  let renameCategoryIcon = '🏷️';
+  let renameCategoryIcon = 'tag';
 
   function startRenameCategory(cat: CategoryInfo): void {
     renameCategoryKey = cat.key;
     renameCategoryName = cat.name;
     renameCategoryColor = cat.color;
-    renameCategoryIcon = cat.icon;
+    renameCategoryIcon = normalizeCategoryIconKey(cat.icon);
     showRenameCategory = true;
   }
 
@@ -259,12 +320,12 @@
     if (!name) return;
     categorySaving = true;
     try {
-      await invoke('save_custom_category', {
+      await runConfigMutationQueued(() => invoke('save_custom_category', {
         key: renameCategoryKey,
         name,
         color: renameCategoryColor,
         icon: renameCategoryIcon,
-      });
+      }));
       await categoryStore.refresh();
       showRenameCategory = false;
       showToast(t('timeline.categoryRenamed'), 'success');
@@ -346,11 +407,11 @@
     categorySaving = true;
     try {
       const targetInfo = getCategoryMeta(nextCategory);
-      const updatedCount = await invoke('set_app_category_rule', {
+      const updatedCount = await runConfigMutationQueued(() => invoke('set_app_category_rule', {
         appName: activity.app_name,
         category: nextCategory,
         syncHistory: true,
-      }) as number;
+      }) as Promise<number>);
 
       const appMatchKey = normalizeAppMatchKey(activity.app_name);
       activities = activities.map((item) =>
@@ -422,26 +483,25 @@
     pendingPrivacyRule = null;
     privacySaving = true;
     try {
-      const config = await invoke<TimelineConfig>('get_config');
-      if (!config.privacy) config.privacy = {};
-      if (!config.privacy.app_rules) config.privacy.app_rules = [];
+      await updateConfigQueued<TimelineConfig>((config) => {
+        if (!config.privacy) config.privacy = {};
+        if (!config.privacy.app_rules) config.privacy.app_rules = [];
 
-      if (level === 'full') {
-        config.privacy.app_rules = config.privacy.app_rules.filter(
-          r => r.app_name !== targetActivity.app_name
-        );
-      } else {
-        const idx = config.privacy.app_rules.findIndex(
-          r => r.app_name === targetActivity.app_name
-        );
-        if (idx >= 0) {
-          config.privacy.app_rules[idx].level = level;
+        if (level === 'full') {
+          config.privacy.app_rules = config.privacy.app_rules.filter(
+            r => r.app_name !== targetActivity.app_name
+          );
         } else {
-          config.privacy.app_rules.push({ app_name: targetActivity.app_name, level });
+          const idx = config.privacy.app_rules.findIndex(
+            r => r.app_name === targetActivity.app_name
+          );
+          if (idx >= 0) {
+            config.privacy.app_rules[idx].level = level;
+          } else {
+            config.privacy.app_rules.push({ app_name: targetActivity.app_name, level });
+          }
         }
-      }
-
-      await invoke('save_config', { config });
+      });
 
       selectedActivity = { ...targetActivity, _privacyLevel: level };
       cache.invalidate('overview');
@@ -486,13 +546,6 @@
     }
   }
 
-  const CATEGORY_EMOJIS = [
-    '💻', '🌐', '💬', '📝', '🎨', '🎮', '📁',
-    '⚡', '📊', '🔧', '🛠️', '💡', '🎯', '📌',
-    '🏷️', '🏠', '📚', '🎵', '📷', '🔬', '🧪',
-    '💼', '🧑‍💻', '🧑‍🎨', '📱', '🚀', '⭐', '🔒',
-  ];
-
   function getCategoryMeta(category: string | null | undefined): CategoryMeta {
     return categoryStore.getCategoryMeta(category || 'other');
   }
@@ -524,12 +577,12 @@
         }
         key = 'cat-' + Math.abs(hash).toString(36);
       }
-      await invoke('save_custom_category', {
+      await runConfigMutationQueued(() => invoke('save_custom_category', {
         key,
         name,
         color: newCategoryColor,
         icon: newCategoryIcon,
-      });
+      }));
       await categoryStore.refresh();
       showCreateCategory = false;
       newCategoryName = '';
@@ -1145,7 +1198,9 @@
     pendingDeleteCategory = null;
     categorySaving = true;
     try {
-      const affected = await invoke<number>('delete_custom_category', { key });
+      const affected = await runConfigMutationQueued(
+        () => invoke<number>('delete_custom_category', { key }),
+      );
       await categoryStore.refresh();
       cache.invalidate('overview');
 
@@ -1436,15 +1491,28 @@
 
 <svelte:window on:resize={handleDetailScroll} on:keydown={handleTimelineWindowKeydown} />
 
-<div class="page-shell" data-locale={currentLocale}>
+<div
+  class="page-shell evidence-timeline-page"
+  data-locale={currentLocale}
+  data-evidence-view={evidenceTimelineViewMode}
+>
+  {#if $uiTemplate === 'evidence-star-map'}
+    <EvidenceTimelineHeader
+      dateLabel={evidenceTimelineDateLabel}
+      evidenceCount={hasMore ? `${activities.length}+` : activities.length}
+      viewMode={evidenceTimelineViewMode}
+      canGoNext={!isToday}
+      on:view={handleEvidenceTimelineView}
+      on:previous={() => stepEvidenceTimelineDate(-1)}
+      on:next={() => stepEvidenceTimelineDate(1)}
+    />
+  {/if}
+
   <!-- 页面标题 -->
-  <div class="page-header">
+  <div class="page-header timeline-support-toolbar">
     <div class="page-title-group">
       <div class="page-title-badge">
-        <svg fill="none" stroke="currentColor" viewBox="0 0 24 24">
-          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8" d="M5 7h14M5 12h9M5 17h14" />
-          <circle cx="17" cy="12" r="2.5" stroke-width="1.8" />
-        </svg>
+        <ListFilter strokeWidth={1.8} aria-hidden="true" />
       </div>
       <div class="page-title-copy">
         <h2>{t('timeline.title')}</h2>
@@ -1472,14 +1540,10 @@
         on:click={() => (showCleanupPanel = true)}
         title={t('timeline.cleanupRecords')}
       >
-        <svg class="timeline-toolbar-icon h-[1.125rem] w-[1.125rem]" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6M1 7h22M9 7V4a1 1 0 011-1h4a1 1 0 011 1v3" />
-        </svg>
+        <Trash2 class="timeline-toolbar-icon h-[1.125rem] w-[1.125rem]" aria-hidden="true" />
       </button>
       <button class="page-control-btn-icon" on:click={loadTimeline} title={t('timeline.refreshTitle')}>
-        <svg class="timeline-toolbar-icon h-[1.125rem] w-[1.125rem] text-slate-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
-        </svg>
+        <RefreshCw class="timeline-toolbar-icon h-[1.125rem] w-[1.125rem] text-slate-500" aria-hidden="true" />
       </button>
       <button
         class="page-control-btn-icon"
@@ -1488,11 +1552,9 @@
         title={t('timeline.exportTitle')}
       >
         {#if exportingTimeline}
-          <div class="timeline-toolbar-icon h-[1.125rem] w-[1.125rem] animate-spin rounded-full border-2 border-current border-t-transparent"></div>
+          <LoaderCircle class="timeline-toolbar-icon h-[1.125rem] w-[1.125rem] animate-spin" aria-hidden="true" />
         {:else}
-          <svg class="timeline-toolbar-icon h-[1.125rem] w-[1.125rem] text-slate-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 10v6m0 0l-3-3m3 3l3-3M5 20h14a2 2 0 002-2V9a2 2 0 00-2-2h-4l-2-2H5a2 2 0 00-2 2v11a2 2 0 002 2z" />
-          </svg>
+          <FolderDown class="timeline-toolbar-icon h-[1.125rem] w-[1.125rem] text-slate-500" aria-hidden="true" />
         {/if}
       </button>
     </div>
@@ -1513,7 +1575,7 @@
   {:else if activities.length === 0}
     <div class="empty-state-lg">
       <div class="empty-state-icon">
-        <span class="text-2xl">📝</span>
+        <Inbox size={28} strokeWidth={1.5} aria-hidden="true" />
       </div>
       <p class="empty-state-copy">{t('timeline.empty')}</p>
     </div>
@@ -1534,16 +1596,12 @@
           aria-expanded={showSummaryDrawer}
           on:click={openSummaryDrawer}
         >
-          <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" />
-          </svg>
+          <Sparkles class="w-4 h-4" aria-hidden="true" />
           {t('timeline.periodSummary')}
           {#if hourlySummaries.length > 0}
             <span class="px-1.5 py-0.5 text-xs bg-primary-100 dark:bg-primary-900/30 text-primary-600 dark:text-primary-400 rounded-full">{hourlySummaries.length}</span>
           {/if}
-          <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7" />
-          </svg>
+          <ChevronRight class="w-3 h-3" aria-hidden="true" />
         </button>
       </div>
 
@@ -1590,7 +1648,7 @@
                                on:error={() => handleTimelineIconError(activity)}
                                class="timeline-app-icon-image app-icon object-cover" />
                         {:else}
-                          <span>{info.icon}</span>
+                          <CategoryIcon categoryKey={activity.category || 'other'} iconKey={info.icon} size={18} />
                         {/if}
                       </div>
                       <div class="timeline-entry-heading timeline-entry-heading-featured">
@@ -1620,7 +1678,7 @@
                            on:error={() => handleTimelineIconError(activity)}
                            class="timeline-app-icon-image app-icon object-cover" />
                     {:else}
-                      <span>{info.icon}</span>
+                      <CategoryIcon categoryKey={activity.category || 'other'} iconKey={info.icon} size={18} />
                     {/if}
                   </div>
                   <div class="timeline-entry-heading">
@@ -1633,9 +1691,7 @@
                 </p>
                 <div class="timeline-entry-tail timeline-entry-tail-compact">
                   <span class="timeline-entry-duration">{formatDuration(activity.duration)}</span>
-                  <svg class="timeline-entry-arrow" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7" />
-                  </svg>
+                  <ChevronRight class="timeline-entry-arrow" aria-hidden="true" />
                 </div>
               </div>
             {/if}
@@ -1652,12 +1708,10 @@
             class="timeline-load-more-btn"
           >
             {#if loadingMore}
-              <div class="animate-spin rounded-full h-4 w-4 border-b-2 border-slate-500"></div>
+              <LoaderCircle class="h-4 w-4 animate-spin" aria-hidden="true" />
               {t('timeline.loadingMore')}
             {:else}
-              <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7" />
-              </svg>
+              <ChevronDown class="w-4 h-4" aria-hidden="true" />
               {t('timeline.loadMore')}
             {/if}
           </button>
@@ -1713,7 +1767,7 @@
                      on:error={() => handleTimelineIconError(selectedActivity)}
                      class="timeline-app-icon-image timeline-app-icon-image-lg app-icon object-cover" />
               {:else}
-                {info.icon}
+                <CategoryIcon categoryKey={selectedActivity.category || 'other'} iconKey={info.icon} size={22} />
               {/if}
             </div>
             <div>
@@ -1727,14 +1781,10 @@
               title={t('timeline.deleteActivity')}
               on:click={() => deleteActivity(selectedActivity)}
             >
-              <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6M1 7h22M9 7V4a1 1 0 011-1h4a1 1 0 011 1v3" />
-              </svg>
+              <Trash2 class="w-5 h-5" aria-hidden="true" />
             </button>
             <button bind:this={detailCloseButton} class="btn btn-ghost" aria-label={t('window.close')} on:click={() => closeDetail()}>
-              <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
-              </svg>
+              <X class="w-5 h-5" aria-hidden="true" />
             </button>
           </div>
         </div>
@@ -1826,9 +1876,7 @@
             >
               <span class="timeline-category-dot" style={`background-color: ${info.color}`}></span>
               <span>{info.name}</span>
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" aria-hidden="true">
-                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7" />
-              </svg>
+              <ChevronDown class="timeline-category-trigger-icon" aria-hidden="true" />
             </button>
 
             {#if showCategoryPopover}
@@ -1854,7 +1902,7 @@
                         <span class="timeline-category-dot" style={`background-color: ${cat.color}`}></span>
                         <span class="timeline-category-option-name">{getCategoryDisplayName(cat)}</span>
                         {#if (selectedActivity.category || 'other') === cat.key}
-                          <span class="timeline-category-check" aria-hidden="true">✓</span>
+                          <Check class="timeline-category-check" size={14} strokeWidth={2.5} aria-hidden="true" />
                         {/if}
                       </button>
                       {#if !cat.is_system}
@@ -1869,7 +1917,7 @@
                               startRenameCategory(cat);
                             }}
                           >
-                            <span aria-hidden="true">✎</span>
+                            <Pencil size={14} strokeWidth={2} aria-hidden="true" />
                           </button>
                           <button
                             type="button"
@@ -1881,7 +1929,7 @@
                               pendingDeleteCategory = { key: cat.key, name: getCategoryDisplayName(cat) };
                             }}
                           >
-                            <span aria-hidden="true">×</span>
+                            <X size={15} strokeWidth={2} aria-hidden="true" />
                           </button>
                         </div>
                       {/if}
@@ -1898,7 +1946,11 @@
                     showCreateCategory = !showCreateCategory;
                   }}
                 >
-                  <span aria-hidden="true">{showCreateCategory ? '×' : '+'}</span>
+                  {#if showCreateCategory}
+                    <X size={14} strokeWidth={2} aria-hidden="true" />
+                  {:else}
+                    <Plus size={14} strokeWidth={2} aria-hidden="true" />
+                  {/if}
                   <span>{t('timeline.createCategory')}</span>
                 </button>
 
@@ -1912,15 +1964,17 @@
                         placeholder={t('timeline.categoryNamePlaceholder')}
                       />
                       <input type="color" bind:value={newCategoryColor} aria-label={t('timeline.detail.appCategory')} />
-                      <span>{newCategoryIcon}</span>
+                      <span><CategoryIcon categoryKey="custom" iconKey={newCategoryIcon} size={17} /></span>
                     </div>
-                    <div class="timeline-category-emoji-grid">
-                      {#each CATEGORY_EMOJIS as emoji}
+                    <div class="timeline-category-icon-grid">
+                      {#each categoryIconOptions as option, index}
                         <button
                           type="button"
-                          class:timeline-category-emoji-active={newCategoryIcon === emoji}
-                          on:click={() => newCategoryIcon = emoji}
-                        >{emoji}</button>
+                          class:timeline-category-icon-active={newCategoryIcon === option.key}
+                          aria-label={`${t('timeline.detail.appCategory')} ${index + 1}`}
+                          aria-pressed={newCategoryIcon === option.key}
+                          on:click={() => newCategoryIcon = option.key}
+                        ><svelte:component this={option.component} size={16} strokeWidth={1.8} aria-hidden="true" /></button>
                       {/each}
                     </div>
                     <div class="timeline-category-editor-actions">
@@ -1940,15 +1994,17 @@
                         placeholder={t('timeline.categoryNamePlaceholder')}
                       />
                       <input type="color" bind:value={renameCategoryColor} aria-label={t('timeline.detail.appCategory')} />
-                      <span>{renameCategoryIcon}</span>
+                      <span><CategoryIcon categoryKey="custom" iconKey={renameCategoryIcon} size={17} /></span>
                     </div>
-                    <div class="timeline-category-emoji-grid">
-                      {#each CATEGORY_EMOJIS as emoji}
+                    <div class="timeline-category-icon-grid">
+                      {#each categoryIconOptions as option, index}
                         <button
                           type="button"
-                          class:timeline-category-emoji-active={renameCategoryIcon === emoji}
-                          on:click={() => renameCategoryIcon = emoji}
-                        >{emoji}</button>
+                          class:timeline-category-icon-active={renameCategoryIcon === option.key}
+                          aria-label={`${t('timeline.detail.appCategory')} ${index + 1}`}
+                          aria-pressed={renameCategoryIcon === option.key}
+                          on:click={() => renameCategoryIcon = option.key}
+                        ><svelte:component this={option.component} size={16} strokeWidth={1.8} aria-hidden="true" /></button>
                       {/each}
                     </div>
                     <div class="timeline-category-editor-actions">
@@ -2021,9 +2077,7 @@
       <div class="flex items-center justify-between p-5 border-b border-slate-200 dark:border-[#30363d]">
         <h3 class="text-base font-semibold text-slate-900 dark:text-[#e6edf3]">{t('timeline.cleanupRecordsTitle')}</h3>
         <button class="btn btn-ghost" on:click={() => (showCleanupPanel = false)} disabled={cleanupBusy}>
-          <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
-          </svg>
+          <X class="w-5 h-5" aria-hidden="true" />
         </button>
       </div>
       <div class="p-5 space-y-4">
@@ -2898,7 +2952,7 @@
     outline-offset: 2px;
   }
 
-  .timeline-category-trigger svg {
+  .timeline-category-trigger-icon {
     width: 0.95rem;
     height: 0.95rem;
     margin-inline-start: auto;
@@ -3050,13 +3104,13 @@
     background: transparent;
   }
 
-  .timeline-category-emoji-grid {
+  .timeline-category-icon-grid {
     display: flex;
     flex-wrap: wrap;
     gap: 0.2rem;
   }
 
-  .timeline-category-emoji-grid button {
+  .timeline-category-icon-grid button {
     width: 1.85rem;
     height: 1.85rem;
     border: 0;
@@ -3064,8 +3118,8 @@
     background: transparent;
   }
 
-  .timeline-category-emoji-grid button:hover,
-  .timeline-category-emoji-active {
+  .timeline-category-icon-grid button:hover,
+  .timeline-category-icon-active {
     background: #e7e5e4 !important;
   }
 
@@ -3305,8 +3359,8 @@
   :global(.dark) .timeline-category-option:hover,
   :global(.dark) .timeline-category-option-active,
   :global(.dark) .timeline-category-option-actions button:hover,
-  :global(.dark) .timeline-category-emoji-grid button:hover,
-  :global(.dark) .timeline-category-emoji-active {
+  :global(.dark) .timeline-category-icon-grid button:hover,
+  :global(.dark) .timeline-category-icon-active {
     color: #e6edf3;
     background: #30363d !important;
   }

@@ -290,7 +290,7 @@ test('全部第一方 Svelte 组件脚本应启用 TypeScript', async () => {
     }
   }
 
-  assert.equal(svelteFiles.length, 38);
+  assert.equal(svelteFiles.length, 43);
   assert.deepEqual(untypedComponents, []);
 });
 

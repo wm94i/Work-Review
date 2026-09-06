@@ -3,12 +3,27 @@
   import { get } from 'svelte/store';
   import { invoke } from '@tauri-apps/api/core';
   import { listen, type Event as TauriEvent } from '@tauri-apps/api/event';
+  import ChartNoAxesColumn from 'lucide-svelte/icons/chart-no-axes-column';
+  import ChartNoAxesGantt from 'lucide-svelte/icons/chart-no-axes-gantt';
+  import Check from 'lucide-svelte/icons/check';
+  import ChevronDown from 'lucide-svelte/icons/chevron-down';
+  import ChevronLeft from 'lucide-svelte/icons/chevron-left';
+  import ChevronRight from 'lucide-svelte/icons/chevron-right';
+  import ChevronUp from 'lucide-svelte/icons/chevron-up';
+  import Globe2 from 'lucide-svelte/icons/globe-2';
+  import LayoutDashboard from 'lucide-svelte/icons/layout-dashboard';
+  import Pencil from 'lucide-svelte/icons/pencil';
+  import Plus from 'lucide-svelte/icons/plus';
+  import Sparkles from 'lucide-svelte/icons/sparkles';
+  import X from 'lucide-svelte/icons/x';
   import StatsCard from '../lib/components/StatsCard.svelte';
   import AppUsageChart from '../lib/components/AppUsageChart.svelte';
   import ActivityHourlyChart from '../lib/components/ActivityHourlyChart.svelte';
   import LocalizedDatePicker from '../lib/components/LocalizedDatePicker.svelte';
+  import EvidenceOverviewHeader from '../lib/components/evidence/EvidenceOverviewHeader.svelte';
   import { cache } from '../lib/stores/cache.ts';
   import { recordingStore, isActiveRecording } from '../lib/stores/recording.ts';
+  import { uiTemplate } from '../lib/stores/uiTemplate.ts';
   import { confirm } from '../lib/stores/confirm.ts';
   import { showToast } from '../lib/stores/toast.ts';
   import { preloadAppIcons, type AppIconInvoke } from '../lib/stores/iconCache.ts';
@@ -1135,6 +1150,28 @@
     handleOverviewDateChange();
   }
 
+  function stepEvidenceOverviewDay(offsetDays: number) {
+    const today = getLocalDateString();
+    const anchorDate = overviewMode === 'date' ? selectedDateTo : today;
+    const nextDate = shiftIsoDate(anchorDate, offsetDays);
+
+    if (nextDate > today) return;
+
+    overviewMode = 'date';
+    selectedDateFrom = nextDate;
+    selectedDateTo = nextDate;
+    handleOverviewDateChange();
+  }
+
+  function returnEvidenceOverviewToday() {
+    if (overviewMode === 'today') {
+      loadStats(true);
+      return;
+    }
+
+    setOverviewMode('today');
+  }
+
   async function saveDomainSemanticRule(domain: DomainItem) {
     const nextCategory = editingSemanticCategory.trim();
     if (!domain) return;
@@ -1402,14 +1439,25 @@
   }}
 />
 
-<div class="page-shell" data-locale={currentLocale}>
+<div class="page-shell evidence-overview-page" data-locale={currentLocale}>
+  {#if $uiTemplate === 'evidence-star-map'}
+    <EvidenceOverviewHeader
+      dateLabel={overviewSubtitle}
+      totalDuration={stats ? formatDurationLocalized(stats.total_duration, { compact: true }) : '--'}
+      evidenceCount={stats?.screenshot_count ?? 0}
+      isRecording={overviewDotActive}
+      canGoNext={overviewMode === 'date' && canStepOverviewDateForward}
+      on:previous={() => stepEvidenceOverviewDay(-1)}
+      on:today={returnEvidenceOverviewToday}
+      on:next={() => stepEvidenceOverviewDay(1)}
+    />
+  {/if}
+
   <!-- 页面标题 -->
-  <div class="page-header">
+  <div class="page-header overview-support-toolbar">
     <div class="page-title-group">
       <div class="page-title-badge">
-        <svg fill="none" stroke="currentColor" viewBox="0 0 24 24">
-          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8" d="M4 6.5A2.5 2.5 0 016.5 4H10v6H4V6.5Zm10 0A2.5 2.5 0 0116.5 4H20v6h-6V4Zm-10 11A2.5 2.5 0 016.5 15H10v5H6.5A2.5 2.5 0 014 17.5V15Zm10-2.5H20v2.5A2.5 2.5 0 0117.5 20H14v-5Z" />
-        </svg>
+        <LayoutDashboard strokeWidth={1.8} aria-hidden="true" />
       </div>
       <div class="page-title-copy">
         <h2>{t('overview.title')}</h2>
@@ -1458,9 +1506,7 @@
             title={t('common.previous')}
             on:click={() => stepOverviewDateRange(-1)}
           >
-            <svg class="h-4 w-4 text-slate-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8" d="M15 19l-7-7 7-7" />
-            </svg>
+            <ChevronLeft class="h-4 w-4 text-slate-500" strokeWidth={1.8} aria-hidden="true" />
           </button>
 
           <LocalizedDatePicker
@@ -1480,9 +1526,7 @@
             disabled={!canStepOverviewDateForward}
             on:click={() => stepOverviewDateRange(1)}
           >
-            <svg class="h-4 w-4 text-slate-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8" d="M9 5l7 7-7 7" />
-            </svg>
+            <ChevronRight class="h-4 w-4 text-slate-500" strokeWidth={1.8} aria-hidden="true" />
           </button>
         </div>
       {/if}
@@ -1495,9 +1539,7 @@
     <!-- 窄屏精修：flex-wrap 允许洞察句换行,链接自动下移到第二行,避免最小窗口横向溢出 -->
     <div class="mb-4 flex flex-wrap items-center gap-3.5 rounded-lg border border-blue-100 bg-gradient-to-r from-blue-50 via-white to-white px-5 py-3.5 dark:border-blue-900/40 dark:from-blue-950/35 dark:via-[#161b22] dark:to-[#161b22]">
       <span class="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-blue-100 text-blue-500 dark:bg-blue-900/40 dark:text-blue-300">
-        <svg class="h-[17px] w-[17px]" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
-          <path d="M12 2.5l2 6.4 6.5 2.1-6.5 2.1-2 6.4-2-6.4L3.5 11l6.5-2.1zM19 15.5l.9 2.6 2.6.9-2.6.9-.9 2.6-.9-2.6-2.6-.9 2.6-.9z" />
-        </svg>
+        <Sparkles class="h-[17px] w-[17px]" aria-hidden="true" />
       </span>
       <p class="min-w-0 flex-1 basis-52 text-sm text-slate-600 dark:text-[#adbac7]">{insightSentence}</p>
       <a
@@ -1806,7 +1848,7 @@
       {:else}
         <div class="empty-state-compact">
           <div class="empty-state-icon !w-12 !h-12 !mb-3 shadow-none">
-            <span class="text-xl">🌐</span>
+            <Globe2 class="h-5 w-5" strokeWidth={1.7} aria-hidden="true" />
           </div>
           <p class="empty-state-copy">{overviewNoWebsiteVisitsText}</p>
         </div>
@@ -1825,13 +1867,9 @@
           }}
         >
           {#if appUsageViewMode === 'row'}
-            <svg class="h-4 w-4 text-slate-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8" d="M4 7h16M4 12h12M4 17h8" />
-            </svg>
+            <ChartNoAxesGantt class="h-4 w-4 text-slate-500" strokeWidth={1.8} aria-hidden="true" />
           {:else}
-            <svg class="h-4 w-4 text-slate-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8" d="M6 18V9m6 9V6m6 12v-4" />
-            </svg>
+            <ChartNoAxesColumn class="h-4 w-4 text-slate-500" strokeWidth={1.8} aria-hidden="true" />
           {/if}
         </button>
       </div>
@@ -1856,7 +1894,7 @@
       {:else}
         <div class="empty-state-compact">
           <div class="empty-state-icon !w-12 !h-12 !mb-3 shadow-none">
-            <span class="text-xl">📊</span>
+            <ChartNoAxesColumn class="h-5 w-5" strokeWidth={1.7} aria-hidden="true" />
           </div>
           <p class="empty-state-copy">{overviewNoAppStatsText}</p>
         </div>
@@ -1894,9 +1932,7 @@
             title={t('overview.viewAll')}
             on:click={showAllDomainSummaries}
           >
-            <svg class="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
-              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 18l-6-6 6-6" />
-            </svg>
+            <ChevronLeft class="h-4 w-4" aria-hidden="true" />
           </button>
         {/if}
         <div class="min-w-0">
@@ -1921,9 +1957,7 @@
         title={t('overview.cancel')}
         on:click={closeDomainOverlay}
       >
-        <svg class="h-5 w-5 text-slate-500" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
-          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
-        </svg>
+        <X class="h-5 w-5 text-slate-500" aria-hidden="true" />
       </button>
     </div>
 
@@ -2055,7 +2089,7 @@
                   on:click={() => cancelDomainSemanticEdit()}
                   aria-label={t('overview.cancel')}
                 >
-                  ×
+                  <X class="h-4 w-4" strokeWidth={2} aria-hidden="true" />
                 </button>
               </div>
 
@@ -2084,9 +2118,7 @@
                         <span class="truncate">{getSemanticCategoryDisplayName(cat)}</span>
                       </span>
                       {#if editingSemanticCategory === cat.key}
-                        <svg class="overview-semantic-check h-4 w-4 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
-                          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M5 13l4 4L19 7" />
-                        </svg>
+                        <Check class="overview-semantic-check h-4 w-4 shrink-0" strokeWidth={2.5} aria-hidden="true" />
                       {/if}
                     </button>
                     {#if !cat.is_system}
@@ -2097,7 +2129,7 @@
                         disabled={semanticCategorySaving}
                         title={t('overview.renameSemanticCategory')}
                         aria-label={t('overview.renameSemanticCategory')}
-                      >✎</button>
+                      ><Pencil class="h-3.5 w-3.5" strokeWidth={2} aria-hidden="true" /></button>
                       <button
                         type="button"
                         on:click={() => pendingDeleteSemanticCategory = { key: cat.key, name: getSemanticCategoryDisplayName(cat) }}
@@ -2105,7 +2137,7 @@
                         disabled={semanticCategorySaving}
                         title={t('overview.deleteSemanticCategory')}
                         aria-label={t('overview.deleteSemanticCategory')}
-                      >×</button>
+                      ><X class="h-4 w-4" strokeWidth={2} aria-hidden="true" /></button>
                     {/if}
                   </div>
                 {/each}
@@ -2120,7 +2152,11 @@
                 class="mt-2 flex w-full items-center justify-center gap-1.5 rounded-xl border border-dashed border-slate-200 px-3 py-2 text-xs font-medium text-slate-500 transition-colors hover:border-primary-300 hover:text-primary-600 dark:border-[#30363d] dark:text-[#7d8590] dark:hover:border-[#484f58] dark:hover:text-primary-300"
                 disabled={semanticCategorySaving}
               >
-                <span>{showCreateSemanticCategory ? '×' : '+'}</span>
+                {#if showCreateSemanticCategory}
+                  <X class="h-3.5 w-3.5" strokeWidth={2} aria-hidden="true" />
+                {:else}
+                  <Plus class="h-3.5 w-3.5" strokeWidth={2} aria-hidden="true" />
+                {/if}
                 <span>{t('overview.createSemanticCategory')}</span>
               </button>
 
@@ -2222,10 +2258,10 @@
                 }}
               >
                 {#if expandedDomains.has(domain.domain)}
-                  <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 15l7-7 7 7"/></svg>
+                  <ChevronUp class="w-3 h-3" aria-hidden="true" />
                   {t('common.collapse')}
                 {:else}
-                  <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/></svg>
+                  <ChevronDown class="w-3 h-3" aria-hidden="true" />
                   {t('common.expandAll', { count: domain.urls.length })}
                 {/if}
               </button>

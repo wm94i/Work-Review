@@ -30,7 +30,7 @@ test('桌宠模型生成提醒应有独立开关且不影响本地规则提醒',
   assert.match(settingsSource, /settingsAppearance\.avatarProactiveAiRequiresAvatar/);
   assert.match(settingsSource, /disabled=\{!config\.avatar_enabled\}/);
   assert.match(settingsSource, /config\.avatar_proactive_ai_enabled && config\.avatar_enabled/);
-  assert.match(settingsSource, /saveConfigQuietly\(\)/);
+  assert.match(settingsSource, /saveConfigQuietly\(\['avatar_proactive_ai_enabled'\]\)/);
 
   for (const source of [zhCNSource, enSource, zhTWSource]) {
     assert.match(source, /avatarProactiveAi:/);
