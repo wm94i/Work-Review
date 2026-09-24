@@ -52,6 +52,9 @@ pub enum AiProvider {
     /// OpenRouter（多模型聚合）
     #[serde(rename = "openrouter")]
     OpenRouter,
+    /// Requesty（多模型聚合）
+    #[serde(rename = "requesty")]
+    Requesty,
     /// Groq（高速推理）
     #[serde(rename = "groq")]
     Groq,
@@ -91,6 +94,7 @@ impl AiProvider {
             AiProvider::Doubao => "火山引擎 豆包",
             AiProvider::MiniMax => "稀宇科技 MiniMax",
             AiProvider::OpenRouter => "OpenRouter",
+            AiProvider::Requesty => "Requesty",
             AiProvider::Groq => "Groq",
             AiProvider::XAI => "xAI Grok",
             AiProvider::Mistral => "Mistral",
@@ -114,6 +118,7 @@ impl AiProvider {
             AiProvider::Doubao => "https://ark.cn-beijing.volces.com/api/v3",
             AiProvider::MiniMax => "https://api.minimaxi.com/v1",
             AiProvider::OpenRouter => "https://openrouter.ai/api/v1",
+            AiProvider::Requesty => "https://router.requesty.ai/v1",
             AiProvider::Groq => "https://api.groq.com/openai/v1",
             AiProvider::XAI => "https://api.x.ai/v1",
             AiProvider::Mistral => "https://api.mistral.ai/v1",
@@ -137,6 +142,7 @@ impl AiProvider {
             AiProvider::Doubao => "doubao-lite-4k",
             AiProvider::MiniMax => "MiniMax-M2.5",
             AiProvider::OpenRouter => "openrouter/auto",
+            AiProvider::Requesty => "openai/gpt-4o-mini",
             AiProvider::Groq => "llama-3.3-70b-versatile",
             AiProvider::XAI => "grok-2-latest",
             AiProvider::Mistral => "mistral-small-latest",
@@ -158,6 +164,7 @@ impl AiProvider {
                 | AiProvider::Doubao
                 | AiProvider::MiniMax
                 | AiProvider::OpenRouter
+                | AiProvider::Requesty
                 | AiProvider::Groq
                 | AiProvider::XAI
                 | AiProvider::Mistral
@@ -2804,6 +2811,16 @@ mod tests {
             "https://api.minimaxi.com/v1"
         );
         assert_eq!(AiProvider::MiniMax.default_model(), "MiniMax-M2.5");
+    }
+
+    #[test]
+    fn requesty应使用_openai_兼容配置() {
+        assert!(AiProvider::Requesty.is_openai_compatible());
+        assert_eq!(
+            AiProvider::Requesty.default_endpoint(),
+            "https://router.requesty.ai/v1"
+        );
+        assert_eq!(AiProvider::Requesty.default_model(), "openai/gpt-4o-mini");
     }
 
     #[test]

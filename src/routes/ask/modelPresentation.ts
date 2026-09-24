@@ -16,6 +16,7 @@ type KnownProviderId =
   | 'gemini'
   | 'claude'
   | 'openrouter'
+  | 'requesty'
   | 'groq'
   | 'xai'
   | 'mistral'
@@ -47,6 +48,7 @@ export const MODEL_PROVIDER_DISPLAY_NAMES = {
   gemini: { 'zh-CN': 'Google Gemini', en: 'Google Gemini', 'zh-TW': 'Google Gemini' },
   claude: { 'zh-CN': 'Anthropic Claude', en: 'Anthropic Claude', 'zh-TW': 'Anthropic Claude' },
   openrouter: { 'zh-CN': 'OpenRouter', en: 'OpenRouter', 'zh-TW': 'OpenRouter' },
+  requesty: { 'zh-CN': 'Requesty', en: 'Requesty', 'zh-TW': 'Requesty' },
   groq: { 'zh-CN': 'Groq', en: 'Groq', 'zh-TW': 'Groq' },
   xai: { 'zh-CN': 'xAI Grok', en: 'xAI Grok', 'zh-TW': 'xAI Grok' },
   mistral: { 'zh-CN': 'Mistral', en: 'Mistral', 'zh-TW': 'Mistral' },

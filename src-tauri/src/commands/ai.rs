@@ -912,6 +912,15 @@ pub async fn get_ai_providers() -> Result<Vec<serde_json::Value>, AppError> {
             "supports_vision": false,
         }),
         serde_json::json!({
+            "id": "requesty",
+            "name": "Requesty",
+            "description": "多模型聚合网关，兼容 OpenAI 格式",
+            "default_endpoint": "https://router.requesty.ai/v1",
+            "default_model": "openai/gpt-4o-mini",
+            "requires_api_key": true,
+            "supports_vision": false,
+        }),
+        serde_json::json!({
             "id": "groq",
             "name": "Groq",
             "description": "超高速推理，兼容 OpenAI 格式",

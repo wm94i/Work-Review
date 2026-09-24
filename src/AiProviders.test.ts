@@ -26,6 +26,28 @@ test('应提供 MiniMax 作为新的 AI 提供商并同步到文档', async () =
   assert.match(readmeEnSource, /MiniMax/);
 });
 
+test('应提供 Requesty 作为 OpenAI 兼容提供商并同步到文档', async () => {
+  const [configSource, commandSource, readmeSource, readmeEnSource, settingsSource] =
+    await Promise.all([
+      readFile(new URL('../crates/core/src/config.rs', import.meta.url), 'utf8'),
+      readCommandsSource(),
+      readFile(new URL('../README.zh.md', import.meta.url), 'utf8'),
+      readFile(new URL('../README.md', import.meta.url), 'utf8'),
+      readFile(
+        new URL('./routes/settings/components/SettingsAI.svelte', import.meta.url),
+        'utf8'
+      ),
+    ]);
+
+  assert.match(configSource, /"requesty"/);
+  assert.match(configSource, /https:\/\/router\.requesty\.ai\/v1/);
+  assert.match(configSource, /\|\s*AiProvider::Requesty/);
+  assert.match(commandSource, /"id": "requesty"/);
+  assert.match(settingsSource, /requesty:/);
+  assert.match(readmeSource, /Requesty/);
+  assert.match(readmeEnSource, /Requesty/);
+});
+
 test('应提供 OpenRouter/Groq/xAI/Mistral/LM Studio/自定义 六个新提供商并同步文档', async () => {
   const [configSource, commandSource, readmeSource, readmeEnSource, settingsSource] =
     await Promise.all([

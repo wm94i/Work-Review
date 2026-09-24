@@ -22,6 +22,7 @@
     | 'gemini'
     | 'claude'
     | 'openrouter'
+    | 'requesty'
     | 'groq'
     | 'xai'
     | 'mistral'
@@ -275,6 +276,11 @@
       en: { name: 'OpenRouter', description: 'One key for hundreds of models' },
       'zh-TW': { name: 'OpenRouter', description: '多模型聚合閘道，一個 Key 調百家模型' },
     },
+    requesty: {
+      'zh-CN': { name: 'Requesty', description: '多模型聚合网关，兼容 OpenAI 格式' },
+      en: { name: 'Requesty', description: 'LLM gateway, OpenAI-compatible' },
+      'zh-TW': { name: 'Requesty', description: '多模型聚合閘道，相容 OpenAI 格式' },
+    },
     groq: {
       'zh-CN': { name: 'Groq', description: '超高速推理' },
       en: { name: 'Groq', description: 'Ultra-fast inference' },
@@ -426,6 +432,7 @@
     gemini: '#4285f4',
     claude: '#d97757',
     openrouter: '#6467f2',
+    requesty: '#1f2937',
     groq: '#f55036',
     xai: '#000000',
     mistral: '#fa520f',

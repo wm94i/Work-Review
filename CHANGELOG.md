@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Add Requesty as an OpenAI-compatible AI provider (`https://router.requesty.ai/v1`).
+
 ## [1.1.3-rc.1] - 2026-09-05
 
 This is a release candidate for testing, not a stable release. Back up your data before installing, especially before testing data-directory migration. RC releases are not marked as Latest and are not offered through the stable automatic-update endpoint.
