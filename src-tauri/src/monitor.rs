@@ -2548,12 +2548,19 @@ mod macos_ax {
             the_type: AXValueType,
             value_ptr: *mut core::ffi::c_void,
         ) -> bool;
-
-        pub static kAXFocusedWindowAttribute: CFStringRef;
-        pub static kAXTitleAttribute: CFStringRef;
-        pub static kAXPositionAttribute: CFStringRef;
-        pub static kAXSizeAttribute: CFStringRef;
     }
+
+    // AX 属性常量在现代 macOS SDK 中是宏而非导出符号：
+    //   #define kAXFocusedWindowAttribute CFSTR("AXFocusedWindow")
+    // （见 ApplicationServices/HIServices 的 AXAttributeConstants.h）。
+    // HIServices 既不导出同名符号，SDK 的 .tbd 中也没有该符号，因此把
+    // `extern "C" { static kAXFooAttribute: CFStringRef; }` 写成外部静态会在链接期
+    // 报 `Undefined symbols for architecture arm64: _kAXFocusedWindowAttribute`。
+    // 这里用与宏完全相同的字面量在进程内构造等值 CFString 传给 AX API。
+    pub const ATTR_FOCUSED_WINDOW: &str = "AXFocusedWindow";
+    pub const ATTR_TITLE: &str = "AXTitle";
+    pub const ATTR_POSITION: &str = "AXPosition";
+    pub const ATTR_SIZE: &str = "AXSize";
 }
 
 /// NSRunningApplication 信息：(localizedName, bundleIdentifier, executableURL.path, pid)
@@ -2646,18 +2653,22 @@ fn ax_focused_window_info(pid: i32) -> (String, Option<WindowBounds>) {
             return (String::new(), None);
         }
 
-        let window = match copy_ax_attribute(app_element, macos_ax::kAXFocusedWindowAttribute) {
-            Some(window) => window,
-            None => {
-                CFRelease(app_element);
-                return (String::new(), None);
-            }
-        };
+        let focused_window_attribute = CFString::from_static_string(macos_ax::ATTR_FOCUSED_WINDOW);
+        let window =
+            match copy_ax_attribute(app_element, focused_window_attribute.as_concrete_TypeRef()) {
+                Some(window) => window,
+                None => {
+                    CFRelease(app_element);
+                    return (String::new(), None);
+                }
+            };
 
-        let title = copy_ax_attribute(window, macos_ax::kAXTitleAttribute)
+        let title_attribute = CFString::from_static_string(macos_ax::ATTR_TITLE);
+        let title = copy_ax_attribute(window, title_attribute.as_concrete_TypeRef())
             .map(|value| CFString::wrap_under_create_rule(value as _).to_string());
 
-        let position = with_ax_value(window, macos_ax::kAXPositionAttribute, |value| {
+        let position_attribute = CFString::from_static_string(macos_ax::ATTR_POSITION);
+        let position = with_ax_value(window, position_attribute.as_concrete_TypeRef(), |value| {
             let mut point = macos_ax::AxPoint { x: 0.0, y: 0.0 };
             macos_ax::AXValueGetValue(
                 value,
@@ -2667,7 +2678,8 @@ fn ax_focused_window_info(pid: i32) -> (String, Option<WindowBounds>) {
             .then_some((point.x, point.y))
         });
 
-        let size = with_ax_value(window, macos_ax::kAXSizeAttribute, |value| {
+        let size_attribute = CFString::from_static_string(macos_ax::ATTR_SIZE);
+        let size = with_ax_value(window, size_attribute.as_concrete_TypeRef(), |value| {
             let mut size = macos_ax::AxSize {
                 width: 0.0,
                 height: 0.0,
