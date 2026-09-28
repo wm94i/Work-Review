@@ -45,11 +45,27 @@ EOF
 
 echo "[2/3] Importing into login keychain..."
 
-openssl pkcs12 -export \
-    -out /tmp/wr_cert.p12 \
-    -inkey /tmp/wr_key.pem \
-    -in /tmp/wr_cert.pem \
-    -passout pass:workreview 2>/dev/null
+# macOS 的 security 只认传统 PKCS#12（RC2/3DES + SHA1）。Homebrew 的 OpenSSL 3.x 默认用
+# AES-256-CBC/SHA-256 导出，security import 会报
+# "MAC verification failed during PKCS12 import (wrong password?)"（密码其实是对的）。
+# 故优先用系统自带 LibreSSL（/usr/bin/openssl，输出传统格式），缺失时退回 OpenSSL 3 的 -legacy。
+export_pkcs12() {
+    if [ -x /usr/bin/openssl ]; then
+        /usr/bin/openssl pkcs12 -export \
+            -out /tmp/wr_cert.p12 \
+            -inkey /tmp/wr_key.pem \
+            -in /tmp/wr_cert.pem \
+            -passout pass:workreview 2>/dev/null && return 0
+    fi
+
+    openssl pkcs12 -export -legacy \
+        -out /tmp/wr_cert.p12 \
+        -inkey /tmp/wr_key.pem \
+        -in /tmp/wr_cert.pem \
+        -passout pass:workreview 2>/dev/null
+}
+
+export_pkcs12
 
 security import /tmp/wr_cert.p12 \
     -k "$KEYCHAIN" \
