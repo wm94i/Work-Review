@@ -945,6 +945,8 @@ pub async fn get_ai_providers() -> Result<Vec<serde_json::Value>, AppError> {
         let id = provider["id"].as_str().unwrap_or("custom").to_string();
         let parsed = serde_json::from_value::<AiProvider>(serde_json::Value::String(id))
             .unwrap_or(AiProvider::Custom);
+        // Endpoints and default models come from AiProvider as the single source of truth,
+        // so this list cannot drift from config.rs.
         // 端点与默认模型统一以 AiProvider 为单一事实源，避免与 config.rs 漂移
         provider["default_endpoint"] =
             serde_json::Value::String(parsed.default_endpoint().to_string());

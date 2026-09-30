@@ -7,8 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.3-rc.2] - 2026-09-30
+
+Second release candidate for 1.1.3. Not offered through the stable automatic-update endpoint. Back up your data before testing data-directory migration.
+1.1.3 的第二个候选版本，同样不进入稳定自动更新通道。测试数据目录迁移前请先备份数据。
+
+### Fixed
+- Collect the active macOS window via NSWorkspace/AXUIElement instead of spawning `osascript` every poll, which flashed the Dock icon each cycle (#181).
+  macOS 前台窗口采集改为进程内 NSWorkspace/AXUIElement，不再每次轮询拉起 `osascript`，消除 Dock 图标的周期性闪烁（#181）。
+- Website category changes now take effect in the overview and history immediately; sites whose domain came from the window title or OCR are backfilled and reclassified (#178).
+  网站分类修改后立即反映到概览与历史；域名来自窗口标题或 OCR 的站点会被回补并重新分类（#178）。
+- Route bare data queries such as "this week's time breakdown" into work review mode instead of leaving them unanswered (#179).
+  “本周时间分布”这类裸数据问题会被正确路由进工作复盘模式，不再答非所问（#179）。
+- Link AX attribute constants correctly on the macOS 26 SDK, where they are macros rather than exported symbols (#184).
+  修复 macOS 26 SDK 下 AX 属性常量的链接错误——它们是宏而非导出符号（#184）。
+- Make `setup-codesign.sh` work with OpenSSL 3 by preferring the system LibreSSL PKCS#12 output and falling back to `-legacy` (#185).
+  `setup-codesign.sh` 兼容 OpenSSL 3：优先系统 LibreSSL 输出传统 PKCS#12，缺失时回退 `-legacy`（#185）。
+
 ### Changed
-- Refresh default AI model suggestions to current vendor lineups (OpenAI `gpt-6-luna`, Gemini `gemini-3.8-flash`, Claude `claude-sonnet-5-5`, Zhipu `glm-5.3-flash`, Moonshot `kimi-k2.6`, Doubao `doubao-seed-evolving`, MiniMax `MiniMax-M3`, Groq `openai/gpt-oss-120b`, xAI `grok-4.7`). Provider endpoints and default models are now served from `AiProvider` instead of a duplicated list.
+- Refresh default AI model suggestions to current vendor lineups: OpenAI `gpt-6-luna`, Gemini `gemini-3.8-flash`, Claude `claude-sonnet-5-5`, Zhipu `glm-5.3-flash`, Moonshot `kimi-k2.6`, Doubao `doubao-seed-evolving`, MiniMax `MiniMax-M3`, Groq `openai/gpt-oss-120b`, xAI `grok-4.7`. Provider endpoints and default models are now served from `AiProvider` instead of a duplicated list.
+  将各 AI 供应商默认模型刷新至当前在售版本（清单见英文行），供应商端点与默认模型改为统一由 `AiProvider` 提供，不再维护重复清单。
 
 ## [1.1.3-rc.1] - 2026-09-05
 
