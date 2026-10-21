@@ -175,29 +175,35 @@ fn get_idle_seconds() -> u64 {
         current_linux_desktop_session(),
         LinuxDesktopSession::Wayland
     ) {
-        let output = Command::new("dbus-send")
-            .args([
+        // GNOME (Mutter) 不实现 org.freedesktop.ScreenSaver.GetSessionIdleTime
+        // (返回 NotSupported),xprintidle 也只能看到 XWayland 输入,
+        // 因此优先使用 Mutter 自带的 IdleMonitor,无需安装扩展。
+        // GNOME (Mutter) answers GetSessionIdleTime with NotSupported and
+        // xprintidle only sees XWayland input, so query Mutter's IdleMonitor first.
+        let candidates: [&[&str]; 2] = [
+            &[
+                "--session",
+                "--print-reply",
+                "--dest=org.gnome.Mutter.IdleMonitor",
+                "/org/gnome/Mutter/IdleMonitor/Core",
+                "org.gnome.Mutter.IdleMonitor.GetIdletime",
+            ],
+            &[
                 "--session",
                 "--print-reply",
                 "--dest=org.freedesktop.ScreenSaver",
                 "/org/freedesktop/ScreenSaver",
                 "org.freedesktop.ScreenSaver.GetSessionIdleTime",
-            ])
-            .output();
+            ],
+        ];
 
-        if let Ok(result) = output {
-            if result.status.success() {
-                let stdout = String::from_utf8_lossy(&result.stdout);
-                if let Some(idle_ms) = stdout
-                    .split_whitespace()
-                    .collect::<Vec<_>>()
-                    .windows(2)
-                    .find_map(|parts| match parts {
-                        ["uint32", value] => value.parse::<u64>().ok(),
-                        _ => None,
-                    })
-                {
-                    return idle_ms / 1000;
+        for args in candidates {
+            if let Ok(result) = Command::new("dbus-send").args(args).output() {
+                if result.status.success() {
+                    let stdout = String::from_utf8_lossy(&result.stdout);
+                    if let Some(idle_ms) = parse_dbus_idle_ms(&stdout) {
+                        return idle_ms / 1000;
+                    }
                 }
             }
         }
@@ -215,6 +221,20 @@ fn get_idle_seconds() -> u64 {
     }
 }
 
+/// 解析 `dbus-send --print-reply` 输出中的空闲毫秒数。
+/// ScreenSaver 返回 `uint32`,Mutter IdleMonitor 返回 `uint64`。
+#[cfg(any(target_os = "linux", test))]
+fn parse_dbus_idle_ms(stdout: &str) -> Option<u64> {
+    stdout
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .windows(2)
+        .find_map(|parts| match parts {
+            ["uint32" | "uint64", value] => value.parse::<u64>().ok(),
+            _ => None,
+        })
+}
+
 // ============== 其他平台 ==============
 
 #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
@@ -230,5 +250,15 @@ mod tests {
     fn test_hash_similarity() {
         assert_eq!(hash_similarity(0x1234567890ABCDEF, 0x1234567890ABCDEF), 100);
         assert_eq!(hash_similarity(0x0000000000000000, 0xFFFFFFFFFFFFFFFF), 0);
+    }
+
+    #[test]
+    fn test_parse_dbus_idle_ms() {
+        let mutter = "method return time=1792623559.822007 sender=:1.10 -> destination=:1.5 serial=1 reply_serial=2\n   uint64 17103\n";
+        assert_eq!(parse_dbus_idle_ms(mutter), Some(17103));
+        let screensaver = "method return time=1 sender=:1.10 -> destination=:1.5 serial=1 reply_serial=2\n   uint32 4200\n";
+        assert_eq!(parse_dbus_idle_ms(screensaver), Some(4200));
+        assert_eq!(parse_dbus_idle_ms(""), None);
+        assert_eq!(parse_dbus_idle_ms("   string \"oops\"\n"), None);
     }
 }
