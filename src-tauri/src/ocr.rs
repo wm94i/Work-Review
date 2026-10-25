@@ -1637,6 +1637,8 @@ mod tests {
         }
         assert_eq!(native.matches("RecognizeAsync(").count(), 1);
         assert_eq!(native.matches("Command::new(").count(), 1);
+        assert!(native.contains("\"-WindowStyle\",\n                    \"Hidden\""));
+        assert!(native.contains(".creation_flags(CREATE_NO_WINDOW)"));
     }
 
     use super::{
