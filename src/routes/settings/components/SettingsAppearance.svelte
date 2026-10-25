@@ -22,6 +22,7 @@
     type AvailableAvatarPresetId,
   } from '$lib/components/Avatar/avatarPresetRegistry.ts';
   import AvatarPresetPreview from '$lib/components/Avatar/AvatarPresetPreview.svelte';
+  import { REPORT_EDITOR_FONTS, reportEditorFontFamily } from '$lib/utils/reportEditorFont.ts';
 
   type AppearanceMode = 'full' | 'avatar-only' | 'background-only';
   type AvatarPersona = 'companion' | 'assistant' | 'coach';
@@ -39,6 +40,7 @@
     break_reminder_enabled: boolean;
     break_reminder_interval_minutes: number;
     ui_visual_style: UiVisualStyle;
+    report_editor_font?: string;
     background_image: string | null;
     background_opacity?: number | null;
     background_blur?: number | null;
@@ -752,6 +754,29 @@
       </button>
     {/each}
   </div>
+</div>
+{/if}
+
+{#if showInterfaceStyleSettings}
+<div class="settings-card" data-locale={currentLocale}>
+  <label for="report-editor-font" class="settings-card-title">{t('settingsAppearance.reportEditorFont')}</label>
+  <p class="settings-muted mt-1" id="report-editor-font-hint">{t('settingsAppearance.reportEditorFontHint')}</p>
+  <select
+    id="report-editor-font"
+    class="control-input mt-3"
+    aria-describedby="report-editor-font-hint"
+    value={config.report_editor_font || ''}
+    style:font-family={reportEditorFontFamily(config.report_editor_font)}
+    on:change={(event) => {
+      config.report_editor_font = event.currentTarget.value;
+      dispatch('change', config);
+    }}
+  >
+    <option value="">{t('settingsAppearance.reportEditorFontSystem')}</option>
+    {#each REPORT_EDITOR_FONTS as font}
+      <option value={font}>{font === 'monospace' ? t('settingsAppearance.reportEditorFontMono') : font}</option>
+    {/each}
+  </select>
 </div>
 {/if}
 

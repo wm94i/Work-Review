@@ -12,6 +12,7 @@
   import { cache, type CacheState } from '../../lib/stores/cache.ts';
   import { formatLocalizedDate, formatLocalizedTime, formatDurationLocalized, locale, t, tm, translateCategoryLabel } from '$lib/i18n/index.ts';
   import { formatUserError } from '$lib/utils/errorDisplay.ts';
+  import { reportEditorFontFamily } from '$lib/utils/reportEditorFont.ts';
   import { shouldShowPromptAppliedToast } from './reportPromptFeedback.ts';
   import { resolveReportMeta, type ResolvedReportMeta } from './reportMeta.ts';
   import {
@@ -49,6 +50,7 @@
     daily_report_pinned_blocks: string[];
     daily_report_hidden_blocks: string[];
     daily_report_system_prompt_override?: string | null;
+    report_editor_font?: string;
     [key: string]: unknown;
   }
 
@@ -1588,6 +1590,8 @@
       <div class="modal-body">
         <textarea
           class="report-edit-textarea"
+          aria-label={t('report.editSection')}
+          style:font-family={reportEditorFontFamily(config?.report_editor_font)}
           bind:value={editingContent}
         ></textarea>
       </div>

@@ -13,7 +13,8 @@
    ══════════════════════════════════════════════════════════ */
 :root {
   color-scheme: light;
-  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", "Hiragino Sans GB", "Segoe UI Variable Text", "Microsoft YaHei", sans-serif;
+  --font-ui: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", "Hiragino Sans GB", "Segoe UI Variable Text", "Microsoft YaHei", sans-serif;
+  font-family: var(--font-ui);
   font-size: 16px;
   line-height: 1.6;
   font-weight: 400;
@@ -3004,7 +3005,7 @@
   width: 100%;
   min-height: 480px;
   padding: 0.75rem 1rem;
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-family: inherit;
   font-size: 15px;
   line-height: 1.8;
   resize: vertical;

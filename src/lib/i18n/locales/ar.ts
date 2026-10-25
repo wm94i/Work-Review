@@ -1093,6 +1093,10 @@ export default {
       switchRequiresVerifiedModel: 'قم بإعداد واختبار اتصال نموذج الذكاء الاصطناعي أولاً',
     },
     settingsAppearance: {
+      reportEditorFont: "خط محرر التقرير",
+      reportEditorFontHint: "يُطبّق على تحرير أقسام التقرير فقط. يجب تثبيت الخط؛ وإلا يُستخدم خط الواجهة. انقر على حفظ الإعدادات بعد التغيير.",
+      reportEditorFontSystem: "خط الواجهة (الافتراضي)",
+      reportEditorFontMono: "خط أحادي المسافة",
       avatar: 'وكيل سطح المكتب (Avatar)',
       avatarDesc: 'مرافق على سطح المكتب يعرض حالة العمل لحظياً',
       avatarBetaHint: 'ميزة تجريبية، لا تزال قيد التطوير.',

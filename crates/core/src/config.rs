@@ -1095,6 +1095,9 @@ pub struct AppConfig {
     /// 界面风格: a=Quiet Pro, b=当前柔和层次, c=Compact Data
     #[serde(default = "default_ui_visual_style")]
     pub ui_visual_style: String,
+    /// 日报编辑字体；空字符串使用界面字体，未安装的字体由前端回退。
+    #[serde(default)]
+    pub report_editor_font: String,
     /// 上班开始时间（0-23）
     #[serde(default = "default_work_start")]
     pub work_start_hour: u8,
@@ -1369,6 +1372,7 @@ impl Default for AppConfig {
             last_app_version: None,
             theme: "system".to_string(),
             ui_visual_style: default_ui_visual_style(),
+            report_editor_font: String::new(),
             work_start_hour: 9,
             work_end_hour: 18,
             work_start_minute: 0,
@@ -2820,6 +2824,19 @@ mod tests {
         assert_eq!(normalize_ui_visual_style("B"), "b");
         assert_eq!(normalize_ui_visual_style("c"), "c");
         assert_eq!(normalize_ui_visual_style("unknown"), "c");
+    }
+
+    #[test]
+    fn 日报编辑字体兼容旧配置且保存后保留选择() {
+        let mut json = serde_json::to_value(AppConfig::default()).unwrap();
+        assert_eq!(json["report_editor_font"], "");
+        json.as_object_mut().unwrap().remove("report_editor_font");
+        let mut config: AppConfig = serde_json::from_value(json).unwrap();
+        assert!(config.report_editor_font.is_empty());
+        config.report_editor_font = "Microsoft YaHei".into();
+        let saved = serde_json::to_string(&config).unwrap();
+        let loaded: AppConfig = serde_json::from_str(&saved).unwrap();
+        assert_eq!(loaded.report_editor_font, "Microsoft YaHei");
     }
 
     #[test]

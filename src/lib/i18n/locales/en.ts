@@ -1103,6 +1103,10 @@ export default {
       switchRequiresVerifiedModel: 'Configure and test the AI model connection first',
     },
     settingsAppearance: {
+      reportEditorFont: "Report editor font",
+      reportEditorFontHint: "Applies only to report section editing. Fonts must be installed; unavailable fonts fall back to the interface font. Click Save settings after changing.",
+      reportEditorFontSystem: "Interface font (default)",
+      reportEditorFontMono: "Monospace",
       avatar: 'Desktop Avatar',
       avatarDesc: 'Desktop companion with real-time work state feedback',
       avatarBetaHint: 'Experimental feature, still being refined.',

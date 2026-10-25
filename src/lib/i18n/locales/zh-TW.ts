@@ -1088,6 +1088,10 @@ export default {
       switchRequiresVerifiedModel: '請先配置並測試 AI 模型連線',
     },
     settingsAppearance: {
+      reportEditorFont: "日報編輯字體",
+      reportEditorFontHint: "僅用於日報段落編輯。字體需已安裝；未安裝時回退到介面字體。修改後請點擊儲存設定。",
+      reportEditorFontSystem: "跟隨介面（預設）",
+      reportEditorFontMono: "等寬字體",
       avatar: '桌面化身',
       avatarDesc: '顯示獨立桌寵視窗，用輕量狀態回饋目前工作節奏',
       avatarBetaHint: '實驗功能，目前仍在持續優化顯示細節、狀態回饋與互動體驗',

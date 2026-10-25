@@ -1086,6 +1086,10 @@ export default {
       switchRequiresVerifiedModel: '请先配置并测试 AI 模型连接',
     },
     settingsAppearance: {
+      reportEditorFont: "日报编辑字体",
+      reportEditorFontHint: "仅用于日报段落编辑。字体需已安装；未安装时回退到界面字体。修改后请点击保存设置。",
+      reportEditorFontSystem: "跟随界面（默认）",
+      reportEditorFontMono: "等宽字体",
       avatar: '桌面化身',
       avatarDesc: '桌宠窗口实时反馈工作节奏',
       avatarBetaHint: '实验功能，持续优化中',
