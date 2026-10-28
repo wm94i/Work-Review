@@ -109,64 +109,54 @@ impl ScreenLockMonitor {
     }
 
     /// 检查屏幕是否锁定 (Linux)
-    /// 通过 D-Bus 查询 screensaver 状态或检查锁屏进程
+    /// 优先使用 loginctl；只有该命令不可用时才走一次合并回退，避免每轮启动多个进程。
     #[cfg(target_os = "linux")]
     pub fn is_locked(&self) -> bool {
         use std::process::Command;
 
-        // 方法1: 通过 loginctl 检查 session 是否 locked
-        if let Ok(output) = Command::new("loginctl")
-            .args([
-                "show-session",
-                "auto",
-                "--property=LockedHint",
-                "--no-legend",
-            ])
-            .output()
-        {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            if stdout.contains("LockedHint=yes") {
-                log::debug!("锁屏检测: loginctl 报告 session 已锁定");
-                return true;
-            }
-        }
-
-        // 方法2: 检查常见锁屏进程
-        for proc_name in &[
-            "cinnamon-screensaver",
-            "gnome-screensaver",
-            "xscreensaver",
-            "i3lock",
-            "swaylock",
-        ] {
-            if let Ok(output) = Command::new("pgrep").args(["-x", proc_name]).output() {
-                if output.status.success() {
-                    log::debug!("锁屏检测: 锁屏进程 {} 运行中", proc_name);
-                    return true;
+        if let Some(output) = run_linux_lock_command(Command::new("loginctl").args([
+            "show-session",
+            "auto",
+            "--property=LockedHint",
+            "--value",
+            "--no-legend",
+        ])) {
+            if output.status.success() {
+                let locked = loginctl_reports_locked(&String::from_utf8_lossy(&output.stdout));
+                if locked {
+                    log::debug!("锁屏检测: loginctl 报告 session 已锁定");
                 }
+                return locked;
             }
         }
 
-        // 方法3: D-Bus 查询 Cinnamon/GNOME screensaver
-        if let Ok(output) = Command::new("dbus-send")
-            .args([
-                "--session",
-                "--dest=org.cinnamon.ScreenSaver",
-                "--type=method_call",
-                "--print-reply",
-                "/org/cinnamon/ScreenSaver",
-                "org.cinnamon.ScreenSaver.GetActive",
-            ])
-            .output()
-        {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            if stdout.contains("boolean true") {
-                log::debug!("锁屏检测: Cinnamon ScreenSaver 报告已激活");
+        // 无 systemd 的桌面环境：一次 pgrep 覆盖常见锁屏进程，再尝试 Cinnamon D-Bus。
+        if let Some(output) = run_linux_lock_command(Command::new("pgrep").args([
+            "-f",
+            "^(cinnamon-screensaver|gnome-screensaver|xscreensaver|i3lock|swaylock)( .*)?$",
+        ])) {
+            if output.status.success() {
+                log::debug!("锁屏检测: 常见锁屏进程正在运行");
                 return true;
             }
         }
 
-        false
+        run_linux_lock_command(Command::new("dbus-send").args([
+            "--session",
+            "--dest=org.cinnamon.ScreenSaver",
+            "--type=method_call",
+            "--print-reply",
+            "/org/cinnamon/ScreenSaver",
+            "org.cinnamon.ScreenSaver.GetActive",
+        ]))
+        .is_some_and(|output| {
+            let locked = output.status.success()
+                && String::from_utf8_lossy(&output.stdout).contains("boolean true");
+            if locked {
+                log::debug!("锁屏检测: Cinnamon ScreenSaver 报告已激活");
+            }
+            locked
+        })
     }
 
     /// 检查屏幕是否锁定 (其他平台)
@@ -181,8 +171,51 @@ impl ScreenLockMonitor {
     }
 }
 
+#[cfg(any(target_os = "linux", test))]
+fn loginctl_reports_locked(stdout: &str) -> bool {
+    matches!(stdout.trim(), "yes" | "LockedHint=yes")
+}
+
+#[cfg(target_os = "linux")]
+fn run_linux_lock_command(command: &mut std::process::Command) -> Option<std::process::Output> {
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    const TIMEOUT: Duration = Duration::from_secs(2);
+
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command.spawn().ok()?;
+    let started_at = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return child.wait_with_output().ok(),
+            Ok(None) if started_at.elapsed() < TIMEOUT => {
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Ok(None) | Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+}
+
 impl Default for ScreenLockMonitor {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::loginctl_reports_locked;
+
+    #[test]
+    fn loginctl锁屏结果只接受明确的yes() {
+        assert!(loginctl_reports_locked("yes\n"));
+        assert!(loginctl_reports_locked("LockedHint=yes\n"));
+        assert!(!loginctl_reports_locked("no\n"));
+        assert!(!loginctl_reports_locked(""));
     }
 }

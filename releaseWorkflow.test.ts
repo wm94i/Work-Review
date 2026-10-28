@@ -52,6 +52,24 @@ test('Release workflow 应校验严格 SemVer、五处版本一致并只允许�
     assert.doesNotMatch(invalid, strictSemver);
   }
   assert.match(source, /npm run test:frontend/);
+  assert.match(source, /TAG_VERSION="\$\{GITHUB_REF_NAME#v\}"/);
+  assert.match(source, /STABLE_VERSION="\$\{TAG_VERSION%-rc\.\*\}"/);
+  assert.match(source, /if \[\[ "\$STABLE_VERSION" != "\$VERSION" \]\]/);
+
+  for (const [tag, version, status] of [
+    ['v1.1.3', '1.1.3', 0],
+    ['v1.1.3-rc.1', '1.1.3', 0],
+    ['v1.1.3-rc.10', '1.1.3', 0],
+    ['v1.1.4-rc.1', '1.1.3', 1],
+  ] as const) {
+    const result = spawnSync(
+      'bash',
+      ['-c', 'TAG_VERSION="${GITHUB_REF_NAME#v}"; STABLE_VERSION="${TAG_VERSION%-rc.*}"; [[ "$STABLE_VERSION" == "$VERSION" ]]'],
+      { env: { ...process.env, GITHUB_REF_NAME: tag, VERSION: version }, encoding: 'utf8' },
+    );
+    assert.equal(result.status, status, `${tag} / ${version}: ${result.error ?? result.stderr}`);
+  }
+
   assert.match(source, /git fetch origin main/);
   assert.match(source, /git rev-parse origin\/main/);
   assert.match(source, /GITHUB_REF_NAME/);
@@ -119,6 +137,8 @@ test('Security Audit 应允许 rustsec Action 更新检查与告警 Issue', () =
   assert.match(permissions, /^\s+issues: write$/m);
   assert.doesNotMatch(workflowPermissions, /^\s+(?:checks|issues): write$/m);
   assert.doesNotMatch(npmAuditJob, /^\s+(?:checks|issues): write$/m);
+  assert.match(source, /\n  pull_request:\s*\n  workflow_dispatch:/);
+  assert.doesNotMatch(source, /^\s+paths:/m);
 });
 
 test('Release workflow 缺少便携包、构建产物或附件时必须失败', () => {

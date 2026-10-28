@@ -39,6 +39,10 @@ pub fn set_avatar_click_through_flag(on: bool) {
 }
 pub fn set_avatar_enabled_flag(on: bool) {
     AVATAR_ENABLED_FLAG.store(on, Ordering::Relaxed);
+    if !on {
+        clear_avatar_input_state();
+        force_resync_click_through();
+    }
 }
 /// 重置 ignore 缓存，强制下一轮命中测试重新同步（穿透配置/窗口变更时调）。
 pub fn force_resync_click_through() {
@@ -46,6 +50,22 @@ pub fn force_resync_click_through() {
 }
 static KEYBOARD_STATE: Lazy<Mutex<KeyboardInputState>> =
     Lazy::new(|| Mutex::new(KeyboardInputState::default()));
+
+fn clear_avatar_input_state() {
+    LAST_KEYBOARD_INPUT_AT_MS.store(0, Ordering::Relaxed);
+    LAST_MOUSE_INPUT_AT_MS.store(0, Ordering::Relaxed);
+    LAST_KEYBOARD_GROUP_CODE.store(0, Ordering::Relaxed);
+    LAST_KEYBOARD_KEY_CODE.store(0, Ordering::Relaxed);
+    LAST_MOUSE_GROUP_CODE.store(0, Ordering::Relaxed);
+    CURSOR_RATIO_INITIALIZED.store(false, Ordering::Relaxed);
+    KEYBOARD_STATE
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .pressed_keys
+        .clear();
+    #[cfg(target_os = "linux")]
+    WAYLAND_CURSOR_UPDATED_AT_MS.store(0, Ordering::Relaxed);
+}
 
 const KEYBOARD_GROUP_DIGIT_1: u8 = 1;
 const KEYBOARD_GROUP_DIGIT_2: u8 = 2;
@@ -1038,6 +1058,9 @@ pub(crate) fn build_avatar_input_payload(now_ms: u64) -> AvatarInputPayload {
 }
 
 pub(crate) fn record_keyboard_input(group_code: u8, key_code: u16) {
+    if !AVATAR_ENABLED_FLAG.load(Ordering::Relaxed) {
+        return;
+    }
     let pressed_at_ms = now_ms();
     {
         let mut state = KEYBOARD_STATE.lock().unwrap_or_else(|e| e.into_inner());
@@ -1055,6 +1078,9 @@ pub(crate) fn record_keyboard_input(group_code: u8, key_code: u16) {
 }
 
 pub(crate) fn release_keyboard_input(key_code: u16) {
+    if !AVATAR_ENABLED_FLAG.load(Ordering::Relaxed) {
+        return;
+    }
     let next_primary = {
         let mut state = KEYBOARD_STATE.lock().unwrap_or_else(|e| e.into_inner());
         state
@@ -1075,11 +1101,17 @@ pub(crate) fn release_keyboard_input(key_code: u16) {
 }
 
 pub(crate) fn record_mouse_input(group_code: u8) {
+    if !AVATAR_ENABLED_FLAG.load(Ordering::Relaxed) {
+        return;
+    }
     LAST_MOUSE_INPUT_AT_MS.store(now_ms(), Ordering::Relaxed);
     LAST_MOUSE_GROUP_CODE.store(group_code, Ordering::Relaxed);
 }
 
 pub(crate) fn record_cursor_ratio(x_ratio: f64, y_ratio: f64) {
+    if !AVATAR_ENABLED_FLAG.load(Ordering::Relaxed) {
+        return;
+    }
     let to_permille = |value: f64| -> u32 { (value.clamp(0.0, 1.0) * 1000.0).round() as u32 };
 
     CURSOR_RATIO_X_PERMILLE.store(to_permille(x_ratio), Ordering::Relaxed);
@@ -1099,6 +1131,11 @@ pub fn spawn_avatar_input_bridge(app: AppHandle) {
         let mut tick: u32 = 0;
 
         loop {
+            if !AVATAR_ENABLED_FLAG.load(Ordering::Relaxed) {
+                INPUT_BRIDGE_STARTED.store(false, Ordering::SeqCst);
+                return;
+            }
+
             let next_payload = build_avatar_input_payload(now_ms());
             if last_payload.as_ref() != Some(&next_payload) {
                 crate::avatar_engine::emit_avatar_input(&app, &next_payload);
@@ -1369,6 +1406,10 @@ pub fn spawn_avatar_input_monitor_retry(app: AppHandle) {
 
     tauri::async_runtime::spawn(async move {
         loop {
+            if !AVATAR_ENABLED_FLAG.load(Ordering::Relaxed) {
+                INPUT_MONITOR_RETRY_STARTED.store(false, Ordering::SeqCst);
+                return;
+            }
             let monitor_started = INPUT_MONITOR_STARTED.load(Ordering::SeqCst);
             if !monitor_started {
                 let has_accessibility_permission =

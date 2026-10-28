@@ -14,7 +14,6 @@
   import { preloadAppIcons, type AppIconInvoke } from './lib/stores/iconCache.ts';
   import { runUpdateFlow } from './lib/utils/updater.ts';
   import { isTimelineActivity } from './routes/timeline/timelineData.ts';
-  import { timelineGateway } from './routes/timeline/timelineGateway.ts';
 
   type Theme = 'system' | 'light' | 'dark';
   type UiVisualStyle = 'a' | 'b' | 'c';
@@ -303,7 +302,7 @@
     devLog('开始预加载数据...');
     const today = getLocalDate();
     
-    // 并行预加载：概览、时间线(今天)、日报(今天)
+    // 并行预加载：概览、日报(今天)
     Promise.all([
       // 1. 概览
       invoke<DailyStatsPreview>('get_today_stats').then(stats => {
@@ -326,16 +325,7 @@
           invokeAppIcon
         );
       }),
-      // 2. 时间线 (今天) - 仅预加载前 20 条
-      Promise.all([
-        timelineGateway.getPage({ date: today, limit: 20, offset: 0 }),
-        timelineGateway.getHourlySummaries(today),
-      ]).then(([activities, summaries]) => cache.setTimeline(
-        today,
-        activities,
-        summaries,
-      )),
-      // 3. 日报 (今天) - 检查是否已存在（必须带上当前语言，否则会把中文日报缓存到其他语言的 key 下）
+      // 2. 日报 (今天) - 检查是否已存在（必须带上当前语言，否则会把中文日报缓存到其他语言的 key 下）
       invoke<unknown>('get_saved_report', { date: today, locale: $locale }).then(report => {
         if (report) cache.setReport(`${today}:${$locale}`, report);
       })

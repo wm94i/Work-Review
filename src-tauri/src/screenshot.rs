@@ -13,8 +13,10 @@ use regex::Regex;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-use std::process::Command;
+use std::process::{Command, Output, Stdio};
 use std::sync::{Arc, Mutex};
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+use std::time::Duration;
 #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux", test))]
 use std::{
     collections::hash_map::DefaultHasher,
@@ -186,6 +188,45 @@ impl From<&StorageConfig> for ScreenshotConfig {
             width_mode: value.screenshot_width_mode,
         }
     }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+const SCREENSHOT_COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn run_screenshot_command_with_timeout(command: &mut Command, context: &str) -> Result<Output> {
+    command.stdout(Stdio::null()).stderr(Stdio::null());
+    let mut child = command
+        .spawn()
+        .map_err(|error| AppError::Screenshot(format!("{context} 启动失败: {error}")))?;
+    let started_at = std::time::Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if started_at.elapsed() < SCREENSHOT_COMMAND_TIMEOUT => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(AppError::Screenshot(format!(
+                    "{context} 执行超时（>{}s）",
+                    SCREENSHOT_COMMAND_TIMEOUT.as_secs()
+                )));
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(AppError::Screenshot(format!("{context} 等待失败: {error}")));
+            }
+        }
+    };
+
+    Ok(Output {
+        status,
+        stdout: Vec::new(),
+        stderr: Vec::new(),
+    })
 }
 
 /// 截屏服务
@@ -846,10 +887,17 @@ impl ScreenshotService {
             screen.display_info.height,
         );
 
-        let output = Command::new("screencapture")
-            .args(["-x", "-t", "png", "-R", &rect, &temp_png.to_string_lossy()])
-            .output()
-            .map_err(|e| AppError::Screenshot(format!("调用 screencapture 失败: {e}")))?;
+        let output = run_screenshot_command_with_timeout(
+            Command::new("screencapture").args([
+                "-x",
+                "-t",
+                "png",
+                "-R",
+                &rect,
+                &temp_png.to_string_lossy(),
+            ]),
+            "screencapture",
+        )?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -1005,23 +1053,30 @@ impl ScreenshotService {
     ) -> Result<ScreenshotResult> {
         let temp_png = screenshots_dir.join(format!("{time_str}_temp.png"));
         let _temp_guard = TemporaryCaptureFile::new(&temp_png);
-        let scrot_result = Command::new("scrot")
-            .args(["-o", &temp_png.to_string_lossy()])
-            .output();
+        let scrot_result = run_screenshot_command_with_timeout(
+            Command::new("scrot").args(["-o", &temp_png.to_string_lossy()]),
+            "scrot",
+        );
 
         let captured = match scrot_result {
             Ok(output) if output.status.success() && temp_png.exists() => true,
             _ => {
-                let import_result = Command::new("import")
-                    .args(["-window", "root", temp_png.to_string_lossy().as_ref()])
-                    .output();
+                let import_result = run_screenshot_command_with_timeout(
+                    Command::new("import").args([
+                        "-window",
+                        "root",
+                        temp_png.to_string_lossy().as_ref(),
+                    ]),
+                    "import",
+                );
 
                 match import_result {
                     Ok(output) if output.status.success() && temp_png.exists() => true,
                     _ => {
-                        let maim_result = Command::new("maim")
-                            .arg(temp_png.to_string_lossy().to_string())
-                            .output();
+                        let maim_result = run_screenshot_command_with_timeout(
+                            Command::new("maim").arg(temp_png.to_string_lossy().to_string()),
+                            "maim",
+                        );
 
                         matches!(
                             maim_result,
@@ -1081,7 +1136,10 @@ impl ScreenshotService {
         let mut captured = false;
 
         for (command_name, args) in candidates {
-            let output = Command::new(command_name).args(&args).output();
+            let output = run_screenshot_command_with_timeout(
+                Command::new(command_name).args(&args),
+                command_name,
+            );
             match output {
                 Ok(result) if result.status.success() && temp_png.exists() => {
                     captured = true;
@@ -1218,10 +1276,11 @@ fn parse_xrandr_active_monitor_rects(output: &str) -> Vec<LinuxCaptureRect> {
 
 #[cfg(target_os = "linux")]
 fn run_xrandr_active_monitors() -> Option<Vec<LinuxCaptureRect>> {
-    let output = Command::new("xrandr")
-        .arg("--listactivemonitors")
-        .output()
-        .ok()?;
+    let output = run_screenshot_command_with_timeout(
+        Command::new("xrandr").arg("--listactivemonitors"),
+        "xrandr",
+    )
+    .ok()?;
     if !output.status.success() {
         return None;
     }
@@ -1253,8 +1312,8 @@ fn parse_gnome_display_config_positions(output: &str) -> Vec<(i32, i32)> {
 
 #[cfg(target_os = "linux")]
 fn run_gnome_display_config_positions() -> Option<Vec<(i32, i32)>> {
-    let output = Command::new("gdbus")
-        .args([
+    let output = run_screenshot_command_with_timeout(
+        Command::new("gdbus").args([
             "call",
             "--session",
             "--dest",
@@ -1263,9 +1322,10 @@ fn run_gnome_display_config_positions() -> Option<Vec<(i32, i32)>> {
             "/org/gnome/Mutter/DisplayConfig",
             "--method",
             "org.gnome.Mutter.DisplayConfig.GetCurrentState",
-        ])
-        .output()
-        .ok()?;
+        ]),
+        "gdbus DisplayConfig.GetCurrentState",
+    )
+    .ok()?;
     if !output.status.success() {
         return None;
     }

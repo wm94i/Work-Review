@@ -2586,6 +2586,12 @@
   background: transparent;
   border: 1.5px solid #cbd5e1;
 }
+.report-weekstrip-day-error {
+  color: #b45309;
+}
+.report-weekstrip-day-error i {
+  background: #f59e0b;
+}
 .report-weekstrip-day-active,
 .report-weekstrip-day-active:hover:not(:disabled) {
   background: #3b82f6;
@@ -2625,6 +2631,9 @@
 }
 .dark .report-weekstrip-day-none i {
   border-color: #484f58;
+}
+.dark .report-weekstrip-day-error {
+  color: #fbbf24;
 }
 .dark .report-weekstrip-day-active,
 .dark .report-weekstrip-day-active:hover:not(:disabled) {

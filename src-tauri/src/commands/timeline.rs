@@ -51,7 +51,15 @@ pub async fn get_activity(
     state: State<'_, Arc<Mutex<AppState>>>,
 ) -> Result<Option<Activity>, AppError> {
     let state = state.lock().map_err(|e| AppError::Unknown(e.to_string()))?;
-    state.database.get_activity_by_id(id)
+    let activity = state.database.get_activity_by_id(id)?;
+    let (ignored_apps, excluded_domains) = collect_privacy_filters(&state);
+    Ok(filter_activities_by_privacy(
+        activity.into_iter().collect(),
+        &ignored_apps,
+        &excluded_domains,
+    )
+    .into_iter()
+    .next())
 }
 
 /// 导出指定日期的时间线为 JSON 文件

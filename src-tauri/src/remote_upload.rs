@@ -96,6 +96,7 @@ async fn upload_s3(
     file_bytes: &[u8],
     relative_path: &str,
 ) -> Result<String> {
+    ensure_s3_endpoint_allowed(&config.endpoint)?;
     let endpoint = config.endpoint.trim_end_matches('/');
     let object_key = remote_object_path(&config.path_prefix, relative_path);
 
@@ -237,17 +238,17 @@ fn is_private_or_local_host(host: &str) -> bool {
     false
 }
 
-/// WebDAV 端点安全校验：远程端点必须使用 https，明文 http 仅允许本机/内网地址
+/// 远程端点安全校验：远程端点必须使用 https，明文 http 仅允许本机/内网地址
 /// （与模型端点策略一致），防止截图与凭据经明文链路发往远程服务器。
-fn ensure_webdav_endpoint_allowed(url: &str) -> Result<()> {
+fn ensure_remote_endpoint_allowed(url: &str, service: &str) -> Result<()> {
     let lower = url.trim().to_ascii_lowercase();
     if lower.starts_with("https://") {
         return Ok(());
     }
     let Some(rest) = lower.strip_prefix("http://") else {
-        return Err(AppError::Config(
-            "WebDAV 地址必须以 http:// 或 https:// 开头".to_string(),
-        ));
+        return Err(AppError::Config(format!(
+            "{service} 地址必须以 http:// 或 https:// 开头"
+        )));
     };
 
     // 提取主机名：截到 path/query/fragment 之前，剥离端口；IPv6 形如 [::1]:5005
@@ -261,9 +262,17 @@ fn ensure_webdav_endpoint_allowed(url: &str) -> Result<()> {
     if is_private_or_local_host(host) {
         return Ok(());
     }
-    Err(AppError::Config(
-        "远程 WebDAV 端点必须使用 https（本机/内网地址除外）".to_string(),
-    ))
+    Err(AppError::Config(format!(
+        "远程 {service} 端点必须使用 https（本机/内网地址除外）"
+    )))
+}
+
+fn ensure_s3_endpoint_allowed(url: &str) -> Result<()> {
+    ensure_remote_endpoint_allowed(url, "S3")
+}
+
+fn ensure_webdav_endpoint_allowed(url: &str) -> Result<()> {
+    ensure_remote_endpoint_allowed(url, "WebDAV")
 }
 
 async fn upload_webdav(
@@ -429,8 +438,8 @@ fn public_url_or_fallback(base_url: Option<&str>, object_path: &str, fallback: &
 #[cfg(test)]
 mod tests {
     use super::{
-        content_type_for_extension, ensure_webdav_endpoint_allowed, public_url_or_fallback,
-        remote_object_path,
+        content_type_for_extension, ensure_s3_endpoint_allowed, ensure_webdav_endpoint_allowed,
+        public_url_or_fallback, remote_object_path,
     };
 
     #[test]
@@ -465,6 +474,15 @@ mod tests {
         assert!(ensure_webdav_endpoint_allowed("http://dav.example.com/dav").is_err());
         assert!(ensure_webdav_endpoint_allowed("http://8.8.8.8/dav").is_err());
         assert!(ensure_webdav_endpoint_allowed("ftp://dav.example.com").is_err());
+    }
+
+    #[test]
+    fn s3端点应拒绝远程明文http仅放行本机内网() {
+        assert!(ensure_s3_endpoint_allowed("https://s3.example.com").is_ok());
+        assert!(ensure_s3_endpoint_allowed("http://localhost:9000").is_ok());
+        assert!(ensure_s3_endpoint_allowed("http://192.168.1.20:9000").is_ok());
+        assert!(ensure_s3_endpoint_allowed("http://s3.example.com").is_err());
+        assert!(ensure_s3_endpoint_allowed("ftp://s3.example.com").is_err());
     }
 
     #[test]

@@ -5,11 +5,16 @@
 #[cfg(target_os = "linux")]
 use crate::linux_session::{current_linux_desktop_session, LinuxDesktopSession};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// 上一次截图的哈希值
 static LAST_SCREENSHOT_HASH: AtomicU64 = AtomicU64::new(0);
 /// 连续屏幕无变化的次数
 static NO_CHANGE_COUNT: AtomicU64 = AtomicU64::new(0);
+/// 两个后台循环共享键鼠空闲查询结果，避免重复启动平台命令。
+static LAST_IDLE_SAMPLE_AT_MS: AtomicU64 = AtomicU64::new(0);
+static CACHED_IDLE_SECONDS: AtomicU64 = AtomicU64::new(0);
+const IDLE_SAMPLE_CACHE_TTL_MS: u64 = 500;
 
 /// 空闲检测器
 pub struct IdleDetector {
@@ -107,7 +112,7 @@ fn hash_similarity(hash1: u64, hash2: u64) -> u32 {
 // ============== Windows 实现 ==============
 
 #[cfg(target_os = "windows")]
-fn get_idle_seconds() -> u64 {
+fn query_idle_seconds() -> u64 {
     use std::mem::size_of;
     use winapi::um::sysinfoapi::GetTickCount;
     use winapi::um::winuser::{GetLastInputInfo, LASTINPUTINFO};
@@ -135,7 +140,7 @@ fn get_idle_seconds() -> u64 {
 // ============== macOS 实现 ==============
 
 #[cfg(target_os = "macos")]
-fn get_idle_seconds() -> u64 {
+fn query_idle_seconds() -> u64 {
     // 使用 FFI 直接调用 CGEventSourceSecondsSinceLastEventType
     // 因为 core-graphics crate 不直接暴露这个函数
     use core_graphics::event_source::CGEventSourceStateID;
@@ -168,7 +173,7 @@ fn get_idle_seconds() -> u64 {
 // ============== Linux 实现 ==============
 
 #[cfg(target_os = "linux")]
-fn get_idle_seconds() -> u64 {
+fn query_idle_seconds() -> u64 {
     use std::process::Command;
 
     if matches!(
@@ -198,7 +203,7 @@ fn get_idle_seconds() -> u64 {
         ];
 
         for args in candidates {
-            if let Ok(result) = Command::new("dbus-send").args(args).output() {
+            if let Some(result) = run_linux_idle_command(Command::new("dbus-send").args(args)) {
                 if result.status.success() {
                     let stdout = String::from_utf8_lossy(&result.stdout);
                     if let Some(idle_ms) = parse_dbus_idle_ms(&stdout) {
@@ -210,14 +215,39 @@ fn get_idle_seconds() -> u64 {
     }
 
     // X11 以及 Wayland 回退到 xprintidle
-    let output = Command::new("xprintidle").output();
+    let output = run_linux_idle_command(&mut Command::new("xprintidle"));
     match output {
-        Ok(result) if result.status.success() => {
+        Some(result) if result.status.success() => {
             let stdout = String::from_utf8_lossy(&result.stdout);
             let idle_ms: u64 = stdout.trim().parse().unwrap_or(0);
             idle_ms / 1000
         }
         _ => 0,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn run_linux_idle_command(command: &mut std::process::Command) -> Option<std::process::Output> {
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    const TIMEOUT: Duration = Duration::from_secs(2);
+
+    command.stdout(Stdio::piped()).stderr(Stdio::null());
+    let mut child = command.spawn().ok()?;
+    let started_at = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return child.wait_with_output().ok(),
+            Ok(None) if started_at.elapsed() < TIMEOUT => {
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Ok(None) | Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
     }
 }
 
@@ -238,8 +268,41 @@ fn parse_dbus_idle_ms(stdout: &str) -> Option<u64> {
 // ============== 其他平台 ==============
 
 #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
-fn get_idle_seconds() -> u64 {
+fn query_idle_seconds() -> u64 {
     0
+}
+
+fn idle_sample_now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64
+}
+
+fn idle_cache_is_fresh(now_ms: u64, sampled_at_ms: u64) -> bool {
+    sampled_at_ms != 0 && now_ms.saturating_sub(sampled_at_ms) < IDLE_SAMPLE_CACHE_TTL_MS
+}
+
+fn get_idle_seconds() -> u64 {
+    let now_ms = idle_sample_now_ms();
+    let sampled_at_ms = LAST_IDLE_SAMPLE_AT_MS.load(Ordering::Acquire);
+    if idle_cache_is_fresh(now_ms, sampled_at_ms) {
+        return CACHED_IDLE_SECONDS.load(Ordering::Relaxed);
+    }
+
+    // 只有一个循环负责更新；竞争者直接读取上一份结果，不再并发启动外部命令。
+    if sampled_at_ms == 0
+        || LAST_IDLE_SAMPLE_AT_MS
+            .compare_exchange(sampled_at_ms, now_ms, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    {
+        let idle_seconds = query_idle_seconds();
+        CACHED_IDLE_SECONDS.store(idle_seconds, Ordering::Release);
+        return idle_seconds;
+    }
+
+    CACHED_IDLE_SECONDS.load(Ordering::Acquire)
 }
 
 #[cfg(test)]
@@ -250,6 +313,13 @@ mod tests {
     fn test_hash_similarity() {
         assert_eq!(hash_similarity(0x1234567890ABCDEF, 0x1234567890ABCDEF), 100);
         assert_eq!(hash_similarity(0x0000000000000000, 0xFFFFFFFFFFFFFFFF), 0);
+    }
+
+    #[test]
+    fn 空闲查询缓存只在半秒内复用() {
+        assert!(idle_cache_is_fresh(1_500, 1_200));
+        assert!(!idle_cache_is_fresh(1_700, 1_200));
+        assert!(!idle_cache_is_fresh(1_500, 0));
     }
 
     #[test]

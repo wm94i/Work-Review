@@ -276,6 +276,7 @@
   let domainUsageRequestId = 0;
   // #104: 按分类着色的柱状图（堆叠）
   let hourlyAppBreakdown: HourlyAppBucket[] = [];
+  let hourlyBreakdownError: string | null = null;
   let categoryList: CategoryInfo[] = [];
   let workGoalMinutes: number | null = null;
   // ── 2026-07 概览改版 ──
@@ -308,6 +309,7 @@
   async function loadHourlyBreakdown() {
     const range = getHourlyBreakdownRange();
     const requestId = ++hourlyBreakdownRequestId;
+    hourlyBreakdownError = null;
     try {
       const breakdown = await invoke<HourlyAppBucket[]>('get_hourly_app_breakdown', {
         mode: overviewMode,
@@ -318,9 +320,12 @@
       if (requestId === hourlyBreakdownRequestId) {
         hourlyAppBreakdown = breakdown;
       }
+      if (requestId === hourlyBreakdownRequestId) {
+        hourlyBreakdownError = null;
+      }
     } catch (e) {
       if (requestId === hourlyBreakdownRequestId) {
-        hourlyAppBreakdown = [];
+        hourlyBreakdownError = formatUserError(e, t('common.loadFailedRetry'));
       }
     }
   }
@@ -1709,6 +1714,14 @@
               {/if}
             </div>
           {/if}
+        </div>
+      {/if}
+      {#if hourlyBreakdownError}
+        <div class="mb-3 flex items-center justify-between gap-3 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700 dark:border-red-500/30 dark:bg-red-950/20 dark:text-red-300" role="alert">
+          <span>{hourlyBreakdownError}</span>
+          <button type="button" class="shrink-0 underline underline-offset-2" on:click={loadHourlyBreakdown}>
+            {t('common.retry')}
+          </button>
         </div>
       {/if}
       <ActivityHourlyChart

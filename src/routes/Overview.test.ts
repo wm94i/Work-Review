@@ -137,7 +137,9 @@ test('小时应用明细只应接受最后一次日期范围请求的结果', as
   assert.match(loadSource, /const requestId = \+\+hourlyBreakdownRequestId;/);
   assert.match(loadSource, /const breakdown = await invoke(?:<[^>]+>)?\('get_hourly_app_breakdown'/);
   assert.match(loadSource, /if \(requestId === hourlyBreakdownRequestId\) \{\s*hourlyAppBreakdown = breakdown;\s*\}/);
-  assert.match(loadSource, /catch \(e\) \{\s*if \(requestId === hourlyBreakdownRequestId\) \{\s*hourlyAppBreakdown = \[\];\s*\}\s*\}/);
+  assert.match(loadSource, /catch \(e\) \{\s*if \(requestId === hourlyBreakdownRequestId\) \{\s*hourlyBreakdownError = formatUserError/);
+  assert.doesNotMatch(loadSource, /hourlyAppBreakdown = \[\];/);
+  assert.match(source, /hourlyBreakdownError/);
 });
 
 test('网站语义分类应使用含色点、名称与当前项勾选的紧凑 Popover', async () => {

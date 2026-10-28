@@ -700,7 +700,7 @@
     <div>
       <h3 class="settings-card-title">
         {t('settingsAppearance.uiVisualStyle')}
-        <span class="ml-1.5 inline-flex items-center rounded-full border border-amber-200 bg-amber-50 px-1 py-px text-[10px] font-semibold uppercase tracking-[0.06em] text-amber-700 align-middle dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-200">Beta</span>
+        <span class="ml-1.5 inline-flex items-center rounded-full border border-amber-200 bg-amber-50 px-1 py-px text-[10px] font-semibold uppercase tracking-[0.06em] text-amber-700 align-middle dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-200">{t('settings.tabs.beta')}</span>
       </h3>
       <p class="settings-muted mt-1">{t('settingsAppearance.uiVisualStyleDesc')}</p>
     </div>

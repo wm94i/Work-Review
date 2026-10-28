@@ -56,7 +56,7 @@ flowchart TD
 | `src-tauri/src/wecom_bot.rs` | 企业微信自建应用 HTTP 回调（需公网） | 与长连接并存 |
 | `crates/` | Rust workspace 子模块 | 待补全 |
 | `scripts/` | 构建/发布脚本（TypeScript） | 待补全 |
-| `.github/workflows/` | CI（`ci.yml`）、发布（`release.yml`）、安全审计（`security-audit.yml` 锁文件变更触发 + 手动运行，已移除每周定时） | `rustsec/audit-check@v2` 仅在 schedule 触发时建 Issue；定时已关闭，审计结果只出现在 Check 报告，不再产生 Issue 通知 |
+| `.github/workflows/` | CI（`ci.yml`）、发布（`release.yml`）、安全审计（`security-audit.yml` 每个 PR/main push + 手动运行，无定时扫描） | `rustsec/audit-check@v2` 在安全审计 job 中可创建或更新跟踪 Issue；普通 PR 也会执行依赖审计 |
 
 ## 6. API 手册
 
@@ -89,7 +89,7 @@ flowchart LR
 
 ## 10. 维护建议
 
-- **安全审计**：锁文件（Cargo.lock / package-lock.json）变更时自动 `cargo audit` + `npm audit`，也可在 Actions 页手动运行；新增 unmaintained 噪音时优先评估是否入 `ignore`，unsound/漏洞必须跟踪。
+- **安全审计**：每个 PR 和 main push 自动运行 `cargo audit` + `npm audit`，也可在 Actions 页手动运行；新增 unmaintained 噪音时优先评估是否入 `ignore`，unsound/漏洞必须跟踪。
 - **发布**：`release.yml` 要求 tag 与五个版本源及 `origin/main` 一致；缺安装包/便携包/附件即失败。
 - 详细运维/监控建议待补全。
 
@@ -102,4 +102,4 @@ flowchart LR
 
 ## 12. 变更日志
 
-- 参见 [CHANGELOG.md](./CHANGELOG.md)（本节与该文件双向关联；条目按 Keep a Changelog 维护）。当前发布版本：[1.1.2](./CHANGELOG.md#112---2026-08-22)。未发布条目见 [Unreleased](./CHANGELOG.md#unreleased)（时间线详情改为截图 + 图注 + 分类标签）。
+- 参见 [CHANGELOG.md](./CHANGELOG.md)（本节与该文件双向关联；条目按 Keep a Changelog 维护）。当前发布版本：[1.1.3](./CHANGELOG.md#113---2026-10-20)。未发布条目见 [Unreleased](./CHANGELOG.md#unreleased)（时间线详情改为截图 + 图注 + 分类标签）。

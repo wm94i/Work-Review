@@ -509,7 +509,7 @@
                 <span>{t(tab.labelKey)}</span>
                 {#if tab.beta}
                   <span class="inline-flex items-center rounded-full border border-amber-200 bg-amber-50 px-1 py-px text-[10px] font-semibold uppercase tracking-[0.06em] text-amber-700 dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-200">
-                    Beta
+                    {t('settings.tabs.beta')}
                   </span>
                 {/if}
               </span>

@@ -19,6 +19,8 @@ test('侧边栏应提供编辑部导航框架', async () => {
   assert.match(source, /sidebar-locale-switch/);
   assert.match(source, /sidebar-locale-compact-icon/);
   assert.match(source, /aria-label=\{isPaused \? translate\('sidebar\.resume'\) : translate\('sidebar\.pause'\)\}/);
+  assert.match(source, /aria-label=\{translate\(item\.labelKey\)\}/);
+  assert.match(source, /aria-current=\{activeStates\[item\.path\] \? 'page' : undefined\}/);
   assert.match(source, /sidebar-toolbelt/);
   assert.doesNotMatch(source, /sidebar-brand-chip/);
   assert.doesNotMatch(source, /sidebar-nav-index/);

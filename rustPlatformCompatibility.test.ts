@@ -77,7 +77,7 @@ test('Windows 发布构建应保留明确类型并隔离 Unix 测试依赖', () 
   );
   assert.match(
     screenshot,
-    /#\[cfg\(any\(target_os = "macos", target_os = "linux"\)\)\]\nuse std::process::Command;/,
+    /#\[cfg\(any\(target_os = "macos", target_os = "linux"\)\)\]\nuse std::process::\{Command, Output, Stdio\};/,
   );
   assert.match(
     system,

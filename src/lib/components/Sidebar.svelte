@@ -189,6 +189,8 @@
         {#each navItems as item}
           <li>
             <a href={item.path} use:link
+              aria-label={translate(item.labelKey)}
+              aria-current={activeStates[item.path] ? 'page' : undefined}
               class="group sidebar-nav-item
                 {activeStates[item.path]
                   ? 'sidebar-nav-item-active'

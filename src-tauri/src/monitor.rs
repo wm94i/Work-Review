@@ -4317,13 +4317,20 @@ fn parse_wm_class(xprop_output: &str) -> Option<String> {
     }
 }
 
+#[cfg(target_os = "linux")]
+pub fn get_active_window_fast() -> Result<ActiveWindow> {
+    // Linux 没有单独的原生 fast provider；复用完整 provider，并由桌宠低频采样、
+    // 录制循环复用 state.cached_active_window，避免重复启动窗口查询命令。
+    get_active_window()
+}
+
 /// 其他平台的后备实现
 #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
 pub fn get_active_window() -> Result<ActiveWindow> {
     get_active_window_fast()
 }
 
-#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+#[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
 pub fn get_active_window_fast() -> Result<ActiveWindow> {
     Ok(ActiveWindow {
         app_name: "Unknown".to_string(),

@@ -9,7 +9,7 @@ test('设置页应提供节点 Beta 标签并在设置工作台内渲染节点�
   assert.match(source, /id:\s*'node'/);
   assert.match(source, /labelKey:\s*'settings\.tabs\.node'/);
   assert.match(source, /beta:\s*true/);
-  assert.match(source, /\bBeta\b/);
+  assert.match(source, /t\('settings\.tabs\.beta'\)/);
   assert.match(source, /activeTab === 'node'/);
   assert.match(source, /<SettingsNodeGateway bind:config/);
 

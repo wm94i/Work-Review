@@ -1,20 +1,11 @@
 name: Security Audit
 
-# 依赖漏洞扫描：锁文件变更时触发，也可在 Actions 页手动运行（不再定时扫描）。
+# 依赖漏洞扫描：每个 PR 和 main push 都运行，也可在 Actions 页手动运行。
+# 依赖公告可能在锁文件不变时发布，因此不能只按 manifest/lockfile 路径触发。
 on:
   push:
     branches: [main, master]
-    paths:
-      - '**/Cargo.toml'
-      - '**/Cargo.lock'
-      - 'package.json'
-      - 'package-lock.json'
   pull_request:
-    paths:
-      - '**/Cargo.toml'
-      - '**/Cargo.lock'
-      - 'package.json'
-      - 'package-lock.json'
   workflow_dispatch:
 
 permissions:

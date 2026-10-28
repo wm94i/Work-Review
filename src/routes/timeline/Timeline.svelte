@@ -797,6 +797,7 @@
 
   let loadTimelineRequestId = 0;
   let loadMoreRequestId = 0;
+  let loadMoreError: string | null = null;
 
   // 加载时间线数据（重置）
   async function loadTimeline() {
@@ -807,6 +808,7 @@
     const requestDate = selectedDate;
     loadMoreRequestId += 1;
     loadingMore = false;
+    loadMoreError = null;
 
     // 2. 缓存未命中，请求后端
     loading = true;
@@ -875,6 +877,7 @@
     const requestDate = selectedDate;
     const requestOffset = offset;
     loadingMore = true;
+    loadMoreError = null;
 
     try {
       const moreActivities = await timelineGateway.getPage({
@@ -909,8 +912,10 @@
       if (moreActivities.length < PAGE_SIZE) {
         hasMore = false;
       }
+      loadMoreError = null;
     } catch (e) {
       if (requestId !== loadMoreRequestId || requestDate !== selectedDate) return;
+      loadMoreError = formatUserError(e, t('common.loadFailedRetry'));
       console.error('加载更多失败:', e);
     } finally {
       if (requestId === loadMoreRequestId && requestDate === selectedDate) {
@@ -1615,6 +1620,14 @@
       <!-- 加载更多按钮 -->
       {#if hasMore}
         <div class="timeline-load-more">
+          {#if loadMoreError}
+            <div class="mb-2 flex items-center justify-center gap-2 text-xs text-red-600 dark:text-red-300" role="alert">
+              <span>{loadMoreError}</span>
+              <button type="button" class="underline underline-offset-2" on:click={loadMore}>
+                {t('common.retry')}
+              </button>
+            </div>
+          {/if}
           <button
             on:click={loadMore}
             disabled={loadingMore}

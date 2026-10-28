@@ -37,7 +37,9 @@ jobs:
           fi
 
           VERSION="$(node -p "require('./package.json').version")"
-          if [[ "$GITHUB_REF_NAME" != "v${VERSION}" ]]; then
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          STABLE_VERSION="${TAG_VERSION%-rc.*}"
+          if [[ "$STABLE_VERSION" != "$VERSION" ]]; then
             echo "Tag ${GITHUB_REF_NAME} 与应用版本 v${VERSION} 不一致" >&2
             exit 1
           fi
