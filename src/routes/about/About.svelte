@@ -20,6 +20,7 @@
   let isCheckingUpdate = false;
   let autoCheckUpdate = true;
   let isSponsorshipOpen = false;
+  let isUpdateDetailsOpen = false;
   let zoomedQr: string | null = null;
   let updateStatus = '';
   let updateStatusTimer: ReturnType<typeof setTimeout> | null = null;
@@ -101,8 +102,11 @@
   });
 
   function handleWindowKeydown(event: KeyboardEvent): void {
-    if (event.key === 'Escape' && isSponsorshipOpen) {
+    if (event.key !== 'Escape') return;
+    if (isSponsorshipOpen) {
       closeSponsorshipModal();
+    } else if (isUpdateDetailsOpen) {
+      isUpdateDetailsOpen = false;
     }
   }
 </script>
@@ -163,29 +167,76 @@
         </button>
       </div>
 
-      <div class="about-update-grid mt-7 grid grid-cols-1 pt-5 sm:grid-cols-3">
-        <div class="about-update-unit flex min-h-20 flex-col items-center justify-center gap-2 px-4 py-3">
-          <span class="text-xs font-medium text-slate-400 dark:text-[#7d8590]">{t('about.currentVersionTag')}</span>
-          <strong class="text-sm font-semibold text-slate-700 dark:text-[#c9d1d9]">v{appVersion}</strong>
+      <div class="about-update-panel mt-7">
+        <div class="about-update-heading">
+          <div class="about-update-heading-main">
+            <div class="about-update-icon" aria-hidden="true">
+              <svg fill="none" viewBox="0 0 24 24">
+                <path stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.7" d="M4 7.5A2.5 2.5 0 0 1 6.5 5h11A2.5 2.5 0 0 1 20 7.5v9a2.5 2.5 0 0 1-2.5 2.5h-11A2.5 2.5 0 0 1 4 16.5v-9Z" />
+                <path stroke="currentColor" stroke-linecap="round" stroke-width="1.7" d="M8 9.5h8M8 13h5" />
+              </svg>
+            </div>
+            <div class="min-w-0 text-left">
+              <div class="about-update-title">{t('about.updateSectionTitle')}</div>
+              <p class="about-update-description">{t('about.updateSectionDescription')}</p>
+            </div>
+          </div>
+          <div class="about-update-heading-actions">
+            <span class="about-channel-badge">
+              <span class="about-channel-dot" aria-hidden="true"></span>
+              {t('about.stableChannel')}
+            </span>
+            <button
+              type="button"
+              class="about-update-info"
+              aria-label={t('about.updateDetailsButton')}
+              aria-expanded={isUpdateDetailsOpen}
+              aria-controls="about-update-details"
+              on:click={() => isUpdateDetailsOpen = !isUpdateDetailsOpen}
+            >
+              <svg fill="none" viewBox="0 0 24 24" aria-hidden="true">
+                <circle cx="12" cy="12" r="8.5" stroke="currentColor" stroke-width="1.7" />
+                <path stroke="currentColor" stroke-linecap="round" stroke-width="1.7" d="M12 10.5v5" />
+                <circle cx="12" cy="7.5" r=".8" fill="currentColor" stroke="none" />
+              </svg>
+            </button>
+          </div>
         </div>
 
-        <div class="about-update-unit flex min-h-20 flex-col items-center justify-center gap-2 px-4 py-3">
-          <span class="text-xs font-medium text-slate-400 dark:text-[#7d8590]">{t('about.autoCheckUpdate')}</span>
-          <button
-            type="button"
-            role="switch"
-            aria-checked={autoCheckUpdate}
-            aria-label={t('about.autoCheckUpdate')}
-            title={t('about.autoCheckUpdate')}
-            on:click={toggleAutoCheck}
-            class="relative inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors duration-200 {autoCheckUpdate ? 'bg-blue-500' : 'bg-slate-300 dark:bg-[#484f58]'}"
-          >
-            <span class="pointer-events-none inline-block h-4 w-4 rounded-full bg-white shadow-sm transition-transform duration-200 dark:shadow-none {autoCheckUpdate ? 'translate-x-[18px]' : 'translate-x-[2px]'}"></span>
-          </button>
-        </div>
+        {#if isUpdateDetailsOpen}
+          <div id="about-update-details" class="about-update-details" role="region" aria-label={t('about.updateDetailsButton')}>
+            <p>{t('about.updateDetails')}</p>
+          </div>
+        {/if}
 
-        <div class="about-update-unit flex min-h-20 flex-col items-center justify-center gap-2 px-4 py-3">
-          <span class="text-xs font-medium text-slate-400 dark:text-[#7d8590]">{t('about.updateStatus')}</span>
+        <div class="about-update-grid">
+          <div class="about-update-unit about-update-version-unit">
+            <span class="about-update-label">{t('about.currentVersionTag')}</span>
+            <strong class="about-update-value">v{appVersion}</strong>
+          </div>
+
+          <div class="about-update-unit about-update-option-unit">
+            <div class="min-w-0 text-left">
+              <span class="about-update-label">{t('about.autoCheckUpdate')}</span>
+              <p class="about-update-hint">{t('about.autoCheckUpdateHint')}</p>
+            </div>
+            <div class="about-update-option-control">
+              <button
+                type="button"
+                role="switch"
+                aria-checked={autoCheckUpdate}
+                aria-label={t('about.autoCheckUpdate')}
+                on:click={toggleAutoCheck}
+                class="about-switch {autoCheckUpdate ? 'about-switch-on' : ''}"
+              >
+                <span class="about-switch-thumb"></span>
+              </button>
+              <span class="about-switch-status">{autoCheckUpdate ? t('settings.summary.stateEnabled') : t('settings.summary.stateDisabled')}</span>
+            </div>
+          </div>
+
+          <div class="about-update-unit about-update-action-unit">
+            <span class="about-update-label">{t('about.updateStatus')}</span>
           <button
             type="button"
             on:click={checkForUpdates}
@@ -203,11 +254,12 @@
         </div>
       </div>
 
-      {#if updateStatus}
-        <div class="about-update-feedback mt-4 text-center" role="status" aria-live="polite">
-          <p class="text-sm text-slate-500 dark:text-[#7d8590]">{updateStatus}</p>
-        </div>
-      {/if}
+        {#if updateStatus}
+          <div class="about-update-feedback" role="status" aria-live="polite">
+            <p>{updateStatus}</p>
+          </div>
+        {/if}
+      </div>
     </section>
 
     <section class="page-card about-principles-card">

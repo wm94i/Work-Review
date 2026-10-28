@@ -21,7 +21,9 @@ test('关于页赞助弹层应保留完整交互，检查更新应位于三个�
   assert.match(source, /about\.supportCopy2/);
   assert.doesNotMatch(source, /推荐微信扫码支持/);
   assert.doesNotMatch(source, /也可以使用支付宝扫码/);
-  assert.match(source, /if \(event\.key === 'Escape' && isSponsorshipOpen\)/);
+  assert.match(source, /if \(event\.key !== 'Escape'\) return;/);
+  assert.match(source, /if \(isSponsorshipOpen\)/);
+  assert.match(source, /isUpdateDetailsOpen = false/);
   assert.match(source, /on:click=\{\(\) => zoomedQr = wechatSponsorshipQr\}/);
   assert.match(source, /on:click=\{\(\) => zoomedQr = alipaySponsorshipQr\}/);
   assert.match(source, /role="switch"/);

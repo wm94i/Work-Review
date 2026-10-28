@@ -31,6 +31,10 @@ test('品牌卡底部应按当前版本、自动检查更新和更新状态分�
   const brandEnd = source.indexOf('</section>', brandStart);
   const brandCard = source.slice(brandStart, brandEnd);
 
+  assert.match(brandCard, /about-update-panel/);
+  assert.match(brandCard, /about-update-info/);
+  assert.match(brandCard, /about-update-details/);
+  assert.match(brandCard, /aria-controls="about-update-details"/);
   assert.match(brandCard, /about-update-grid/);
   assert.equal(
     (brandCard.match(/class="about-update-unit(?:\s|\")/g) || []).length,

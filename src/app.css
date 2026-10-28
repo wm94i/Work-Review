@@ -4235,16 +4235,234 @@
   color: #334155;
 }
 
+.about-update-panel {
+  width: 100%;
+  padding: 1rem 1.1rem 0.9rem;
+  border: 1px solid var(--surface-border-subtle);
+  border-radius: var(--radius-lg);
+  background: color-mix(in srgb, var(--editorial-surface-subtle) 72%, transparent);
+}
+
+.about-update-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.about-update-heading-main,
+.about-update-heading-actions,
+.about-update-option-control {
+  display: flex;
+  align-items: center;
+}
+
+.about-update-heading-main {
+  min-width: 0;
+  gap: 0.7rem;
+}
+
+.about-update-heading-actions {
+  flex-shrink: 0;
+  gap: 0.5rem;
+}
+
+.about-update-icon {
+  display: inline-flex;
+  width: 2.1rem;
+  height: 2.1rem;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid rgba(99, 102, 241, 0.18);
+  border-radius: var(--radius-md);
+  background: rgba(99, 102, 241, 0.08);
+  color: #6366f1;
+}
+
+.about-update-icon svg {
+  width: 1.05rem;
+  height: 1.05rem;
+}
+
+.about-update-title {
+  color: #1e293b;
+  font-size: 0.9375rem;
+  font-weight: 680;
+  line-height: 1.35;
+}
+
+.about-update-description,
+.about-update-hint {
+  margin: 0.2rem 0 0;
+  color: #64748b;
+  font-size: 0.75rem;
+  line-height: 1.55;
+}
+
+.about-channel-badge {
+  display: inline-flex;
+  min-height: 1.65rem;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0.2rem 0.55rem;
+  border: 1px solid rgba(34, 197, 94, 0.2);
+  border-radius: var(--radius-full);
+  background: rgba(34, 197, 94, 0.08);
+  color: #15803d;
+  font-size: 0.6875rem;
+  font-weight: 650;
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.about-channel-dot {
+  width: 0.35rem;
+  height: 0.35rem;
+  border-radius: var(--radius-full);
+  background: #22c55e;
+}
+
+.about-update-info {
+  display: inline-flex;
+  width: 1.8rem;
+  height: 1.8rem;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--surface-border-subtle);
+  border-radius: var(--radius-full);
+  color: #94a3b8;
+  transition: border-color 160ms ease, background-color 160ms ease, color 160ms ease;
+}
+
+.about-update-info:hover,
+.about-update-info[aria-expanded="true"] {
+  border-color: rgba(99, 102, 241, 0.35);
+  background: rgba(99, 102, 241, 0.08);
+  color: #6366f1;
+}
+
+.about-update-info:focus-visible,
+.about-switch:focus-visible {
+  outline: 2px solid rgba(99, 102, 241, 0.45);
+  outline-offset: 2px;
+}
+
+.about-update-info svg {
+  width: 1rem;
+  height: 1rem;
+}
+
+.about-update-details {
+  margin-top: 0.8rem;
+  padding: 0.65rem 0.75rem;
+  border: 1px solid var(--surface-border-subtle);
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, var(--editorial-surface-featured) 72%, transparent);
+  color: #64748b;
+  font-size: 0.75rem;
+  line-height: 1.65;
+}
+
+.about-update-details p {
+  margin: 0;
+}
+
 .about-update-grid {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 0.75rem;
+  grid-template-columns: minmax(7rem, 0.72fr) minmax(0, 1.65fr) auto;
+  gap: 0.85rem;
   width: 100%;
+  margin-top: 0.95rem;
+  padding-top: 0.95rem;
+  border-top: 1px solid var(--surface-border-subtle);
 }
 
 .about-update-unit {
+  display: flex;
   min-width: 0;
+  flex-direction: column;
+  justify-content: center;
+  gap: 0.35rem;
+  text-align: left;
+}
+
+.about-update-label {
+  color: #94a3b8;
+  font-size: 0.6875rem;
+  font-weight: 650;
+  line-height: 1.35;
+}
+
+.about-update-value {
+  color: #334155;
+  font-size: 1.05rem;
+  font-weight: 700;
+  line-height: 1.2;
+}
+
+.about-update-option-unit {
+  justify-content: space-between;
+  gap: 0.8rem;
+}
+
+.about-update-option-control {
+  flex-shrink: 0;
+  gap: 0.5rem;
+}
+
+.about-switch {
+  display: inline-flex;
+  width: 2.25rem;
+  height: 1.3rem;
+  flex: 0 0 auto;
+  align-items: center;
+  padding: 0.15rem;
+  border: 0;
+  border-radius: var(--radius-full);
+  background: #cbd5e1;
+  transition: background-color 160ms ease;
+}
+
+.about-switch-on {
+  background: #6366f1;
+}
+
+.about-switch-thumb {
+  width: 1rem;
+  height: 1rem;
+  border-radius: var(--radius-full);
+  background: #ffffff;
+  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.2);
+  transform: translateX(0);
+  transition: transform 160ms ease;
+}
+
+.about-switch-on .about-switch-thumb {
+  transform: translateX(0.95rem);
+}
+
+.about-switch-status {
+  color: #64748b;
+  font-size: 0.6875rem;
+  white-space: nowrap;
+}
+
+.about-update-action-unit {
+  align-items: flex-end;
+}
+
+.about-update-feedback {
+  margin-top: 0.8rem;
+  padding-top: 0.7rem;
+  border-top: 1px solid var(--surface-border-subtle);
+  color: #64748b;
+  font-size: 0.75rem;
   text-align: center;
+}
+
+.about-update-feedback p {
+  margin: 0;
 }
 
 .about-principles-card {
@@ -4353,6 +4571,65 @@
 .dark .about-brand-description,
 .dark .about-tech-item {
   color: #8b949e;
+}
+
+.dark .about-update-panel {
+  border-color: var(--surface-border-default);
+  background: rgba(22, 27, 34, 0.46);
+}
+
+.dark .about-update-icon {
+  border-color: rgba(129, 140, 248, 0.24);
+  background: rgba(99, 102, 241, 0.16);
+  color: #a5b4fc;
+}
+
+.dark .about-update-title,
+.dark .about-update-value {
+  color: #e6edf3;
+}
+
+.dark .about-update-description,
+.dark .about-update-hint,
+.dark .about-update-details,
+.dark .about-update-feedback,
+.dark .about-switch-status {
+  color: #8b949e;
+}
+
+.dark .about-channel-badge {
+  border-color: rgba(74, 222, 128, 0.24);
+  background: rgba(34, 197, 94, 0.12);
+  color: #86efac;
+}
+
+.dark .about-update-info {
+  border-color: var(--surface-border-default);
+  color: #7d8590;
+}
+
+.dark .about-update-info:hover,
+.dark .about-update-info[aria-expanded="true"] {
+  border-color: rgba(129, 140, 248, 0.45);
+  background: rgba(99, 102, 241, 0.16);
+  color: #a5b4fc;
+}
+
+.dark .about-update-details {
+  border-color: var(--surface-border-default);
+  background: rgba(13, 17, 23, 0.38);
+}
+
+.dark .about-switch {
+  background: #484f58;
+}
+
+.dark .about-switch-on {
+  background: #818cf8;
+}
+
+.dark .about-update-feedback {
+  border-color: var(--surface-border-default);
 }
 
 .dark .about-support-link {
@@ -4866,9 +5143,24 @@
     grid-template-columns: 1fr;
   }
 
+  .about-update-heading {
+    flex-direction: column;
+    gap: 0.75rem;
+  }
+
+  .about-update-heading-actions {
+    width: 100%;
+    justify-content: space-between;
+  }
+
   .about-update-unit {
     min-height: 4.2rem;
     padding: 0.75rem 0;
+  }
+
+  .about-update-option-unit,
+  .about-update-action-unit {
+    align-items: flex-start;
   }
 
   .about-tech-stack {
