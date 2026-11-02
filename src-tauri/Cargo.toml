@@ -75,7 +75,7 @@ futures-util = { version = "0.3", default-features = false, features = ["sink"] 
 # 平台特定依赖 - Windows
 [target.'cfg(windows)'.dependencies]
 windows-capture = "1.5"
-winapi = { version = "0.3", features = ["winuser", "processthreadsapi", "tlhelp32", "psapi", "handleapi", "winnt", "winbase", "sysinfoapi", "wingdi", "libloaderapi", "shellapi", "commctrl", "commoncontrols"] }
+winapi = { version = "0.3", features = ["winuser", "processthreadsapi", "tlhelp32", "psapi", "handleapi", "winnt", "winbase", "sysinfoapi", "wingdi", "libloaderapi", "shellapi", "commctrl", "commoncontrols", "powerbase", "powersetting"] }
 uiautomation = "0.24"
 
 # 平台特定依赖 - macOS

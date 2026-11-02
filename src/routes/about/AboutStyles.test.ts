@@ -28,26 +28,24 @@ test('关于页主体应在窗口拉高时自适应垂直居中而非堆积底�
   );
 });
 
-test('关于页新结构应保持居中、三列更新与留白分组', async () => {
+test('关于页更新行应紧凑居中、允许窄窗换行且保留键盘焦点', async () => {
   const css = await readFile(cssUrl, 'utf8');
-  const source = await readFile(new URL('./About.svelte', import.meta.url), 'utf8');
 
   assert.match(css, /\.about-brand-identity\s*\{[\s\S]*?align-items:\s*center;/);
   assert.match(css, /\.about-brand-title-row\s*\{[\s\S]*?justify-content:\s*center;/);
   assert.match(css, /^\.about-version-badge\s*\{[\s\S]*?border-radius:\s*var\(--radius-full\);/m);
-  assert.match(css, /\.about-update-panel\s*\{[\s\S]*?border-radius:\s*var\(--radius-lg\);/);
-  assert.match(css, /\.about-update-grid\s*\{[\s\S]*?grid-template-columns:\s*minmax\(7rem,\s*0\.72fr\)\s+minmax\(0,\s*1\.65fr\)\s+auto;/);
-  assert.match(css, /\.about-update-info\s*\{[\s\S]*?border-radius:\s*var\(--radius-full\);/);
+  assert.match(css, /\.about-update-controls\s*\{[^}]*display:\s*flex;[^}]*flex-wrap:\s*wrap;[^}]*justify-content:\s*center;/);
+  assert.match(css, /\.about-auto-check input:focus-visible\s*\{[^}]*outline:/);
+  assert.match(css, /\.dark \.about-auto-check,\s*\.dark \.about-update-feedback\s*\{[^}]*color:/);
+  assert.match(css, /\.about-update-feedback\s*\{[^}]*overflow-wrap:\s*anywhere;/);
   assert.match(css, /\.about-trust-grid\s*\{[\s\S]*?gap:\s*1rem;/);
-  assert.doesNotMatch(css, /\.about-update-unit\s*\+\s*\.about-update-unit\s*\{/);
   assert.doesNotMatch(css, /\.about-trust-card\s*\+\s*\.about-trust-card\s*\{/);
   assert.match(css, /\.about-principles-card\b/);
   assert.match(css, /\.about-tech-item\b/);
-  assert.match(css, /@media \(max-width:\s*640px\)[\s\S]*?\.about-update-grid\s*\{[\s\S]*?grid-template-columns:\s*1fr;/);
   assert.match(css, /@media \(max-width:\s*640px\)[\s\S]*?\.about-tech-stack\s*\{[\s\S]*?justify-content:\s*center;/);
-  assert.match(source, /about-update-panel/);
-  assert.match(source, /about-update-details/);
-  assert.match(source, /aria-expanded=\{isUpdateDetailsOpen\}/);
+  for (const selector of ['about-update-panel', 'about-update-grid', 'about-update-unit', 'about-update-heading', 'about-update-info', 'about-update-details', 'about-channel-badge', 'about-switch']) {
+    assert.doesNotMatch(css, new RegExp(`\\.${selector}\\b`), `应删除已废弃样式 ${selector}`);
+  }
 });
 
 test('关于页新卡片的深色边界应保持低对比', async () => {

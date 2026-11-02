@@ -20,7 +20,6 @@
   let isCheckingUpdate = false;
   let autoCheckUpdate = true;
   let isSponsorshipOpen = false;
-  let isUpdateDetailsOpen = false;
   let zoomedQr: string | null = null;
   let updateStatus = '';
   let updateStatusTimer: ReturnType<typeof setTimeout> | null = null;
@@ -105,8 +104,6 @@
     if (event.key !== 'Escape') return;
     if (isSponsorshipOpen) {
       closeSponsorshipModal();
-    } else if (isUpdateDetailsOpen) {
-      isUpdateDetailsOpen = false;
     }
   }
 </script>
@@ -167,99 +164,30 @@
         </button>
       </div>
 
-      <div class="about-update-panel mt-7">
-        <div class="about-update-heading">
-          <div class="about-update-heading-main">
-            <div class="about-update-icon" aria-hidden="true">
-              <svg fill="none" viewBox="0 0 24 24">
-                <path stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.7" d="M4 7.5A2.5 2.5 0 0 1 6.5 5h11A2.5 2.5 0 0 1 20 7.5v9a2.5 2.5 0 0 1-2.5 2.5h-11A2.5 2.5 0 0 1 4 16.5v-9Z" />
-                <path stroke="currentColor" stroke-linecap="round" stroke-width="1.7" d="M8 9.5h8M8 13h5" />
-              </svg>
-            </div>
-            <div class="min-w-0 text-left">
-              <div class="about-update-title">{t('about.updateSectionTitle')}</div>
-              <p class="about-update-description">{t('about.updateSectionDescription')}</p>
-            </div>
-          </div>
-          <div class="about-update-heading-actions">
-            <span class="about-channel-badge">
-              <span class="about-channel-dot" aria-hidden="true"></span>
-              {t('about.stableChannel')}
-            </span>
-            <button
-              type="button"
-              class="about-update-info"
-              aria-label={t('about.updateDetailsButton')}
-              aria-expanded={isUpdateDetailsOpen}
-              aria-controls="about-update-details"
-              on:click={() => isUpdateDetailsOpen = !isUpdateDetailsOpen}
-            >
-              <svg fill="none" viewBox="0 0 24 24" aria-hidden="true">
-                <circle cx="12" cy="12" r="8.5" stroke="currentColor" stroke-width="1.7" />
-                <path stroke="currentColor" stroke-linecap="round" stroke-width="1.7" d="M12 10.5v5" />
-                <circle cx="12" cy="7.5" r=".8" fill="currentColor" stroke="none" />
-              </svg>
-            </button>
-          </div>
-        </div>
-
-        {#if isUpdateDetailsOpen}
-          <div id="about-update-details" class="about-update-details" role="region" aria-label={t('about.updateDetailsButton')}>
-            <p>{t('about.updateDetails')}</p>
-          </div>
-        {/if}
-
-        <div class="about-update-grid">
-          <div class="about-update-unit about-update-version-unit">
-            <span class="about-update-label">{t('about.currentVersionTag')}</span>
-            <strong class="about-update-value">v{appVersion}</strong>
-          </div>
-
-          <div class="about-update-unit about-update-option-unit">
-            <div class="min-w-0 text-left">
-              <span class="about-update-label">{t('about.autoCheckUpdate')}</span>
-              <p class="about-update-hint">{t('about.autoCheckUpdateHint')}</p>
-            </div>
-            <div class="about-update-option-control">
-              <button
-                type="button"
-                role="switch"
-                aria-checked={autoCheckUpdate}
-                aria-label={t('about.autoCheckUpdate')}
-                on:click={toggleAutoCheck}
-                class="about-switch {autoCheckUpdate ? 'about-switch-on' : ''}"
-              >
-                <span class="about-switch-thumb"></span>
-              </button>
-              <span class="about-switch-status">{autoCheckUpdate ? t('settings.summary.stateEnabled') : t('settings.summary.stateDisabled')}</span>
-            </div>
-          </div>
-
-          <div class="about-update-unit about-update-action-unit">
-            <span class="about-update-label">{t('about.updateStatus')}</span>
-          <button
-            type="button"
-            on:click={checkForUpdates}
-            disabled={isCheckingUpdate}
-            class="page-control-btn min-h-9 px-3 disabled:opacity-50"
-          >
-            {#if isCheckingUpdate}
-              <svg class="h-3.5 w-3.5 shrink-0 animate-spin" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>
-              <span class="leading-none">{t('about.checkingUpdates')}</span>
-            {:else}
-              <svg class="h-3.5 w-3.5 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" /></svg>
-              <span class="leading-none">{t('about.checkUpdates')}</span>
-            {/if}
-          </button>
-        </div>
+      <div class="about-update-controls">
+        <label class="about-auto-check">
+          <input type="checkbox" checked={autoCheckUpdate} on:change={toggleAutoCheck} />
+          <span>{t('about.autoCheckUpdate')}</span>
+        </label>
+        <button
+          type="button"
+          on:click={checkForUpdates}
+          disabled={isCheckingUpdate}
+          aria-busy={isCheckingUpdate}
+          class="page-control-btn min-h-9 px-3 disabled:opacity-50"
+        >
+          {#if isCheckingUpdate}
+            <svg class="h-3.5 w-3.5 shrink-0 animate-spin" fill="none" viewBox="0 0 24 24" aria-hidden="true"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>
+            <span class="leading-none">{t('about.checkingUpdates')}</span>
+          {:else}
+            <svg class="h-3.5 w-3.5 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" /></svg>
+            <span class="leading-none">{t('about.checkUpdates')}</span>
+          {/if}
+        </button>
       </div>
-
-        {#if updateStatus}
-          <div class="about-update-feedback" role="status" aria-live="polite">
-            <p>{updateStatus}</p>
-          </div>
-        {/if}
-      </div>
+      {#if updateStatus}
+        <p class="about-update-feedback" role="status" aria-live="polite">{updateStatus}</p>
+      {/if}
     </section>
 
     <section class="page-card about-principles-card">

@@ -14,7 +14,7 @@ test('关于页应提供赞助支持按钮并展示微信与支付宝收款码',
   assert.match(source, /docs\/sponsorship\/zfb\.png/);
 });
 
-test('关于页赞助弹层应保留完整交互，检查更新应位于三个轻量操作之后', async () => {
+test('关于页赞助弹层应保留完整交互，紧凑更新行应位于三个轻量操作之后', async () => {
   const source = await readFile(new URL('./About.svelte', import.meta.url), 'utf8');
 
   assert.match(source, /about\.supportCopy/);
@@ -23,15 +23,15 @@ test('关于页赞助弹层应保留完整交互，检查更新应位于三个�
   assert.doesNotMatch(source, /也可以使用支付宝扫码/);
   assert.match(source, /if \(event\.key !== 'Escape'\) return;/);
   assert.match(source, /if \(isSponsorshipOpen\)/);
-  assert.match(source, /isUpdateDetailsOpen = false/);
+  assert.doesNotMatch(source, /isUpdateDetailsOpen/);
   assert.match(source, /on:click=\{\(\) => zoomedQr = wechatSponsorshipQr\}/);
   assert.match(source, /on:click=\{\(\) => zoomedQr = alipaySponsorshipQr\}/);
-  assert.match(source, /role="switch"/);
-  assert.match(source, /aria-checked=\{autoCheckUpdate\}/);
+  assert.match(source, /<label class="about-auto-check">[\s\S]*type="checkbox"[\s\S]*t\('about\.autoCheckUpdate'\)/);
+  assert.match(source, /checked=\{autoCheckUpdate\} on:change=\{toggleAutoCheck\}/);
   assert.ok(
     source.indexOf("t('about.sponsorship')")
       < source.indexOf("t('about.checkUpdates')"),
-    'GitHub、数据目录和赞助支持应先展示，检查更新应位于下方状态区'
+    'GitHub、数据目录和赞助支持应先展示，检查更新只保留在下方紧凑行'
   );
 });
 
