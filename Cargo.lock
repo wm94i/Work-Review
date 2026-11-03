@@ -7666,7 +7666,7 @@ dependencies = [
 
 [[package]]
 name = "work-review"
-version = "1.1.3"
+version = "1.1.4-rc.1"
 dependencies = [
  "aes",
  "anyhow",
@@ -7692,6 +7692,7 @@ dependencies = [
  "reqwest 0.11.27",
  "rusqlite",
  "screenshots",
+ "semver",
  "serde",
  "serde_json",
  "sha1",

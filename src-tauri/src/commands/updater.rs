@@ -2,7 +2,9 @@
 
 use crate::AppState;
 use reqwest::Url;
+use semver::Version;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -15,6 +17,8 @@ const GITHUB_LATEST_RELEASE_API: &str =
     "https://api.github.com/repos/wm94i/Work-Review/releases/latest";
 
 const GITHUB_LATEST_RELEASE_PAGE: &str = "https://github.com/wm94i/Work-Review/releases/latest";
+const GITHUB_RELEASES_API: &str =
+    "https://api.github.com/repos/wm94i/Work-Review/releases?per_page=100";
 
 const UPDATE_STATUS_EVENT: &str = "update-status";
 
@@ -37,6 +41,7 @@ pub struct GithubUpdateInfo {
     pub latest_version: String,
     pub available: bool,
     pub auto_update_ready: bool,
+    pub prerelease: bool,
     pub release_url: String,
     pub body: Option<String>,
     pub source: Option<String>,
@@ -69,6 +74,8 @@ struct GithubUpdateStatusPayload {
 #[serde(rename_all = "camelCase")]
 pub struct UpdateSettings {
     pub auto_check: bool,
+    #[serde(default)]
+    pub include_prerelease: bool,
     pub last_check_time: u64,
     #[serde(default = "default_update_check_interval")]
     pub check_interval_hours: u64,
@@ -79,6 +86,18 @@ struct GithubReleaseResponse {
     tag_name: String,
     html_url: String,
     body: Option<String>,
+    #[serde(default)]
+    draft: bool,
+    #[serde(default)]
+    prerelease: bool,
+    #[serde(default)]
+    assets: Vec<GithubReleaseAsset>,
+}
+
+#[derive(Deserialize, Debug)]
+struct GithubReleaseAsset {
+    browser_download_url: String,
+    digest: Option<String>,
 }
 
 fn default_update_check_interval() -> u64 {
@@ -94,9 +113,7 @@ fn update_source_label(endpoint: &str) -> String {
 
 fn build_versioned_updater_endpoint(endpoint: &str, version: &str) -> Option<String> {
     let normalized_version = normalize_version(version);
-    if normalized_version.is_empty() {
-        return None;
-    }
+    Version::parse(normalized_version).ok()?;
 
     endpoint.contains("releases/latest/download/").then(|| {
         endpoint.replacen(
@@ -111,19 +128,68 @@ fn build_updater_manifest_candidates(
     endpoint: &str,
     expected_version: Option<&str>,
 ) -> Vec<String> {
-    let mut candidates = Vec::new();
+    // 确认过的版本只读对应 tag，不能在下载时悄悄回退到另一个 Latest。
+    match expected_version {
+        Some(version) => build_versioned_updater_endpoint(endpoint, version)
+            .into_iter()
+            .collect(),
+        None => vec![endpoint.to_string()],
+    }
+}
 
-    if let Some(expected_version) = expected_version {
-        if let Some(versioned_endpoint) =
-            build_versioned_updater_endpoint(endpoint, expected_version)
-        {
-            candidates.push(versioned_endpoint);
+fn update_asset_matches_manifest(asset: &Url, manifest: &str, version: &str) -> bool {
+    let manifest =
+        build_versioned_updater_endpoint(manifest, version).unwrap_or_else(|| manifest.to_string());
+    let Some((directory, _)) = manifest.rsplit_once('/') else {
+        return false;
+    };
+    asset
+        .as_str()
+        .strip_prefix(&format!("{directory}/"))
+        .is_some_and(|filename| {
+            !filename.is_empty()
+                && !filename.contains('/')
+                && !filename.to_ascii_lowercase().contains("%2f")
+                && !filename.to_ascii_lowercase().contains("%5c")
+        })
+}
+
+fn trusted_asset_digest<'a>(
+    release: &'a GithubReleaseResponse,
+    asset_url: &Url,
+) -> Option<&'a str> {
+    let mut official_url = asset_url.as_str();
+    for prefix in ["https://gh-proxy.cn/", "https://gh-proxy.com/"] {
+        if let Some(url) = official_url.strip_prefix(prefix) {
+            official_url = url;
+            break;
         }
     }
+    release
+        .assets
+        .iter()
+        .find(|asset| asset.browser_download_url == official_url)
+        .and_then(|asset| asset.digest.as_deref())
+        .and_then(|digest| digest.strip_prefix("sha256:"))
+        .filter(|digest| digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()))
+}
 
-    candidates.push(endpoint.to_string());
-    candidates.dedup();
-    candidates
+fn verify_asset_digest(bytes: &[u8], expected: &str) -> Result<(), AppError> {
+    if !hex::encode(Sha256::digest(bytes)).eq_ignore_ascii_case(expected) {
+        return Err(AppError::Unknown(
+            "安装包与 GitHub 官方版本摘要不符，已拒绝安装".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn update_http_client() -> Result<reqwest::Client, AppError> {
+    reqwest::Client::builder()
+        .user_agent("WorkReview-Updater")
+        .timeout(Duration::from_secs(UPDATE_REQUEST_TIMEOUT_SECS))
+        .connect_timeout(Duration::from_secs(UPDATE_CONNECT_TIMEOUT_SECS))
+        .build()
+        .map_err(|e| AppError::Unknown(format!("创建更新检查客户端失败: {e}")))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -151,66 +217,96 @@ fn emit_update_status(
     );
 }
 
-async fn check_installable_update(app: &AppHandle) -> Option<GithubUpdateInfo> {
+async fn check_installable_update(
+    app: &AppHandle,
+    expected_version: Option<&str>,
+    include_prerelease: bool,
+) -> Option<GithubUpdateInfo> {
     let current_version = env!("CARGO_PKG_VERSION").to_string();
     let mut last_failure = None;
     let mut no_update_source = None;
 
     for endpoint in UPDATER_JSON_ENDPOINTS {
         let source_label = update_source_label(endpoint);
-        let endpoint_url = match Url::parse(endpoint) {
-            Ok(url) => url,
-            Err(error) => {
-                last_failure = Some(format!("{source_label}: 解析更新源失败: {error}"));
-                continue;
-            }
-        };
+        for manifest_endpoint in build_updater_manifest_candidates(endpoint, expected_version) {
+            let endpoint_url = match Url::parse(&manifest_endpoint) {
+                Ok(url) => url,
+                Err(error) => {
+                    last_failure = Some(format!("{source_label}: 解析更新源失败: {error}"));
+                    continue;
+                }
+            };
 
-        let updater = match app
-            .updater_builder()
-            .endpoints(vec![endpoint_url])
-            .map(|builder| {
-                builder
-                    .timeout(Duration::from_secs(UPDATE_REQUEST_TIMEOUT_SECS))
-                    .configure_client(|client| {
-                        client
-                            .connect_timeout(Duration::from_secs(UPDATE_CONNECT_TIMEOUT_SECS))
-                            .user_agent("WorkReview-Updater")
-                    })
-            })
-            .and_then(|builder| builder.build())
-        {
-            Ok(updater) => updater,
-            Err(error) => {
-                last_failure = Some(format!("{source_label}: 构建更新器失败: {error}"));
-                continue;
-            }
-        };
+            let updater = match app
+                .updater_builder()
+                .endpoints(vec![endpoint_url])
+                .map(|builder| {
+                    builder
+                        .timeout(Duration::from_secs(UPDATE_REQUEST_TIMEOUT_SECS))
+                        .configure_client(|client| {
+                            client
+                                .connect_timeout(Duration::from_secs(UPDATE_CONNECT_TIMEOUT_SECS))
+                                .user_agent("WorkReview-Updater")
+                        })
+                })
+                .and_then(|builder| builder.build())
+            {
+                Ok(updater) => updater,
+                Err(error) => {
+                    last_failure = Some(format!("{source_label}: 构建更新器失败: {error}"));
+                    continue;
+                }
+            };
 
-        match updater.check().await {
-            Ok(Some(update)) => {
-                return Some(GithubUpdateInfo {
-                    current_version: update.current_version,
-                    latest_version: update.version,
-                    available: true,
-                    auto_update_ready: true,
-                    release_url: GITHUB_LATEST_RELEASE_PAGE.to_string(),
-                    body: update.body,
-                    source: Some(source_label),
-                });
-            }
-            Ok(None) => {
-                no_update_source = Some(source_label);
-                continue;
-            }
-            Err(error) => {
-                last_failure = Some(format!("{source_label}: 检查可安装更新失败: {error}"));
+            match updater.check().await {
+                Ok(Some(update)) => {
+                    if !is_update_allowed(
+                        &current_version,
+                        &update.version,
+                        include_prerelease,
+                        expected_version,
+                    ) || !update_asset_matches_manifest(
+                        &update.download_url,
+                        &manifest_endpoint,
+                        &update.version,
+                    ) {
+                        last_failure = Some(format!(
+                            "{source_label}: 更新版本或包地址不符合所选渠道或目标"
+                        ));
+                        continue;
+                    }
+                    return Some(GithubUpdateInfo {
+                        current_version: update.current_version,
+                        prerelease: parse_release_version(&update.version)
+                            .is_some_and(|version| !version.pre.is_empty()),
+                        release_url: format!(
+                            "https://github.com/wm94i/Work-Review/releases/tag/v{}",
+                            update.version
+                        ),
+                        latest_version: update.version,
+                        available: true,
+                        auto_update_ready: true,
+                        body: update.body,
+                        source: Some(source_label),
+                    });
+                }
+                Ok(None) if expected_version.is_none() => {
+                    no_update_source = Some(source_label.clone());
+                }
+                Ok(None) => {
+                    last_failure = Some(format!("{source_label}: 目标版本没有可安装更新包"));
+                }
+                Err(error) => {
+                    last_failure = Some(format!("{source_label}: 检查可安装更新失败: {error}"));
+                }
             }
         }
     }
 
     if let Some(source) = no_update_source {
         return Some(GithubUpdateInfo {
+            prerelease: parse_release_version(&current_version)
+                .is_some_and(|version| !version.pre.is_empty()),
             current_version: current_version.clone(),
             latest_version: current_version,
             available: false,
@@ -222,7 +318,7 @@ async fn check_installable_update(app: &AppHandle) -> Option<GithubUpdateInfo> {
     }
 
     if let Some(failure) = last_failure {
-        log::warn!("安装型更新检查失败，回退到 GitHub Release API: {failure}");
+        log::warn!("安装型更新检查未找到目标更新: {failure}");
     }
 
     None
@@ -232,6 +328,7 @@ impl Default for UpdateSettings {
     fn default() -> Self {
         Self {
             auto_check: true,
+            include_prerelease: false,
             last_check_time: 0,
             check_interval_hours: DEFAULT_UPDATE_CHECK_INTERVAL_HOURS,
         }
@@ -242,35 +339,46 @@ fn normalize_version(version: &str) -> &str {
     version.trim().trim_start_matches(['v', 'V'])
 }
 
-fn parse_version_parts(version: &str) -> Vec<u64> {
-    normalize_version(version)
-        .split('.')
-        .map(|segment| {
-            segment
-                .chars()
-                .take_while(|c| c.is_ascii_digit())
-                .collect::<String>()
-                .parse::<u64>()
-                .unwrap_or(0)
-        })
-        .collect()
+fn parse_release_version(version: &str) -> Option<Version> {
+    Version::parse(normalize_version(version)).ok()
 }
 
-fn compare_versions(current: &str, latest: &str) -> Ordering {
-    let current_parts = parse_version_parts(current);
-    let latest_parts = parse_version_parts(latest);
-    let max_len = current_parts.len().max(latest_parts.len());
+fn is_update_allowed(
+    current: &str,
+    candidate: &str,
+    include_prerelease: bool,
+    expected: Option<&str>,
+) -> bool {
+    let (Some(current), Some(candidate)) = (
+        parse_release_version(current),
+        parse_release_version(candidate),
+    ) else {
+        return false;
+    };
+    (include_prerelease || candidate.pre.is_empty())
+        && candidate.cmp_precedence(&current) == Ordering::Greater
+        && expected.is_none_or(|expected| {
+            parse_release_version(expected).is_some_and(|version| version == candidate)
+        })
+}
 
-    for index in 0..max_len {
-        let current_value = *current_parts.get(index).unwrap_or(&0);
-        let latest_value = *latest_parts.get(index).unwrap_or(&0);
-        match current_value.cmp(&latest_value) {
-            Ordering::Equal => continue,
-            other => return other,
-        }
-    }
-
-    Ordering::Equal
+fn select_release(
+    releases: &[GithubReleaseResponse],
+    include_prerelease: bool,
+) -> Option<&GithubReleaseResponse> {
+    releases
+        .iter()
+        .filter_map(|release| {
+            let version = parse_release_version(&release.tag_name)?;
+            if release.draft
+                || (!include_prerelease && (release.prerelease || !version.pre.is_empty()))
+            {
+                return None;
+            }
+            Some((release, version))
+        })
+        .max_by(|(_, left), (_, right)| left.cmp_precedence(right))
+        .map(|(release, _)| release)
 }
 
 fn update_settings_path(data_dir: &Path) -> std::path::PathBuf {
@@ -385,53 +493,71 @@ pub async fn quit_app_for_update(app: AppHandle) -> Result<(), AppError> {
     Ok(())
 }
 
-/// 基于 updater.json 优先检查更新；若自动更新元数据暂未就绪，则回退到 GitHub Release API。
+/// 正式版优先检查安装清单；测试版需本机启用，并按 SemVer 选择已发布的候选。
 #[tauri::command]
-pub async fn check_github_update(app: AppHandle) -> Result<GithubUpdateInfo, AppError> {
-    let client = reqwest::Client::builder()
-        .user_agent("WorkReview-Updater")
-        .timeout(Duration::from_secs(UPDATE_REQUEST_TIMEOUT_SECS))
-        .connect_timeout(Duration::from_secs(UPDATE_CONNECT_TIMEOUT_SECS))
-        .build()
-        .map_err(|e| AppError::Unknown(format!("创建更新检查客户端失败: {e}")))?;
-
-    if let Some(update_info) = check_installable_update(&app).await {
-        return Ok(update_info);
+pub async fn check_github_update(
+    app: AppHandle,
+    state: State<'_, Arc<Mutex<AppState>>>,
+) -> Result<GithubUpdateInfo, AppError> {
+    let data_dir = state
+        .lock()
+        .map_err(|e| AppError::Unknown(e.to_string()))?
+        .data_dir
+        .clone();
+    let settings = load_update_settings_from_dir(&data_dir)?;
+    if !settings.include_prerelease {
+        if let Some(update_info) = check_installable_update(&app, None, false).await {
+            return Ok(update_info);
+        }
     }
 
-    let current_version = env!("CARGO_PKG_VERSION").to_string();
-    let release = client
-        .get(GITHUB_LATEST_RELEASE_API)
-        .header(reqwest::header::USER_AGENT, "WorkReview-Updater")
+    let client = update_http_client()?;
+    let endpoint = if settings.include_prerelease {
+        GITHUB_RELEASES_API
+    } else {
+        GITHUB_LATEST_RELEASE_API
+    };
+    let response = client
+        .get(endpoint)
         .header(reqwest::header::ACCEPT, "application/vnd.github+json")
         .send()
         .await?
-        .error_for_status()?
-        .json::<GithubReleaseResponse>()
-        .await?;
-
+        .error_for_status()?;
+    let releases = if settings.include_prerelease {
+        // shortcut: 查询最近 100 个发行版；超过此范围仍需发现旧发布时间的高版本时再增加分页。
+        response.json::<Vec<GithubReleaseResponse>>().await?
+    } else {
+        vec![response.json::<GithubReleaseResponse>().await?]
+    };
+    let release = select_release(&releases, settings.include_prerelease)
+        .ok_or_else(|| AppError::Unknown("未找到符合所选更新渠道的已发布版本".to_string()))?;
+    let current_version = env!("CARGO_PKG_VERSION").to_string();
     let latest_version = normalize_version(&release.tag_name).to_string();
-    let has_update = compare_versions(&current_version, &latest_version) == Ordering::Less;
-
-    if !has_update {
-        return Ok(GithubUpdateInfo {
-            current_version,
-            latest_version,
-            available: false,
-            auto_update_ready: false,
-            release_url: release.html_url,
-            body: release.body,
-            source: Some("github-release-api".to_string()),
-        });
+    let available = is_update_allowed(
+        &current_version,
+        &latest_version,
+        settings.include_prerelease,
+        None,
+    );
+    if available {
+        if let Some(mut update_info) =
+            check_installable_update(&app, Some(&latest_version), settings.include_prerelease).await
+        {
+            update_info.prerelease |= release.prerelease;
+            return Ok(update_info);
+        }
     }
 
     Ok(GithubUpdateInfo {
         current_version,
+        prerelease: release.prerelease
+            || parse_release_version(&latest_version)
+                .is_some_and(|version| !version.pre.is_empty()),
         latest_version,
-        available: true,
+        available,
         auto_update_ready: false,
-        release_url: release.html_url,
-        body: release.body,
+        release_url: release.html_url.clone(),
+        body: release.body.clone(),
         source: Some("github-release-api".to_string()),
     })
 }
@@ -440,8 +566,48 @@ pub async fn check_github_update(app: AppHandle) -> Result<GithubUpdateInfo, App
 #[tauri::command]
 pub async fn download_and_install_github_update(
     app: AppHandle,
+    state: State<'_, Arc<Mutex<AppState>>>,
     expected_version: Option<String>,
 ) -> Result<GithubUpdateInstallResult, AppError> {
+    let data_dir = state
+        .lock()
+        .map_err(|e| AppError::Unknown(e.to_string()))?
+        .data_dir
+        .clone();
+    let settings = load_update_settings_from_dir(&data_dir)?;
+    let expected = expected_version
+        .as_deref()
+        .ok_or_else(|| AppError::Unknown("必须先检查并确认目标更新版本".to_string()))?;
+    if !is_update_allowed(
+        env!("CARGO_PKG_VERSION"),
+        expected,
+        settings.include_prerelease,
+        None,
+    ) {
+        return Err(AppError::Unknown(
+            "目标版本不是新版本，或未启用接收测试版".to_string(),
+        ));
+    }
+    // 镜像提供的有效旧签名不能证明目标版本；摘要只信任 GitHub 官方 HTTPS API。
+    let trusted_release = update_http_client()?
+        .get(format!(
+            "https://api.github.com/repos/wm94i/Work-Review/releases/tags/v{}",
+            normalize_version(expected)
+        ))
+        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<GithubReleaseResponse>()
+        .await?;
+    if trusted_release.draft
+        || (!settings.include_prerelease && trusted_release.prerelease)
+        || parse_release_version(&trusted_release.tag_name) != parse_release_version(expected)
+    {
+        return Err(AppError::Unknown(
+            "官方发行版与确认版本或渠道不符".to_string(),
+        ));
+    }
     let mut attempted_sources = Vec::new();
     let mut failures = Vec::new();
 
@@ -492,6 +658,22 @@ pub async fn download_and_install_github_update(
 
             match updater.check().await {
                 Ok(Some(found_update)) => {
+                    if !is_update_allowed(
+                        env!("CARGO_PKG_VERSION"),
+                        &found_update.version,
+                        settings.include_prerelease,
+                        Some(expected),
+                    ) || !update_asset_matches_manifest(
+                        &found_update.download_url,
+                        &manifest_endpoint,
+                        expected,
+                    ) {
+                        last_check_error = Some(format!(
+                            "{source_label}: 返回版本 {} 与确认版本 {} 或所选渠道不符",
+                            found_update.version, expected
+                        ));
+                        continue;
+                    }
                     update = Some(found_update);
                     last_check_error = None;
                     break;
@@ -514,15 +696,13 @@ pub async fn download_and_install_github_update(
             continue;
         };
 
-        if let Some(expected) = expected_version.as_deref() {
-            if compare_versions(&update.version, expected) == Ordering::Less {
-                failures.push(format!(
-                    "{source_label}: 返回版本 {}，低于目标版本 {}",
-                    update.version, expected
-                ));
-                continue;
-            }
-        }
+        let Some(expected_digest) = trusted_asset_digest(&trusted_release, &update.download_url)
+        else {
+            failures.push(format!(
+                "{source_label}: 缺少 GitHub 官方 SHA-256 校验信息，已拒绝安装"
+            ));
+            continue;
+        };
 
         emit_update_status(
             &app,
@@ -543,12 +723,8 @@ pub async fn download_and_install_github_update(
         let progress_version = update.version.clone();
         let mut downloaded_bytes = 0_u64;
 
-        let finish_app = app.clone();
-        let finish_source = source_label.clone();
-        let finish_version = update.version.clone();
-
-        match update
-            .download_and_install(
+        let downloaded = update
+            .download(
                 move |chunk_length, total_bytes| {
                     downloaded_bytes += chunk_length as u64;
                     let percent = total_bytes.and_then(|total| {
@@ -576,21 +752,28 @@ pub async fn download_and_install_github_update(
                         percent,
                     );
                 },
-                move || {
-                    emit_update_status(
-                        &finish_app,
-                        "installing",
-                        format!("下载完成，正在安装（{finish_source}）..."),
-                        Some(finish_source.clone()),
-                        Some(finish_version.clone()),
-                        None,
-                        None,
-                        Some(100),
-                    );
-                },
+                || {},
             )
-            .await
-        {
+            .await;
+        let installed = match downloaded {
+            Ok(bytes) => verify_asset_digest(&bytes, expected_digest).and_then(|()| {
+                emit_update_status(
+                    &app,
+                    "installing",
+                    format!("下载及校验完成，正在安装（{source_label}）..."),
+                    Some(source_label.clone()),
+                    Some(update.version.clone()),
+                    None,
+                    None,
+                    Some(100),
+                );
+                update
+                    .install(bytes)
+                    .map_err(|error| AppError::Unknown(error.to_string()))
+            }),
+            Err(error) => Err(AppError::Unknown(error.to_string())),
+        };
+        match installed {
             Ok(()) => {
                 emit_update_status(
                     &app,
@@ -657,7 +840,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn 更新清单候选应优先显式版本地址再回退latest地址() {
+    fn 确认版本后更新清单必须固定到对应tag而非latest() {
         let candidates = build_updater_manifest_candidates(
             "https://github.com/wm94i/Work-Review/releases/latest/download/updater.json",
             Some("1.0.24"),
@@ -667,8 +850,6 @@ mod tests {
             candidates,
             vec![
                 "https://github.com/wm94i/Work-Review/releases/download/v1.0.24/updater.json"
-                    .to_string(),
-                "https://github.com/wm94i/Work-Review/releases/latest/download/updater.json"
                     .to_string(),
             ]
         );
@@ -686,10 +867,211 @@ mod tests {
             vec![
                 "https://gh-proxy.cn/https://github.com/wm94i/Work-Review/releases/download/v1.0.24/updater-ghproxy.json"
                     .to_string(),
-                "https://gh-proxy.cn/https://github.com/wm94i/Work-Review/releases/latest/download/updater-ghproxy.json"
-                    .to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn 更新设置缺省不得开启测试版且应持久化选择() {
+        let legacy: UpdateSettings = serde_json::from_str(
+            r#"{"autoCheck":true,"lastCheckTime":123,"checkIntervalHours":24}"#,
+        )
+        .unwrap();
+        assert!(!legacy.include_prerelease);
+        assert!(!UpdateSettings::default().include_prerelease);
+        let enabled = UpdateSettings {
+            include_prerelease: true,
+            ..legacy
+        };
+        let restored: UpdateSettings =
+            serde_json::from_str(&serde_json::to_string(&enabled).unwrap()).unwrap();
+        assert!(restored.include_prerelease);
+        assert_eq!(restored.last_check_time, 123);
+    }
+
+    #[test]
+    fn 版本比较必须区分rc序号正式版和构建元数据() {
+        for (current, candidate, allowed) in [
+            ("1.1.3", "1.1.3-rc.3", false),
+            ("1.1.3", "1.1.2", false),
+            ("1.1.3", "1.1.4-rc.1", true),
+            ("1.1.3-rc.3", "1.1.3-rc.10", true),
+            ("1.1.3-rc.10", "1.1.3-rc.3", false),
+            ("1.1.3-rc.3", "1.1.3", true),
+            ("1.1.3+old", "1.1.3+new", false),
+            ("1.1.3", "1.1.4-rc.01", false),
+            ("1.1.3", "nightly", false),
+            ("unknown", "1.1.4", false),
+        ] {
+            assert_eq!(
+                is_update_allowed(current, candidate, true, None),
+                allowed,
+                "{current} -> {candidate}"
+            );
+        }
+    }
+
+    #[test]
+    fn 未开启测试版时检查和安装都应拒绝预发布() {
+        assert!(!is_update_allowed("1.1.3", "1.1.4-rc.1", false, None));
+        assert!(!is_update_allowed(
+            "1.1.3",
+            "1.1.4-rc.1",
+            false,
+            Some("1.1.4-rc.1")
+        ));
+        assert!(is_update_allowed("1.1.3-rc.3", "1.1.3", false, None));
+    }
+
+    #[test]
+    fn 下载安装必须匹配确认版本且不可静默换成更高版本() {
+        assert!(is_update_allowed("1.1.3", "1.1.4", false, Some("v1.1.4")));
+        for candidate in ["1.1.3", "1.1.4-rc.3", "1.1.5"] {
+            assert!(!is_update_allowed("1.1.3", candidate, true, Some("1.1.4")));
+        }
+    }
+
+    #[test]
+    fn 已确认rc应使用独立版本清单且拒绝无效版本路径() {
+        let endpoint = UPDATER_JSON_ENDPOINTS[0];
+        assert_eq!(
+            build_updater_manifest_candidates(endpoint, Some("1.1.4-rc.3")),
+            vec!["https://github.com/wm94i/Work-Review/releases/download/v1.1.4-rc.3/updater.json"]
+        );
+        assert!(build_updater_manifest_candidates(endpoint, Some("../bad")).is_empty());
+        assert_eq!(
+            build_updater_manifest_candidates(endpoint, None),
+            vec![endpoint]
+        );
+    }
+
+    fn release(tag: &str, prerelease: bool, draft: bool) -> GithubReleaseResponse {
+        GithubReleaseResponse {
+            tag_name: tag.to_string(),
+            html_url: String::new(),
+            body: None,
+            prerelease,
+            draft,
+            assets: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn 测试版选择应按语义版本而非发布时间或rc字符串排序() {
+        let releases = [
+            release("v1.1.3-rc.10", true, false),
+            release("v9.0.0", false, true),
+            release("nightly", false, false),
+            release("v1.1.3-rc.3", true, false),
+            release("v1.1.2", false, false),
+        ];
+        assert_eq!(
+            select_release(&releases, true).unwrap().tag_name,
+            "v1.1.3-rc.10"
+        );
+        assert_eq!(select_release(&releases, false).unwrap().tag_name, "v1.1.2");
+    }
+
+    #[test]
+    fn 同版本正式发布应优先于rc且不能伪造预发布标记绕过渠道() {
+        let releases = [
+            release("v1.1.3-rc.3", true, false),
+            release("v1.1.3", false, false),
+            release("v1.1.4-rc.1", false, false),
+        ];
+        assert_eq!(select_release(&releases, false).unwrap().tag_name, "v1.1.3");
+        assert_eq!(
+            select_release(&releases[..2], true).unwrap().tag_name,
+            "v1.1.3"
+        );
+        assert_eq!(
+            select_release(&releases, true).unwrap().tag_name,
+            "v1.1.4-rc.1"
+        );
+        assert!(select_release(&[release("v1.1.4", true, false)], false).is_none());
+    }
+
+    #[test]
+    fn 清单版本正确但包地址指向旧rc或其他来源时也必须拒绝() {
+        let manifest = UPDATER_JSON_ENDPOINTS[0];
+        for (url, allowed) in [
+            ("https://github.com/wm94i/Work-Review/releases/download/v1.1.4-rc.10/setup.exe", true),
+            ("https://github.com/wm94i/Work-Review/releases/download/v1.1.4-rc.3/setup.exe", false),
+            ("https://github.com/other/repo/releases/download/v1.1.4-rc.10/setup.exe", false),
+            ("http://github.com/wm94i/Work-Review/releases/download/v1.1.4-rc.10/setup.exe", false),
+            ("https://example.com/wm94i/Work-Review/releases/download/v1.1.4-rc.10/setup.exe", false),
+            ("https://github.com/wm94i/Work-Review/releases/download/v1.1.4-rc.10/sub/setup.exe", false),
+            ("https://github.com/wm94i/Work-Review/releases/download/v1.1.4-rc.10/bad%2fname.exe", false),
+        ] {
+            assert_eq!(
+                update_asset_matches_manifest(&Url::parse(url).unwrap(), manifest, "1.1.4-rc.10"),
+                allowed,
+                "{url}"
+            );
+        }
+        let pinned =
+            build_updater_manifest_candidates(UPDATER_JSON_ENDPOINTS[1], Some("1.1.4-rc.10"));
+        assert!(update_asset_matches_manifest(
+            &Url::parse("https://gh-proxy.cn/https://github.com/wm94i/Work-Review/releases/download/v1.1.4-rc.10/setup.exe").unwrap(),
+            &pinned[0],
+            "1.1.4-rc.10",
+        ));
+    }
+
+    #[test]
+    fn 摘要只允许官方对应资产且代理不可另选旧包() {
+        let bytes = b"new release package";
+        let digest = hex::encode(Sha256::digest(bytes));
+        let mut trusted = release("v1.1.4-rc.1", true, false);
+        trusted.assets.push(GithubReleaseAsset {
+            browser_download_url:
+                "https://github.com/wm94i/Work-Review/releases/download/v1.1.4-rc.1/setup.exe"
+                    .to_string(),
+            digest: Some(format!("sha256:{digest}")),
+        });
+        for prefix in ["", "https://gh-proxy.cn/", "https://gh-proxy.com/"] {
+            let url = Url::parse(&format!(
+                "{prefix}{}",
+                trusted.assets[0].browser_download_url
+            ))
+            .unwrap();
+            assert_eq!(trusted_asset_digest(&trusted, &url), Some(digest.as_str()));
+        }
+        let other =
+            Url::parse("https://github.com/wm94i/Work-Review/releases/download/v1.1.3/setup.exe")
+                .unwrap();
+        assert!(trusted_asset_digest(&trusted, &other).is_none());
+    }
+
+    #[test]
+    fn 缺失或伪造格式的官方摘要不能跳过校验() {
+        let url =
+            Url::parse("https://github.com/wm94i/Work-Review/releases/download/v1.1.4/setup.exe")
+                .unwrap();
+        for digest in [
+            None,
+            Some("sha256:bad"),
+            Some("sha1:1234"),
+            Some("sha256:zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"),
+        ] {
+            let mut trusted = release("v1.1.4", false, false);
+            trusted.assets.push(GithubReleaseAsset {
+                browser_download_url: url.to_string(),
+                digest: digest.map(str::to_string),
+            });
+            assert!(trusted_asset_digest(&trusted, &url).is_none());
+        }
+    }
+
+    #[test]
+    fn 正确版本路径及旧有效签名也不能替代官方目标包摘要() {
+        let new_package = b"authentic new package";
+        let old_package = b"authentic old package with an otherwise valid signature";
+        let digest = hex::encode(Sha256::digest(new_package));
+        assert!(verify_asset_digest(new_package, &digest).is_ok());
+        assert!(verify_asset_digest(new_package, &digest.to_ascii_uppercase()).is_ok());
+        assert!(verify_asset_digest(old_package, &digest).is_err());
+        assert!(verify_asset_digest(b"", &digest).is_err());
     }
 
     #[test]

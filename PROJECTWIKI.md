@@ -102,4 +102,4 @@ flowchart LR
 
 ## 12. 变更日志
 
-- 参见 [CHANGELOG.md](./CHANGELOG.md)（本节与该文件双向关联；条目按 Keep a Changelog 维护）。当前发布版本：[1.1.3](./CHANGELOG.md#113---2026-10-20)。未发布条目见 [Unreleased](./CHANGELOG.md#unreleased)（时间线详情改为截图 + 图注 + 分类标签）。
+- 参见 [CHANGELOG.md](./CHANGELOG.md)（本节与该文件双向关联；条目按 Keep a Changelog 维护）。当前稳定版本：[1.1.3](./CHANGELOG.md#113---2026-10-20)，当前开发候选版本：[1.1.4-rc.1](./CHANGELOG.md#114-rc1---2026-11-03)。未发布条目见 [Unreleased](./CHANGELOG.md#unreleased)（时间线详情改为截图 + 图注 + 分类标签）。

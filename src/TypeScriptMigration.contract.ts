@@ -508,6 +508,7 @@ type ExpectedGithubUpdateInfo = {
   latestVersion: string;
   available: boolean;
   autoUpdateReady: boolean;
+  prerelease: boolean;
   releaseUrl: string;
   body: string | null;
   source: string | null;

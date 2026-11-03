@@ -18,6 +18,7 @@ function releaseInfo(overrides: Partial<GithubUpdateInfo> = {}): GithubUpdateInf
     latestVersion: '1.1.0',
     available: true,
     autoUpdateReady: true,
+    prerelease: false,
     releaseUrl: 'https://example.com/releases/1.1.0',
     body: null,
     source: 'test-source',
@@ -161,7 +162,7 @@ function createHarness(options: HarnessOptions = {}): UpdateHarness {
     },
     confirm: async (confirmOptions?: ConfirmationOptions) => {
       confirmations.push(confirmOptions);
-      return confirmResults.shift() ?? false;
+      return confirmResults.shift() ?? true;
     },
     showToast: (message: unknown, type, duration?: number) => {
       toasts.push({ message, type, duration });
@@ -407,4 +408,56 @@ test('平台探测失败后应清空缓存并允许下次更新重试', async ()
     harness.commands.filter(({ command }) => command === 'get_runtime_platform').length,
     2
   );
+});
+
+test('默认检查必须先确认版本，取消后不得下载或退出应用', async () => {
+  const harness = createHarness({ confirmResults: [false] });
+  const result = await createUpdateFlow(harness.dependencies)();
+  assert.deepEqual(result, { updated: false, cancelled: true });
+  assert.equal(harness.confirmations.length, 1);
+  assert.equal(harness.confirmations[0]?.title, 'updater.newVersionTitle');
+  assert.match(harness.confirmations[0]?.message ?? '', /1\.1\.0/);
+  assert.equal(harness.commands.some(c => c.command === 'download_and_install_github_update'), false);
+  assert.equal(harness.relaunchCount, 0);
+});
+
+test('RC 即使关闭普通确认也必须提示测试风险并允许取消', async () => {
+  const harness = createHarness({
+    checkedRelease: releaseInfo({ latestVersion: '1.1.4-rc.3', prerelease: true }),
+    confirmResults: [false],
+  });
+  const result = await createUpdateFlow(harness.dependencies)({ confirmBeforeDownload: false });
+  assert.deepEqual(result, { updated: false, cancelled: true });
+  assert.equal(harness.confirmations[0]?.title, 'updater.prereleaseTitle');
+  assert.equal(harness.confirmations[0]?.tone, 'warning');
+  assert.match(harness.confirmations[0]?.message ?? '', /updater\.prereleaseMessage.*1\.1\.4-rc\.3/);
+  assert.equal(harness.commands.some(c => c.command === 'download_and_install_github_update'), false);
+});
+
+test('确认 RC 后应只请求安装已展示的完整版本号', async () => {
+  const harness = createHarness({
+    checkedRelease: releaseInfo({ latestVersion: '1.1.4-rc.10', prerelease: true }),
+  });
+  const result = await createUpdateFlow(harness.dependencies)();
+  assert.deepEqual(result, { updated: true });
+  assert.equal(harness.confirmations.length, 1);
+  assert.deepEqual(
+    harness.commands.find(c => c.command === 'download_and_install_github_update')?.args,
+    { expectedVersion: '1.1.4-rc.10' },
+  );
+});
+
+test('平台没有 RC 在线包时应警告并打开对应发布页，不尝试安装', async () => {
+  const releaseUrl = 'https://github.com/wm94i/Work-Review/releases/tag/v1.1.4-rc.1';
+  const harness = createHarness({
+    checkedRelease: releaseInfo({
+      latestVersion: '1.1.4-rc.1', prerelease: true, autoUpdateReady: false, releaseUrl,
+    }),
+  });
+  const result = await createUpdateFlow(harness.dependencies)();
+  assert.ok('autoUpdateReady' in result && !result.autoUpdateReady);
+  assert.equal(harness.confirmations[0]?.tone, 'warning');
+  assert.match(harness.confirmations[0]?.message ?? '', /updater\.prereleaseManualMessage.*1\.1\.4-rc\.1/);
+  assert.deepEqual(harness.opened, [releaseUrl]);
+  assert.equal(harness.commands.some(c => c.command === 'download_and_install_github_update'), false);
 });

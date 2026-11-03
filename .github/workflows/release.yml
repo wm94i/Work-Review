@@ -31,18 +31,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if [[ ! "$GITHUB_REF_NAME" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-rc\.(0|[1-9][0-9]*))?$ ]]; then
-            echo "Expected vMAJOR.MINOR.PATCH or vMAJOR.MINOR.PATCH-rc.N without leading zeros" >&2
-            exit 1
-          fi
-
-          VERSION="$(node -p "require('./package.json').version")"
-          TAG_VERSION="${GITHUB_REF_NAME#v}"
-          STABLE_VERSION="${TAG_VERSION%-rc.*}"
-          if [[ "$STABLE_VERSION" != "$VERSION" ]]; then
-            echo "Tag ${GITHUB_REF_NAME} 与应用版本 v${VERSION} 不一致" >&2
-            exit 1
-          fi
+          node scripts/prepare-release-version.mjs "$GITHUB_REF_NAME"
 
           npm run test:frontend
 
@@ -94,6 +83,10 @@ jobs:
         with:
           node-version: 22
           cache: "npm"
+
+      - name: Apply release tag to application version
+        shell: bash
+        run: node scripts/prepare-release-version.mjs "$GITHUB_REF_NAME"
 
       - name: Install Linux build dependencies
         if: startsWith(matrix.platform, 'ubuntu')

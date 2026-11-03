@@ -25,7 +25,7 @@ test('关于页应保留左对齐标准页头，并将品牌主体居中组织',
   assert.match(source, /about-action-row/);
 });
 
-test('品牌卡底部只保留自动检查与一个更新按钮，不重复版本或扩展独立面板', async () => {
+test('品牌卡底部只保留紧凑更新选项与一个检查按钮，不重复版本或扩展独立面板', async () => {
   const source = await readAboutSource();
   const brandStart = source.indexOf('class="page-card about-brand-card"');
   const brandEnd = source.indexOf('</section>', brandStart);
@@ -35,9 +35,10 @@ test('品牌卡底部只保留自动检查与一个更新按钮，不重复版�
   assert.match(brandCard, /about-update-controls/);
   assert.equal((brandCard.match(/v\{appVersion\}/g) || []).length, 1, '版本只在品牌标题旁显示一次');
   assert.equal((controls.match(/<button\b/g) || []).length, 1, '更新行只保留一个按钮');
-  assert.equal((controls.match(/type="checkbox"/g) || []).length, 1);
+  assert.equal((controls.match(/type="checkbox"/g) || []).length, 2);
+  assert.match(controls, /t\('about\.includePrerelease'\)/);
   assert.match(controls, /t\('about\.checkUpdates'\)/);
-  assert.match(controls, /disabled=\{isCheckingUpdate\}/);
+  assert.match(controls, /disabled=\{isCheckingUpdate \|\| isSavingUpdateSettings\}/);
   assert.match(controls, /aria-busy=\{isCheckingUpdate\}/);
   assert.match(controls, /\{#if updateStatus\}[\s\S]*role="status" aria-live="polite"/);
   assert.doesNotMatch(source, /about-update-(?:panel|grid|details|info)|about-channel-|isUpdateDetailsOpen/);

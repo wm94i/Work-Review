@@ -13,6 +13,7 @@ export interface GithubUpdateInfo {
   latestVersion: string;
   available: boolean;
   autoUpdateReady: boolean;
+  prerelease: boolean;
   releaseUrl: string;
   body: string | null;
   source: string | null;
@@ -181,7 +182,7 @@ export function createUpdateFlow(dependencies: UpdateFlowDependencies): RunUpdat
   return async function runUpdateFlow(options = {}): Promise<RunUpdateFlowResult> {
     const {
       silentWhenUpToDate = false,
-      confirmBeforeDownload = false,
+      confirmBeforeDownload = true,
       onStatusChange = () => {},
     } = options;
 
@@ -208,15 +209,15 @@ export function createUpdateFlow(dependencies: UpdateFlowDependencies): RunUpdat
         onStatusChange(translate('updater.availableManual'));
         showToast(translate('updater.availableManual'), 'info', 4500);
 
-        if (confirmBeforeDownload && releaseInfo.releaseUrl) {
+        if ((confirmBeforeDownload || releaseInfo.prerelease) && releaseInfo.releaseUrl) {
           const shouldOpenRelease = await confirm({
-            title: translate('updater.newVersionTitle'),
-            message: translate('updater.openReleaseMessage', {
+            title: translate(releaseInfo.prerelease ? 'updater.prereleaseTitle' : 'updater.newVersionTitle'),
+            message: translate(releaseInfo.prerelease ? 'updater.prereleaseManualMessage' : 'updater.openReleaseMessage', {
               version: releaseInfo.latestVersion,
             }),
             confirmText: translate('updater.openRelease'),
             cancelText: translate('updater.later'),
-            tone: 'info',
+            tone: releaseInfo.prerelease ? 'warning' : 'info',
           });
 
           if (shouldOpenRelease) {
@@ -232,15 +233,15 @@ export function createUpdateFlow(dependencies: UpdateFlowDependencies): RunUpdat
         };
       }
 
-      if (confirmBeforeDownload) {
+      if (confirmBeforeDownload || releaseInfo.prerelease) {
         const shouldStart = await confirm({
-          title: translate('updater.newVersionTitle'),
-          message: translate('updater.startUpdateMessage', {
+          title: translate(releaseInfo.prerelease ? 'updater.prereleaseTitle' : 'updater.newVersionTitle'),
+          message: translate(releaseInfo.prerelease ? 'updater.prereleaseMessage' : 'updater.startUpdateMessage', {
             version: releaseInfo.latestVersion,
           }),
           confirmText: translate('updater.startUpdate'),
           cancelText: translate('updater.later'),
-          tone: 'info',
+          tone: releaseInfo.prerelease ? 'warning' : 'info',
         });
 
         if (!shouldStart) {

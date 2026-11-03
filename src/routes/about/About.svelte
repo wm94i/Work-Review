@@ -8,6 +8,7 @@
 
   interface UpdateSettings {
     autoCheck: boolean;
+    includePrerelease: boolean;
     lastCheckTime: number;
     checkIntervalHours: number;
   }
@@ -19,6 +20,8 @@
   let appVersion = '';
   let isCheckingUpdate = false;
   let autoCheckUpdate = true;
+  let includePrerelease = false;
+  let isSavingUpdateSettings = false;
   let isSponsorshipOpen = false;
   let zoomedQr: string | null = null;
   let updateStatus = '';
@@ -37,20 +40,30 @@
     try {
       const settings = await invoke<UpdateSettings>('get_update_settings');
       autoCheckUpdate = settings?.autoCheck ?? true;
+      includePrerelease = settings?.includePrerelease ?? false;
     } catch (e) {
       console.error('读取更新设置失败:', e);
     }
   });
 
-  async function toggleAutoCheck() {
-    autoCheckUpdate = !autoCheckUpdate;
+  async function toggleUpdateSetting(key: 'autoCheck' | 'includePrerelease') {
+    if (isSavingUpdateSettings || isCheckingUpdate) return;
+    const previous = key === 'autoCheck' ? autoCheckUpdate : includePrerelease;
+    if (key === 'autoCheck') autoCheckUpdate = !previous;
+    else includePrerelease = !previous;
+    isSavingUpdateSettings = true;
     try {
       const settings = await invoke<UpdateSettings>('get_update_settings');
-      settings.autoCheck = autoCheckUpdate;
+      settings[key] = !previous;
       await invoke('save_update_settings', { settings });
+      updateStatus = '';
     } catch (e) {
       console.error('保存更新设置失败:', e);
-      autoCheckUpdate = !autoCheckUpdate;
+      if (key === 'autoCheck') autoCheckUpdate = previous;
+      else includePrerelease = previous;
+      updateStatus = t('about.updateSettingsSaveFailed');
+    } finally {
+      isSavingUpdateSettings = false;
     }
   }
 
@@ -75,12 +88,16 @@
   }
 
   async function checkForUpdates() {
-    if (isCheckingUpdate) return;
-
+    if (isCheckingUpdate || isSavingUpdateSettings) return;
+    if (updateStatusTimer !== null) {
+      clearTimeout(updateStatusTimer);
+      updateStatusTimer = null;
+    }
     isCheckingUpdate = true;
     updateStatus = t('about.checkingUpdates');
 
     await runUpdateFlow({
+      confirmBeforeDownload: true,
       onStatusChange: (status) => {
         updateStatus = status;
       },
@@ -166,13 +183,17 @@
 
       <div class="about-update-controls">
         <label class="about-auto-check">
-          <input type="checkbox" checked={autoCheckUpdate} on:change={toggleAutoCheck} />
+          <input type="checkbox" checked={autoCheckUpdate} disabled={isSavingUpdateSettings || isCheckingUpdate} on:change={() => toggleUpdateSetting('autoCheck')} />
           <span>{t('about.autoCheckUpdate')}</span>
+        </label>
+        <label class="about-auto-check" title={t('about.includePrereleaseHint')}>
+          <input type="checkbox" checked={includePrerelease} disabled={isSavingUpdateSettings || isCheckingUpdate} on:change={() => toggleUpdateSetting('includePrerelease')} />
+          <span>{t('about.includePrerelease')}</span>
         </label>
         <button
           type="button"
           on:click={checkForUpdates}
-          disabled={isCheckingUpdate}
+          disabled={isCheckingUpdate || isSavingUpdateSettings}
           aria-busy={isCheckingUpdate}
           class="page-control-btn min-h-9 px-3 disabled:opacity-50"
         >

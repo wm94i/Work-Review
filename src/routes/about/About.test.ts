@@ -27,7 +27,8 @@ test('关于页赞助弹层应保留完整交互，紧凑更新行应位于三�
   assert.match(source, /on:click=\{\(\) => zoomedQr = wechatSponsorshipQr\}/);
   assert.match(source, /on:click=\{\(\) => zoomedQr = alipaySponsorshipQr\}/);
   assert.match(source, /<label class="about-auto-check">[\s\S]*type="checkbox"[\s\S]*t\('about\.autoCheckUpdate'\)/);
-  assert.match(source, /checked=\{autoCheckUpdate\} on:change=\{toggleAutoCheck\}/);
+  assert.match(source, /checked=\{autoCheckUpdate\}[\s\S]*toggleUpdateSetting\('autoCheck'\)/);
+  assert.match(source, /checked=\{includePrerelease\}[\s\S]*toggleUpdateSetting\('includePrerelease'\)/);
   assert.ok(
     source.indexOf("t('about.sponsorship')")
       < source.indexOf("t('about.checkUpdates')"),
@@ -42,6 +43,18 @@ test('关于页应独立读取版本与更新设置，失败时不得伪造旧�
   assert.match(source, /settings\?\.autoCheck \?\? true/);
   assert.doesNotMatch(source, /appVersion = '1\.0\.0'/);
   assert.ok(source.indexOf("console.error('获取版本失败:'") < source.indexOf("console.error('读取更新设置失败:'"));
+});
+
+test('测试版必须默认关闭并保存到独立更新设置，手动检查需确认下载', async () => {
+  const source = await readFile(new URL('./About.svelte', import.meta.url), 'utf8');
+  assert.match(source, /let includePrerelease = false;/);
+  assert.match(source, /settings\?\.includePrerelease \?\? false/);
+  assert.match(source, /settings\[key\] = !previous/);
+  assert.match(source, /await invoke\('save_update_settings', \{ settings \}\);\s*updateStatus = '';/);
+  assert.match(source, /else includePrerelease = previous/);
+  assert.match(source, /t\('about\.updateSettingsSaveFailed'\)/);
+  assert.match(source, /confirmBeforeDownload: true/);
+  assert.match(source, /t\('about\.includePrerelease'\)/);
 });
 
 test('关于页不应恢复 Linux 会话状态查询或 Wayland 详情卡片', async () => {
