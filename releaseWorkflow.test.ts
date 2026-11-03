@@ -118,6 +118,21 @@ test('Release workflow 缺少便携包、构建产物或附件时必须失败', 
   assert.match(source, /artifactErrorsFailBuild:\s*true/);
 });
 
+test('Windows 便携包应在独立暂存目录打包空Data并校验ZIP内容', () => {
+  const workflow = readFileSync(new URL('./.github/workflows/release.yml', import.meta.url), 'utf8');
+  const portableStep = workflow.match(/- name: Package Windows portable[\s\S]*?(?=\n\s+- name:)/)?.[0] ?? '';
+  assert.match(portableStep, /shell:\s*pwsh/);
+  assert.match(portableStep, /\.\/scripts\/package-windows-portable\.ps1 -Executable \$exe\.FullName/);
+  const script = readFileSync(new URL('./scripts/package-windows-portable.ps1', import.meta.url), 'utf8');
+  assert.match(script, /CreateDirectory\(\(Join-Path \$staging 'Data'\)\)/);
+  assert.match(script, /Copy-Item -LiteralPath \$exe\.FullName/);
+  assert.match(script, /CreateFromDirectory\(\$staging, \$temporaryArchive\)/);
+  assert.match(script, /'Data\/', 'PORTABLE_README\.txt', 'Work_Review\.exe'/);
+  assert.match(script, /Compare-Object \$expected \$entries/);
+  assert.doesNotMatch(script, /Copy-Item[^\n]*-Recurse/);
+  assert.ok(script.indexOf('Move-Item -LiteralPath $temporaryArchive') > script.indexOf('Compare-Object $expected $entries'));
+});
+
 test('macOS release 应保持 ad-hoc 签名且不导入自签证书', () => {
   const source = readFileSync(new URL('./.github/workflows/release.yml', import.meta.url), 'utf8');
 

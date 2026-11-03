@@ -214,7 +214,7 @@ export function createUpdateFlow(dependencies: UpdateFlowDependencies): RunUpdat
             title: translate(releaseInfo.prerelease ? 'updater.prereleaseTitle' : 'updater.newVersionTitle'),
             message: translate(releaseInfo.prerelease ? 'updater.prereleaseManualMessage' : 'updater.openReleaseMessage', {
               version: releaseInfo.latestVersion,
-            }),
+            }) + (releaseInfo.source === 'portable-release-api' ? `\n\n${translate('updater.portableUpdateHint')}` : ''),
             confirmText: translate('updater.openRelease'),
             cancelText: translate('updater.later'),
             tone: releaseInfo.prerelease ? 'warning' : 'info',

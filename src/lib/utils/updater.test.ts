@@ -234,6 +234,33 @@ test('发现新版本但当前发布未准备好在线更新时不应继续安�
   );
 });
 
+test('Windows 便携版只打开发布页并提示保留Data，测试版仍需风险确认', async () => {
+  for (const prerelease of [false, true]) {
+    for (const confirmed of [false, true]) {
+      const release = releaseInfo({
+        autoUpdateReady: false,
+        source: 'portable-release-api',
+        prerelease,
+      });
+      const harness = createHarness({
+        checkedRelease: release,
+        platform: 'windows',
+        confirmResults: [confirmed],
+      });
+      await createUpdateFlow(harness.dependencies)();
+      assert.match(String(harness.confirmations[0]?.message), /updater\.portableUpdateHint/);
+      if (prerelease) {
+        assert.match(String(harness.confirmations[0]?.message), /updater\.prereleaseManualMessage/);
+        assert.equal(harness.confirmations[0]?.tone, 'warning');
+      }
+      assert.deepEqual(harness.opened, confirmed ? [release.releaseUrl] : []);
+      assert.equal(harness.relaunchCount, 0);
+      assert.ok(harness.commands.every(({ command }) =>
+        command !== 'download_and_install_github_update' && command !== 'quit_app_for_update'));
+    }
+  }
+});
+
 test('无更新时应在成功检查后记录时间并支持静默状态', async () => {
   const harness = createHarness({
     checkedRelease: releaseInfo({ available: false, autoUpdateReady: false }),

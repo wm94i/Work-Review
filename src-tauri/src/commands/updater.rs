@@ -493,6 +493,15 @@ pub async fn quit_app_for_update(app: AppHandle) -> Result<(), AppError> {
     Ok(())
 }
 
+fn ensure_installer_update_allowed(portable_mode: bool) -> Result<(), AppError> {
+    if portable_mode {
+        return Err(AppError::Config(
+            "便携模式不运行安装版更新器，请从发布页下载新版便携 ZIP，完全退出后替换 EXE 并保留 Data 目录".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// 正式版优先检查安装清单；测试版需本机启用，并按 SemVer 选择已发布的候选。
 #[tauri::command]
 pub async fn check_github_update(
@@ -505,7 +514,9 @@ pub async fn check_github_update(
         .data_dir
         .clone();
     let settings = load_update_settings_from_dir(&data_dir)?;
-    if !settings.include_prerelease {
+    let portable_mode = crate::data_dir::is_portable_mode()?;
+    let installer_allowed = ensure_installer_update_allowed(portable_mode).is_ok();
+    if installer_allowed && !settings.include_prerelease {
         if let Some(update_info) = check_installable_update(&app, None, false).await {
             return Ok(update_info);
         }
@@ -539,7 +550,7 @@ pub async fn check_github_update(
         settings.include_prerelease,
         None,
     );
-    if available {
+    if available && installer_allowed {
         if let Some(mut update_info) =
             check_installable_update(&app, Some(&latest_version), settings.include_prerelease).await
         {
@@ -558,7 +569,14 @@ pub async fn check_github_update(
         auto_update_ready: false,
         release_url: release.html_url.clone(),
         body: release.body.clone(),
-        source: Some("github-release-api".to_string()),
+        source: Some(
+            if portable_mode {
+                "portable-release-api"
+            } else {
+                "github-release-api"
+            }
+            .to_string(),
+        ),
     })
 }
 
@@ -569,6 +587,7 @@ pub async fn download_and_install_github_update(
     state: State<'_, Arc<Mutex<AppState>>>,
     expected_version: Option<String>,
 ) -> Result<GithubUpdateInstallResult, AppError> {
+    ensure_installer_update_allowed(crate::data_dir::is_portable_mode()?)?;
     let data_dir = state
         .lock()
         .map_err(|e| AppError::Unknown(e.to_string()))?
@@ -838,6 +857,16 @@ pub async fn download_and_install_github_update(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn 便携模式不得运行安装版更新器而普通安装不受影响() {
+        let error = ensure_installer_update_allowed(true)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("ZIP"));
+        assert!(error.contains("Data"));
+        assert!(ensure_installer_update_allowed(false).is_ok());
+    }
 
     #[test]
     fn 确认版本后更新清单必须固定到对应tag而非latest() {

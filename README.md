@@ -222,6 +222,14 @@ Supported providers: Ollama (local) / LM Studio (local) / OpenAI compatible / De
 
 **Windows:** Depends on Microsoft Edge WebView2 Runtime.
 
+**Windows portable mode (Unreleased, #182):**
+- Future portable ZIPs include an empty `Data` folder. When it exists beside the EXE, the database, configuration, screenshots and update settings stay there, taking priority over this PC's saved location without adding a settings toggle. Without it, existing storage behavior is unchanged.
+- No data is imported automatically. Back up and exit completely before copying your full data directory into `Data`; move the EXE and `Data` together. An unreadable or unwritable folder stops startup with an error instead of silently falling back.
+- To update, download the portable ZIP, exit, replace the EXE and preserve `Data`; do not run the installer. External data locations cannot be selected in portable mode. After exiting and backing up, moving `Data` away restores this PC's normal data location.
+- WebView2 cache, autostart registration and user-selected external export paths remain system-managed. `Data` may contain API keys: never share it publicly.
+
+**Published `v1.1.4-rc.1` and earlier releases do not include this support.**
+
 > **Windows 11 Smart App Control**: If Windows shows "Smart App Control blocked this app from running", it's because Work Review is signed with a self-signed certificate (not a commercial EV certificate). You can turn off Smart App Control in "Windows Security → App & browser control → Smart App Control". See [#139](https://github.com/wm94i/Work-Review/issues/139).
 
 **Linux:** Screenshots and window tracking depend on the current session type and toolchain. <details><summary>Dependency details</summary>

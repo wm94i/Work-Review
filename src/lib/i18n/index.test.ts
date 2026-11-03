@@ -355,7 +355,7 @@ test('四语言词典的叶路径、类型与占位符应完全一致', async ()
   assert.ok(firstDictionary);
   const expected = collectLeafSignatures(firstDictionary).sort(byPath);
 
-  assert.equal(expected.length, 1_338);
+  assert.equal(expected.length, 1_339);
   for (let index = 1; index < dictionaries.length; index += 1) {
     const dictionary = dictionaries[index];
     assert.ok(dictionary);

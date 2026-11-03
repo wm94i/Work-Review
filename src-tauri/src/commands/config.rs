@@ -187,10 +187,12 @@ fn restore_migration_entries(
     backup_dir: &Path,
     moved_entries: &[String],
     installed_entries: &[String],
-) {
+) -> Result<(), AppError> {
+    let mut restored = true;
     for entry_name in installed_entries.iter().rev() {
         if let Err(error) = remove_migration_path(&target_dir.join(entry_name)) {
             log::error!("回滚迁移新条目 {} 失败: {error}", entry_name);
+            restored = false;
         }
     }
     for entry_name in moved_entries.iter().rev() {
@@ -200,42 +202,52 @@ fn restore_migration_entries(
         }
         if let Err(error) = std::fs::rename(&backup_path, target_dir.join(entry_name)) {
             log::error!("恢复迁移旧条目 {} 失败: {error}", entry_name);
+            restored = false;
         }
     }
+    // 只允许删除空备份目录，回滚不完整时绝不能递归清理剩余的旧数据。
+    if !restored || std::fs::remove_dir(backup_dir).is_err() {
+        return Err(AppError::Config(format!(
+            "未能完整回滚，原目标数据的备份保留在 {}，请勿删除该目录",
+            backup_dir.display()
+        )));
+    }
+    Ok(())
 }
 
 fn commit_migration_stage(stage_dir: &Path, target_dir: &Path) -> Result<(), AppError> {
     let backup_dir = migration_sibling_path(target_dir, "migration-backup")?;
     std::fs::create_dir_all(&backup_dir)?;
     let mut moved_entries = Vec::new();
-
-    for entry_name in migration_entry_names() {
-        let source = target_dir.join(entry_name);
-        if !source.exists() {
-            continue;
-        }
-        if let Err(error) = std::fs::rename(&source, backup_dir.join(entry_name)) {
-            restore_migration_entries(target_dir, &backup_dir, &moved_entries, &[]);
-            let _ = remove_migration_path(&backup_dir);
-            let _ = remove_migration_path(stage_dir);
-            return Err(error.into());
-        }
-        moved_entries.push(entry_name.to_string());
-    }
-
     let mut installed_entries = Vec::new();
-    for entry_name in migration_entry_names() {
-        let source = stage_dir.join(entry_name);
-        if !source.exists() {
-            continue;
+
+    let committed: Result<(), AppError> = (|| {
+        for entry_name in migration_entry_names() {
+            let source = target_dir.join(entry_name);
+            if source.exists() {
+                std::fs::rename(&source, backup_dir.join(entry_name))?;
+                moved_entries.push(entry_name.to_string());
+            }
         }
-        if let Err(error) = std::fs::rename(&source, target_dir.join(entry_name)) {
+        for entry_name in migration_entry_names() {
+            let source = stage_dir.join(entry_name);
+            if source.exists() {
+                std::fs::rename(&source, target_dir.join(entry_name))?;
+                installed_entries.push(entry_name.to_string());
+            }
+        }
+        Ok(())
+    })();
+    if let Err(error) = committed {
+        let restored =
             restore_migration_entries(target_dir, &backup_dir, &moved_entries, &installed_entries);
-            let _ = remove_migration_path(&backup_dir);
-            let _ = remove_migration_path(stage_dir);
-            return Err(error.into());
+        let _ = remove_migration_path(stage_dir);
+        if let Err(rollback_error) = restored {
+            return Err(AppError::Config(format!(
+                "迁移失败：{error}；{rollback_error}"
+            )));
         }
-        installed_entries.push(entry_name.to_string());
+        return Err(error);
     }
 
     if let Err(error) = remove_migration_path(&backup_dir) {
@@ -331,6 +343,7 @@ pub async fn change_data_dir(
     }
 
     let requested_path = to_absolute_path(Path::new(requested_dir))?;
+    crate::data_dir::validate_data_dir_target(&requested_path)?;
     let current_dir = {
         let state = state.lock().map_err(|e| AppError::Unknown(e.to_string()))?;
         state.data_dir.canonicalize()?
@@ -482,7 +495,7 @@ pub async fn cleanup_old_data_dir(
 mod tests {
     use super::{
         commit_migration_stage, ensure_target_dir_ready, migration_sibling_path,
-        resolve_migration_target,
+        resolve_migration_target, restore_migration_entries,
     };
 
     #[test]
@@ -523,6 +536,40 @@ mod tests {
             assert!(resolve_migration_target(&current, &root.join("parent-alias")).is_err());
         }
 
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn 回滚受阻时必须保留备份并报告恢复路径() {
+        let root =
+            std::env::temp_dir().join(format!("migration-rollback-{}", uuid::Uuid::new_v4()));
+        let target = root.join("target");
+        let backup = root.join("backup");
+        std::fs::create_dir_all(target.join("config.json")).unwrap();
+        std::fs::create_dir_all(&backup).unwrap();
+        std::fs::write(backup.join("config.json"), b"irreplaceable-old-config").unwrap();
+        std::fs::write(target.join("config.json/blocker"), b"user-file").unwrap();
+        let error =
+            restore_migration_entries(&target, &backup, &["config.json".into()], &[]).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains(&backup.to_string_lossy().to_string()));
+        assert_eq!(
+            std::fs::read(backup.join("config.json")).unwrap(),
+            b"irreplaceable-old-config"
+        );
+        assert_eq!(
+            std::fs::read(target.join("config.json/blocker")).unwrap(),
+            b"user-file"
+        );
+
+        std::fs::remove_dir_all(target.join("config.json")).unwrap();
+        restore_migration_entries(&target, &backup, &["config.json".into()], &[]).unwrap();
+        assert!(!backup.exists());
+        assert_eq!(
+            std::fs::read(target.join("config.json")).unwrap(),
+            b"irreplaceable-old-config"
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 

@@ -17,6 +17,7 @@ mod avatar_proactive;
 mod bot_common;
 mod commands;
 mod config_sync;
+mod data_dir;
 mod dingtalk_bot;
 mod feishu_bot;
 mod idle_detector;
@@ -33,9 +34,10 @@ mod telegram_bot;
 mod wecom_aibot;
 mod wecom_bot;
 
+pub(crate) use data_dir::{default_data_dir, save_data_dir_preference};
 use once_cell::sync::OnceCell;
 use screenshot::{ScreenshotResult, ScreenshotService};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -444,11 +446,6 @@ pub struct AppState {
 pub(crate) struct AppLifecycleState {
     suppress_next_exit: bool,
     explicit_quit_requested: bool,
-}
-
-#[derive(Serialize, Deserialize)]
-struct DataDirPreference {
-    data_dir: String,
 }
 
 fn should_prevent_exit(suppress_next_exit: bool, explicit_quit_requested: bool) -> bool {
@@ -876,117 +873,6 @@ fn should_emit_avatar_backlog_nudge(
 
     runtime.last_backlog_nudge_at_ms = now_ms;
     Some(count)
-}
-
-pub(crate) fn default_data_dir() -> PathBuf {
-    dirs::data_dir()
-        .map(|d| d.join("work-review"))
-        .unwrap_or_else(|| PathBuf::from("./data"))
-}
-
-fn data_dir_preference_path() -> PathBuf {
-    dirs::config_dir()
-        .map(|d| d.join("work-review").join("data-location.json"))
-        .unwrap_or_else(|| PathBuf::from("./work-review-data-location.json"))
-}
-
-fn load_data_dir_preference() -> Option<PathBuf> {
-    let path = data_dir_preference_path();
-    let content = std::fs::read_to_string(path).ok()?;
-    let preference: DataDirPreference = serde_json::from_str(&content).ok()?;
-    let data_dir = preference.data_dir.trim();
-    if data_dir.is_empty() {
-        None
-    } else {
-        Some(PathBuf::from(data_dir))
-    }
-}
-
-pub(crate) fn save_data_dir_preference(data_dir: &Path) -> std::io::Result<()> {
-    let default_dir = default_data_dir();
-    let preference_path = data_dir_preference_path();
-
-    if data_dir == default_dir {
-        if preference_path.exists() {
-            std::fs::remove_file(preference_path)?;
-        }
-        return Ok(());
-    }
-
-    if let Some(parent) = preference_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
-    let content = serde_json::to_string_pretty(&DataDirPreference {
-        data_dir: data_dir.to_string_lossy().to_string(),
-    })
-    .map_err(std::io::Error::other)?;
-
-    std::fs::write(preference_path, content)?;
-    Ok(())
-}
-
-fn ensure_data_dir(path: &Path) -> std::io::Result<PathBuf> {
-    std::fs::create_dir_all(path)?;
-    Ok(path.canonicalize().unwrap_or_else(|_| path.to_path_buf()))
-}
-
-/// 获取数据目录
-fn resolve_data_dir() -> PathBuf {
-    let default_dir = default_data_dir();
-    let preferred_dir = load_data_dir_preference().unwrap_or_else(|| default_dir.clone());
-
-    match ensure_data_dir(&preferred_dir) {
-        Ok(dir) => {
-            migrate_legacy_data_dir(&dir);
-            dir
-        }
-        Err(error) => {
-            log::warn!("创建数据目录失败，回退默认目录: {error}");
-
-            if preferred_dir != default_dir {
-                if let Ok(dir) = ensure_data_dir(&default_dir) {
-                    migrate_legacy_data_dir(&dir);
-                    let _ = save_data_dir_preference(&dir);
-                    return dir;
-                }
-            }
-
-            let fallback_dir = PathBuf::from("./data");
-            if let Err(fallback_error) = std::fs::create_dir_all(&fallback_dir) {
-                log::warn!("创建兜底数据目录失败: {fallback_error}");
-            }
-            migrate_legacy_data_dir(&fallback_dir);
-            fallback_dir
-        }
-    }
-}
-
-fn migrate_legacy_data_dir(target_dir: &PathBuf) {
-    let legacy_dir = match std::env::current_exe()
-        .ok()
-        .and_then(|path| path.parent().map(|parent| parent.join("data")))
-    {
-        Some(path) => path,
-        None => return,
-    };
-
-    if legacy_dir == *target_dir || !legacy_dir.exists() {
-        return;
-    }
-
-    let target_has_data = target_dir.join("config.json").exists()
-        || target_dir.join("workreview.db").exists()
-        || target_dir.join("screenshots").exists();
-    if target_has_data {
-        return;
-    }
-
-    if let Err(error) = copy_dir_contents(&legacy_dir, target_dir, false) {
-        log::warn!("迁移旧版数据目录失败: {error}");
-    } else {
-        log::info!("已将旧版数据目录迁移到稳定目录: {target_dir:?}");
-    }
 }
 
 pub(crate) fn copy_dir_contents(
@@ -4313,7 +4199,13 @@ async fn main() {
     log::info!("work回顾助手启动中...");
 
     // 获取数据目录
-    let data_dir = resolve_data_dir();
+    let data_dir = match data_dir::resolve_data_dir() {
+        Ok(directory) => directory,
+        Err(error) => {
+            data_dir::report_startup_error(&error);
+            std::process::exit(1);
+        }
+    };
     log::info!("数据目录: {data_dir:?}");
 
     // 加载配置
