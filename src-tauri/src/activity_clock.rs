@@ -97,6 +97,16 @@ fn next_power_state(previous: u64, event: PowerEvent) -> u64 {
     (previous.wrapping_add(POWER_FLAGS + 1) & !POWER_FLAGS) | next_flags
 }
 
+#[cfg(any(target_os = "windows", test))]
+fn needs_display_recovery(previous: u64, next: u64) -> bool {
+    previous != next && next & POWER_FLAGS == 0
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn display_is_available() -> bool {
+    power_snapshot() & POWER_FLAGS == 0
+}
+
 #[cfg(target_os = "windows")]
 fn power_snapshot() -> u64 {
     windows::POWER_STATE.load(std::sync::atomic::Ordering::Acquire)
@@ -122,7 +132,7 @@ pub(crate) use windows::PowerMonitor;
 
 #[cfg(target_os = "windows")]
 mod windows {
-    use super::{next_power_state, PowerEvent};
+    use super::{needs_display_recovery, next_power_state, PowerEvent};
     use std::sync::atomic::{AtomicU64, Ordering};
     use winapi::ctypes::c_void;
     use winapi::shared::guiddef::IsEqualGUID;
@@ -179,9 +189,17 @@ mod windows {
             _ => None,
         };
         if let Some(event) = event {
-            let _ = POWER_STATE.fetch_update(Ordering::AcqRel, Ordering::Acquire, |previous| {
-                Some(next_power_state(previous, event))
-            });
+            if let Ok(previous) =
+                POWER_STATE.fetch_update(Ordering::AcqRel, Ordering::Acquire, |previous| {
+                    Some(next_power_state(previous, event))
+                })
+            {
+                if needs_display_recovery(previous, next_power_state(previous, event)) {
+                    if let Some(app) = crate::APP_HANDLE.get() {
+                        crate::avatar_transparency::schedule(app);
+                    }
+                }
+            }
         }
         0
     }
@@ -357,6 +375,53 @@ mod tests {
         assert_eq!(resumed & POWER_FLAGS, 0);
         let base = base();
         assert!(!sample(base, 1, resumed).follows(base));
+    }
+
+    #[test]
+    fn 亮屏或仅收到恢复通知时应恢复透明合成() {
+        let off = next_power_state(0, PowerEvent::DisplayOff(true));
+        let on = next_power_state(off, PowerEvent::DisplayOff(false));
+        assert!(needs_display_recovery(off, on));
+        assert!(needs_display_recovery(
+            0,
+            next_power_state(0, PowerEvent::Resume)
+        ));
+        let suspended = next_power_state(0, PowerEvent::Suspend);
+        assert!(needs_display_recovery(
+            suspended,
+            next_power_state(suspended, PowerEvent::Resume)
+        ));
+    }
+
+    #[test]
+    fn 熄屏待机变暗或重复亮屏不触发透明恢复() {
+        for event in [
+            PowerEvent::Suspend,
+            PowerEvent::DisplayOff(true),
+            PowerEvent::DisplayOff(false),
+        ] {
+            assert!(!needs_display_recovery(0, next_power_state(0, event)));
+        }
+        let off = next_power_state(0, PowerEvent::DisplayOff(true));
+        let suspended = next_power_state(off, PowerEvent::Suspend);
+        let resumed_in_background = next_power_state(suspended, PowerEvent::Resume);
+        assert!(!needs_display_recovery(suspended, resumed_in_background));
+        let on = next_power_state(resumed_in_background, PowerEvent::DisplayOff(false));
+        assert!(needs_display_recovery(resumed_in_background, on));
+        assert!(!needs_display_recovery(
+            on,
+            next_power_state(on, PowerEvent::DisplayOff(false))
+        ));
+    }
+
+    #[test]
+    fn 先亮屏后解除待机也只在显示可用时恢复透明() {
+        let off = next_power_state(0, PowerEvent::DisplayOff(true));
+        let suspended = next_power_state(off, PowerEvent::Suspend);
+        let display_on = next_power_state(suspended, PowerEvent::DisplayOff(false));
+        assert!(!needs_display_recovery(suspended, display_on));
+        let resumed = next_power_state(display_on, PowerEvent::Resume);
+        assert!(needs_display_recovery(display_on, resumed));
     }
 
     #[test]

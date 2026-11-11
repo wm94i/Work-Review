@@ -14,6 +14,8 @@ mod avatar_followup;
 #[allow(dead_code)]
 mod avatar_input;
 mod avatar_proactive;
+#[cfg(target_os = "windows")]
+mod avatar_transparency;
 mod bot_common;
 mod commands;
 mod config_sync;
@@ -52,7 +54,7 @@ use work_review_core::config::{
 use work_review_core::database::Database;
 use work_review_core::privacy::PrivacyFilter;
 
-// 全局 AppHandle，用于在 macOS Dock 点击时恢复窗口
+// 全局 AppHandle，供原生系统回调恢复窗口。
 static APP_HANDLE: OnceCell<AppHandle> = OnceCell::new();
 const MAIN_WINDOW_LABEL: &str = "main";
 const AUTOSTART_LAUNCH_ARG: &str = "--autostart";
@@ -4723,6 +4725,9 @@ async fn main() {
                 })
                 .build(app)?;
 
+            // 先发布句柄，再注册后台电源通知，避免恢复事件找不到应用。
+            let _ = APP_HANDLE.set(app.handle().clone());
+
             // 启动后台截屏任务
             tauri::async_runtime::spawn(async move {
                 background_screenshot_task(state_clone, screenshot_app_handle).await;
@@ -4753,9 +4758,6 @@ async fn main() {
             });
 
             sync_effective_dock_visibility(app.handle());
-
-            // 保存 AppHandle 到全局变量，用于从 macOS Dock 点击恢复窗口
-            let _ = APP_HANDLE.set(app.handle().clone());
 
             // 注: macOS Dock 点击恢复窗口通过系统托盘 LeftClick 事件处理
             // 用户需要点击状态栏的系统托盘图标来恢复窗口

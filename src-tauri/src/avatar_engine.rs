@@ -475,6 +475,8 @@ pub fn sync_avatar_window(
             }
             let _ = window.unminimize();
             let _ = window.show();
+            #[cfg(target_os = "windows")]
+            crate::avatar_transparency::schedule(app);
         }
     } else if let Some(window) = app.get_webview_window(AVATAR_WINDOW_LABEL) {
         let _ = window.hide();
