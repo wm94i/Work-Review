@@ -2880,6 +2880,8 @@ impl Database {
 
     /// 列出所有可用日报日期
     pub fn list_report_dates(&self, limit: usize) -> Result<Vec<String>> {
+        let limit = i64::try_from(limit)
+            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
         let conn = self.conn.lock().map_err(|e| {
             AppError::Database(rusqlite::Error::InvalidParameterName(e.to_string()))
         })?;
@@ -5119,6 +5121,131 @@ mod tests {
         };
         db.init_tables().expect("初始化内存数据库失败");
         db
+    }
+
+    #[test]
+    fn 内置sqlite必须包含wal页大小校验安全补丁() {
+        assert!(
+            rusqlite::version_number() >= 3_054_001,
+            "SQLite {}",
+            rusqlite::version()
+        );
+    }
+
+    #[test]
+    fn 日报日期限制应保留排序去重和溢出拒绝() {
+        let db = in_memory_db();
+        db.conn
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "INSERT INTO daily_reports_localized(date,locale,content,ai_mode,created_at) VALUES
+             ('2026-11-01','zh-CN','report','local',1),
+             ('2026-11-02','zh-CN','report','local',2),
+             ('2026-11-02','en','report','local',2);",
+            )
+            .unwrap();
+        assert!(db.list_report_dates(0).unwrap().is_empty());
+        assert_eq!(db.list_report_dates(1).unwrap(), ["2026-11-02"]);
+        assert_eq!(
+            db.list_report_dates(10).unwrap(),
+            ["2026-11-02", "2026-11-01"]
+        );
+        if usize::BITS == 64 {
+            assert!(db.list_report_dates(usize::MAX).is_err());
+        }
+    }
+
+    #[test]
+    fn sqlite升级应兼容旧数据库与已提交wal并保留迁移备份() {
+        for with_wal in [false, true] {
+            let dir = temp_db_path("sqlite-upgrade").with_extension("");
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("legacy.db");
+            std::fs::write(
+                &path,
+                include_bytes!("../tests/fixtures/sqlite-3.44.0.sqlite"),
+            )
+            .unwrap();
+            if with_wal {
+                std::fs::write(
+                    dir.join("legacy.db-wal"),
+                    include_bytes!("../tests/fixtures/sqlite-3.44.0.sqlite-wal"),
+                )
+                .unwrap();
+            }
+            let expected_count = if with_wal { 2 } else { 1 };
+            let expected_duration = if with_wal { 75 } else { 30 };
+            let db = Database::new(&path).unwrap();
+            let activities = db.get_activities_in_range(None, None, 10).unwrap();
+            assert_eq!(activities.len(), expected_count);
+            assert_eq!(
+                activities.iter().map(|row| row.duration).sum::<i64>(),
+                expected_duration
+            );
+            let old = db.get_activity_by_id(1).unwrap().unwrap();
+            assert_eq!(old.app_name, "Legacy Editor");
+            assert_eq!(old.screenshot_path, "screenshots/legacy.png");
+            assert!(old.browser_url.is_none() && old.screenshot_url.is_none());
+            assert_eq!(
+                db.get_report("2026-11-01", None).unwrap().unwrap().content,
+                "旧版合成日报"
+            );
+            if with_wal {
+                assert_eq!(
+                    db.get_report("2026-11-02", None).unwrap().unwrap().content,
+                    "WAL 合成日报"
+                );
+            }
+            let date = chrono::DateTime::from_timestamp(old.timestamp, 0)
+                .unwrap()
+                .with_timezone(&chrono::Local)
+                .format("%Y-%m-%d")
+                .to_string();
+            assert_eq!(
+                db.get_daily_stats(&date).unwrap().total_duration,
+                expected_duration
+            );
+            db.insert_activity(&Activity {
+                id: None,
+                timestamp: old.timestamp + 300,
+                duration: 5,
+                window_title: "Written after SQLite upgrade".to_string(),
+                ..old
+            })
+            .unwrap();
+            let backup_path = dir.join("backup.db");
+            db.backup_to(&backup_path).unwrap();
+            drop(db);
+            for candidate in [&path, &backup_path] {
+                let reopened = Database::new(candidate).unwrap();
+                assert_eq!(
+                    reopened
+                        .get_activities_in_range(None, None, 10)
+                        .unwrap()
+                        .len(),
+                    expected_count + 1
+                );
+                assert_eq!(
+                    reopened.get_daily_stats(&date).unwrap().total_duration,
+                    expected_duration + 5
+                );
+                assert_eq!(
+                    reopened.list_report_dates(10).unwrap().len(),
+                    expected_count
+                );
+                assert_eq!(
+                    reopened
+                        .conn
+                        .lock()
+                        .unwrap()
+                        .query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))
+                        .unwrap(),
+                    "ok"
+                );
+            }
+            std::fs::remove_dir_all(dir).unwrap();
+        }
     }
 
     #[test]
