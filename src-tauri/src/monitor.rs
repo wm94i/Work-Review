@@ -3640,7 +3640,16 @@ fn get_browser_url_via_system_events(process_name: &str) -> Option<String> {
 }
 
 #[cfg(target_os = "macos")]
-static MACOS_BROWSER_URL_CACHE: Lazy<Mutex<HashMap<(String, String), (Instant, Option<String>)>>> =
+type MacosBrowserUrlCacheKey = (String, String);
+
+#[cfg(target_os = "macos")]
+type MacosBrowserUrlCacheEntry = (Instant, Option<String>);
+
+#[cfg(target_os = "macos")]
+type MacosBrowserUrlCache = HashMap<MacosBrowserUrlCacheKey, MacosBrowserUrlCacheEntry>;
+
+#[cfg(target_os = "macos")]
+static MACOS_BROWSER_URL_CACHE: Lazy<Mutex<MacosBrowserUrlCache>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
 #[cfg(target_os = "macos")]
@@ -3936,6 +3945,8 @@ fn get_active_window_linux_x11_native() -> Result<ActiveWindow> {
     use std::os::raw::{c_int, c_long, c_uchar, c_ulong, c_void};
     use x11::xlib;
 
+    const C_LONG_SIZE: usize = std::mem::size_of::<c_long>();
+
     unsafe {
         let display = xlib::XOpenDisplay(std::ptr::null());
         if display.is_null() {
@@ -3997,7 +4008,7 @@ fn get_active_window_linux_x11_native() -> Result<ActiveWindow> {
             let byte_len = match actual_format {
                 8 => nitems as usize,
                 16 => (nitems as usize) * 2,
-                32 => (nitems as usize) * std::mem::size_of::<c_long>(),
+                32 => (nitems as usize) * C_LONG_SIZE,
                 _ => 0,
             };
             let bytes = std::slice::from_raw_parts(data, byte_len).to_vec();
@@ -4007,11 +4018,11 @@ fn get_active_window_linux_x11_native() -> Result<ActiveWindow> {
 
         let (_, fmt, bytes) = read_window_prop(root, atom_active, xlib::XA_WINDOW, 1)
             .ok_or_else(|| AppError::Unknown("X11 _NET_ACTIVE_WINDOW 不可用".to_string()))?;
-        if fmt != 32 || bytes.len() < std::mem::size_of::<c_long>() {
+        if fmt != 32 || bytes.len() < C_LONG_SIZE {
             return Err(AppError::Unknown("X11 活动窗口 ID 格式异常".to_string()));
         }
-        let mut raw_long = [0u8; std::mem::size_of::<c_long>()];
-        raw_long.copy_from_slice(&bytes[..raw_long.len()]);
+        let mut raw_long = [0u8; C_LONG_SIZE];
+        raw_long.copy_from_slice(&bytes[..C_LONG_SIZE]);
         let active_win = c_long::from_ne_bytes(raw_long) as xlib::Window;
         if active_win == 0 {
             return Err(AppError::Unknown("没有活动窗口".to_string()));
@@ -4036,9 +4047,9 @@ fn get_active_window_linux_x11_native() -> Result<ActiveWindow> {
         // PID：读 _NET_WM_PID
         let pid = read_window_prop(active_win, atom_net_wm_pid, xlib::XA_CARDINAL, 1).and_then(
             |(_, pid_fmt, pid_bytes)| {
-                if pid_fmt == 32 && pid_bytes.len() >= std::mem::size_of::<c_long>() {
-                    let mut buf = [0u8; std::mem::size_of::<c_long>()];
-                    buf.copy_from_slice(&pid_bytes[..buf.len()]);
+                if pid_fmt == 32 && pid_bytes.len() >= C_LONG_SIZE {
+                    let mut buf = [0u8; C_LONG_SIZE];
+                    buf.copy_from_slice(&pid_bytes[..C_LONG_SIZE]);
                     let val = c_long::from_ne_bytes(buf);
                     u32::try_from(val).ok().filter(|&p| p > 0)
                 } else {
@@ -4077,7 +4088,8 @@ fn get_active_window_linux_x11_native() -> Result<ActiveWindow> {
                     parts
                         .get(1)
                         .or_else(|| parts.first())
-                        .map(|s| s.to_string())
+                        .copied()
+                        .map(str::to_string)
                 })
                 .unwrap_or_else(|| "Unknown".to_string());
             (class_name, None)

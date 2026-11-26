@@ -49,6 +49,26 @@ test('Linux 发布构建不应编译仅供 macOS 或测试使用的符号', () =
   );
 });
 
+test('Linux X11 属性解码与 macOS URL 缓存应满足跨平台零警告门禁', () => {
+  const monitor = readSource('./src-tauri/src/monitor.rs');
+
+  assert.match(
+    monitor,
+    /const C_LONG_SIZE: usize = std::mem::size_of::<c_long>\(\);/,
+    'Linux X11 属性解码应复用 C_LONG_SIZE 常量，避免 copy_from_slice 自借用 E0502',
+  );
+  assert.doesNotMatch(
+    monitor,
+    /\b(?:raw_long|buf)\.copy_from_slice\(&\w+\[\.\.(?:raw_long|buf)\.len\(\)\]\)/,
+    'Linux X11 copy_from_slice 不得在可变借用期间再次不可变借用同一数组',
+  );
+  assert.match(
+    monitor,
+    /type MacosBrowserUrlCache = HashMap<MacosBrowserUrlCacheKey, MacosBrowserUrlCacheEntry>;[\s\S]*?static MACOS_BROWSER_URL_CACHE: Lazy<Mutex<MacosBrowserUrlCache>>/,
+    'macOS 浏览器 URL 缓存静态量应通过类型别名拆解，避免触发 clippy::type_complexity',
+  );
+});
+
 test('Windows 发布构建应保留明确类型并隔离 Unix 测试依赖', () => {
   const monitor = readSource('./src-tauri/src/monitor.rs');
   const ocr = readSource('./src-tauri/src/ocr.rs');
