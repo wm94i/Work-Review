@@ -1,8 +1,7 @@
 <script lang="ts">
-  import { link, location } from 'svelte-spa-router';
+  import { link, router } from 'svelte-spa-router';
   import { invoke } from '@tauri-apps/api/core';
   import { emitTo } from '@tauri-apps/api/event';
-  import { createEventDispatcher } from 'svelte';
   import {
     getLocaleLabel,
     locale,
@@ -26,13 +25,22 @@
     fullLabelKey: string;
   }
 
-  export let isRecording = true;
-  export let isPaused = false;
-  export let theme: Theme = 'system';
-  
-  const dispatch = createEventDispatcher<{ themeChange: Theme }>();
-  let localeMenuOpen = false;
-  let localeMenuContainer: HTMLElement | null = null;
+  interface Props {
+    isRecording?: boolean;
+    isPaused?: boolean;
+    theme?: Theme;
+    onThemeChange?: (nextTheme: Theme) => void;
+  }
+
+  let {
+    isRecording = true,
+    isPaused = false,
+    theme = 'system',
+    onThemeChange,
+  }: Props = $props();
+
+  let localeMenuOpen = $state(false);
+  let localeMenuContainer = $state<HTMLElement | null>(null);
 
   const navItems: NavItem[] = [
     { path: '/', labelKey: 'sidebar.nav.overview', icon: 'home' },
@@ -43,28 +51,30 @@
     { path: '/about', labelKey: 'sidebar.nav.about', icon: 'info' },
   ];
 
-  $: currentLocale = $locale;
-  $: translate = (key: string, params: InterpolationParams = {}) => {
-    currentLocale;
+  const currentLocale = $derived($locale);
+  const translate = $derived((key: string, params: InterpolationParams = {}) => {
+    void currentLocale;
     return t(key, params);
-  };
+  });
   const localeOptionsBase: LocaleOption[] = [
     { value: 'zh-CN', label: 'ZH', fullLabelKey: 'sidebar.localeNames.zhCN' },
     { value: 'en', label: 'EN', fullLabelKey: 'sidebar.localeNames.en' },
     { value: 'zh-TW', label: 'TW', fullLabelKey: 'sidebar.localeNames.zhTW' },
     { value: 'ar', label: 'AR', fullLabelKey: 'sidebar.localeNames.ar' },
   ];
-  $: localeOptions = localeOptionsBase.map((option) => ({
-    ...option,
-    fullLabel: translate(option.fullLabelKey),
-  }));
-  $: currentLocaleLabel = getLocaleLabel(currentLocale);
+  const localeOptions = $derived(
+    localeOptionsBase.map((option) => ({
+      ...option,
+      fullLabel: translate(option.fullLabelKey),
+    })),
+  );
+  const currentLocaleLabel = $derived(getLocaleLabel(currentLocale));
 
   function cycleTheme(): void {
     const themes: Theme[] = ['system', 'light', 'dark'];
     const currentIndex = themes.indexOf(theme);
     const nextTheme = themes[(currentIndex + 1) % themes.length] ?? 'system';
-    dispatch('themeChange', nextTheme);
+    onThemeChange?.(nextTheme);
   }
 
   function toggleLocaleMenu(): void {
@@ -99,7 +109,7 @@
     }
   }
 
-  async function toggleRecording() {
+  async function toggleRecording(): Promise<void> {
     try {
       if (isPaused) {
         await invoke('resume_recording');
@@ -111,18 +121,21 @@
     }
   }
 
-  $: activeStates = navItems.reduce<Record<string, boolean>>((acc, item) => {
-    const loc = $location || '/';
-    if (item.path === '/') {
-      acc[item.path] = loc === '/';
-    } else {
-      acc[item.path] = loc === item.path || loc.startsWith(item.path + '/');
-    }
-    return acc;
-  }, {});
+  // Runes 模式下的 $derived 原生追踪 svelte-spa-router v5 的 router.location（$state/$derived getter）
+  const activeStates = $derived(
+    navItems.reduce<Record<string, boolean>>((acc, item) => {
+      const loc = router.location || '/';
+      if (item.path === '/') {
+        acc[item.path] = loc === '/';
+      } else {
+        acc[item.path] = loc === item.path || loc.startsWith(item.path + '/');
+      }
+      return acc;
+    }, {}),
+  );
 </script>
 
-<svelte:window on:click={handleWindowClick} on:keydown={handleWindowKeydown} />
+<svelte:window onclick={handleWindowClick} onkeydown={handleWindowKeydown} />
 
 <div class="sidebar-editorial-shell h-full flex flex-col overflow-hidden">
   <div class="sidebar-top">
@@ -157,10 +170,10 @@
           </span>
         </div>
         <button
-          on:click={toggleRecording}
+          onclick={toggleRecording}
           class="sidebar-recording-toggle mt-0.5 shrink-0 px-3 py-1.5 text-[11px] font-semibold rounded-lg transition-all
-            {isPaused 
-              ? 'bg-emerald-100 text-emerald-700 hover:bg-emerald-200 dark:bg-emerald-900/40 dark:text-emerald-300' 
+            {isPaused
+              ? 'bg-emerald-100 text-emerald-700 hover:bg-emerald-200 dark:bg-emerald-900/40 dark:text-emerald-300'
               : 'bg-slate-100 text-slate-700 hover:bg-slate-200 dark:bg-[#30363d] dark:text-[#adbac7]'}"
           aria-label={isPaused ? translate('sidebar.resume') : translate('sidebar.pause')}
           title={isPaused ? translate('sidebar.resume') : translate('sidebar.pause')}
@@ -186,7 +199,7 @@
     <!-- 导航菜单 -->
     <nav class="sidebar-nav sidebar-nav-section">
       <ul class="sidebar-nav-list">
-        {#each navItems as item}
+        {#each navItems as item (item.path)}
           <li>
             <a href={item.path} use:link
               aria-label={translate(item.labelKey)}
@@ -247,7 +260,7 @@
             aria-haspopup="menu"
             aria-expanded={localeMenuOpen}
             title={translate('sidebar.localeButtonTitle')}
-            on:click={toggleLocaleMenu}
+            onclick={toggleLocaleMenu}
           >
             <svg class="sidebar-locale-compact-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
               <circle cx="12" cy="12" r="9" stroke-width="1.8" />
@@ -264,13 +277,13 @@
               class="absolute bottom-full start-0 mb-2 min-w-[148px] rounded-[var(--radius-md)] border border-slate-200/80 bg-white/96 p-1.5 shadow-xl dark:shadow-[0_12px_32px_rgba(0,0,0,0.5)] backdrop-blur dark:border-[#30363d]/80 dark:bg-[#161b22]/96"
               role="menu"
             >
-              {#each localeOptions as option}
+              {#each localeOptions as option (option.value)}
                 <button
                   type="button"
                   class="flex w-full items-center gap-2 whitespace-nowrap rounded-xl px-3 py-2 text-start text-xs font-medium transition-colors {currentLocale === option.value ? 'bg-slate-200/80 text-slate-900 dark:bg-[#30363d] dark:text-[#e6edf3]' : 'text-slate-500 hover:bg-slate-50 hover:text-slate-900 dark:text-[#adbac7] dark:hover:bg-[#21262d]/80 dark:hover:text-[#e6edf3]'}"
                   role="menuitemradio"
                   aria-checked={currentLocale === option.value}
-                  on:click={() => selectLocale(option.value)}
+                  onclick={() => selectLocale(option.value)}
                 >
                   <span class="font-semibold tracking-[0.08em] text-slate-500 dark:text-[#7d8590]">{option.label}</span>
                   <span class="text-slate-700 dark:text-[#c9d1d9]">{option.fullLabel}</span>
@@ -280,8 +293,9 @@
           {/if}
         </div>
 
-        <button on:click={cycleTheme}
+        <button onclick={cycleTheme}
           class="sidebar-footer-action"
+          aria-label={theme === 'system' ? translate('sidebar.themeTitle.system') : theme === 'light' ? translate('sidebar.themeTitle.light') : translate('sidebar.themeTitle.dark')}
           title="{theme === 'system' ? translate('sidebar.themeTitle.system') : theme === 'light' ? translate('sidebar.themeTitle.light') : translate('sidebar.themeTitle.dark')}">
           {#if theme === 'system'}
             <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z" /></svg>

@@ -126,16 +126,16 @@ impl AiProvider {
     pub fn default_model(&self) -> &'static str {
         match self {
             AiProvider::Ollama => "qwen3",
-            AiProvider::OpenAI => "gpt-6-luna",
-            AiProvider::Gemini => "gemini-3.8-flash",
+            AiProvider::OpenAI => "gpt-6.2-sol",
+            AiProvider::Gemini => "gemini-4-hydrogen",
             AiProvider::Claude => "claude-sonnet-5-5",
             AiProvider::SiliconFlow => "Qwen/Qwen3-8B",
-            AiProvider::DeepSeek => "deepseek-chat",
-            AiProvider::Qwen => "qwen-flash",
+            AiProvider::DeepSeek => "deepseek-flash",
+            AiProvider::Qwen => "qwen3.8-flash",
             AiProvider::Zhipu => "glm-5.3-flash",
-            AiProvider::Moonshot => "kimi-k2.6",
+            AiProvider::Moonshot => "kimi-k3",
             AiProvider::Doubao => "doubao-seed-evolving",
-            AiProvider::MiniMax => "MiniMax-M3",
+            AiProvider::MiniMax => "MiniMax-M3.1-Flash",
             AiProvider::OpenRouter => "openrouter/auto",
             AiProvider::Groq => "openai/gpt-oss-120b",
             AiProvider::XAI => "grok-4.7",
@@ -163,6 +163,37 @@ impl AiProvider {
                 | AiProvider::Mistral
                 | AiProvider::LmStudio
                 | AiProvider::Custom
+        )
+    }
+
+    /// 返回与 JSON 序列化一致的小写服务商标识
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            AiProvider::Ollama => "ollama",
+            AiProvider::OpenAI => "openai",
+            AiProvider::Gemini => "gemini",
+            AiProvider::Claude => "claude",
+            AiProvider::SiliconFlow => "siliconflow",
+            AiProvider::DeepSeek => "deepseek",
+            AiProvider::Qwen => "qwen",
+            AiProvider::Zhipu => "zhipu",
+            AiProvider::Moonshot => "moonshot",
+            AiProvider::Doubao => "doubao",
+            AiProvider::MiniMax => "minimax",
+            AiProvider::OpenRouter => "openrouter",
+            AiProvider::Groq => "groq",
+            AiProvider::XAI => "xai",
+            AiProvider::Mistral => "mistral",
+            AiProvider::LmStudio => "lmstudio",
+            AiProvider::Custom => "custom",
+        }
+    }
+
+    /// 是否通常需要配置 API Key（本地 Ollama / LM Studio 与自定义接口允许为空）
+    pub fn requires_api_key(&self) -> bool {
+        !matches!(
+            self,
+            AiProvider::Ollama | AiProvider::LmStudio | AiProvider::Custom
         )
     }
 }
@@ -370,6 +401,14 @@ pub struct WebsiteSemanticRule {
     pub semantic_category: String,
 }
 
+/// 浏览器 URL 无法识别时的默认隐私降级策略
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum UnknownUrlFallback {
+    Record,
+    Anonymize,
+}
+
 /// 隐私配置
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct PrivacyConfig {
@@ -385,6 +424,12 @@ pub struct PrivacyConfig {
     /// 已弃用：敏感词过滤始终启用，此字段仅保留反序列化兼容
     #[serde(default = "default_true")]
     pub filter_sensitive: bool,
+    /// 自动跳过浏览器无痕 / 隐私窗口（默认开启）
+    #[serde(default = "default_true")]
+    pub skip_private_windows: bool,
+    /// 浏览器 URL 未知时的降级策略：None 表示配置了排除域名时自动 Anonymize，否则 Record
+    #[serde(default)]
+    pub unknown_url_fallback: Option<UnknownUrlFallback>,
 
     // 兼容旧版
     #[serde(default)]
@@ -418,20 +463,33 @@ impl Default for PrivacyConfig {
             ],
             excluded_domains: vec![], // 默认无域名黑名单
             filter_sensitive: true,   // 已弃用，保留兼容
+            skip_private_windows: true,
+            unknown_url_fallback: None,
             excluded_apps: vec![],
         }
     }
 }
 
+fn normalized_app_rule_key(app_name: &str) -> String {
+    crate::categorize::normalize_display_app_name(app_name.trim())
+        .trim()
+        .to_lowercase()
+}
+
 impl PrivacyConfig {
-    /// 获取应用的隐私级别
+    /// 获取应用的隐私级别（命中多条规则或遗留 excluded_apps 时取最严级别：忽略 > 脱敏 > 完整记录）
     pub fn get_app_privacy_level(&self, app_name: &str) -> PrivacyLevel {
-        let normalized = crate::categorize::normalize_display_app_name(app_name).to_lowercase();
-        // 先检查新的规则（规范化后精确匹配 + 包含匹配）
+        let normalized = normalized_app_rule_key(app_name);
+        if normalized.is_empty() {
+            return PrivacyLevel::Full;
+        }
+        let mut strictest = PrivacyLevel::Full;
+        // 检查新规则（规范化后精确匹配 + 单向包含匹配），取最严级别避免先匹配遮蔽后置收紧规则
         for rule in &self.app_rules {
-            let rule_normalized =
-                crate::categorize::normalize_display_app_name(&rule.app_name).to_lowercase();
-            // 精确匹配或包含匹配（应用名包含规则名，处理 "Google Chrome" 包含 "Chrome" 的情况）
+            let rule_normalized = normalized_app_rule_key(&rule.app_name);
+            if rule_normalized.is_empty() {
+                continue;
+            }
             if normalized == rule_normalized || normalized.contains(&rule_normalized) {
                 log::debug!(
                     "应用 {} 匹配规则 {}, 级别: {:?}",
@@ -439,26 +497,30 @@ impl PrivacyConfig {
                     rule.app_name,
                     rule.level
                 );
-                return rule.level;
+                if privacy_level_rank(rule.level) > privacy_level_rank(strictest) {
+                    strictest = rule.level;
+                }
             }
         }
-        // 兼容旧版 excluded_apps（视为 Ignored）
+        // 兼容旧版 excluded_apps（视为 Ignored，不可被 app_rules 中的宽松规则降级）
         for excluded in &self.excluded_apps {
-            let excluded_normalized =
-                crate::categorize::normalize_display_app_name(excluded).to_lowercase();
-            if normalized.contains(&excluded_normalized) {
+            let excluded_normalized = normalized_app_rule_key(excluded);
+            if !excluded_normalized.is_empty()
+                && (normalized == excluded_normalized || normalized.contains(&excluded_normalized))
+            {
                 return PrivacyLevel::Ignored;
             }
         }
-        PrivacyLevel::Full
+        strictest
     }
 
     /// 检查窗口标题是否触发隐私保护
     pub fn should_anonymize_by_keyword(&self, window_title: &str) -> bool {
         let title_lower = window_title.to_lowercase();
-        self.excluded_keywords
-            .iter()
-            .any(|k| title_lower.contains(&k.to_lowercase()))
+        self.excluded_keywords.iter().any(|k| {
+            let k = k.trim();
+            !k.is_empty() && title_lower.contains(&k.to_lowercase())
+        })
     }
 
     /// 从完整 URL 或裸域名（可带端口）提取小写主机名，保留 www 和子域。
@@ -518,21 +580,47 @@ impl PrivacyConfig {
         migrated
     }
 
-    /// 收集所有应忽略的应用名（小写），包含 app_rules 和遗留 excluded_apps
+    /// 收集所有应忽略的应用名（与匹配侧一致做显示名归一化 + 小写去空），包含 app_rules 和遗留 excluded_apps
     pub fn collect_ignored_app_names(&self) -> Vec<String> {
-        let mut names: Vec<String> = self
+        let mut names: Vec<String> = Vec::new();
+        for rule in self
             .app_rules
             .iter()
             .filter(|rule| rule.level == PrivacyLevel::Ignored)
-            .map(|rule| rule.app_name.to_lowercase())
-            .collect();
+        {
+            let normalized = normalized_app_rule_key(&rule.app_name);
+            if !normalized.is_empty() && !names.contains(&normalized) {
+                names.push(normalized);
+            }
+        }
         for app in &self.excluded_apps {
-            let lower = app.to_lowercase();
-            if !names.contains(&lower) {
-                names.push(lower);
+            let normalized = normalized_app_rule_key(app);
+            if !normalized.is_empty() && !names.contains(&normalized) {
+                names.push(normalized);
             }
         }
         names
+    }
+
+    /// 清理无效的空白 / 归一化后为空的隐私条目（如 `.exe`），避免通配误伤全部应用。
+    pub fn normalize(&mut self) {
+        self.app_rules.retain_mut(|rule| {
+            let trimmed = rule.app_name.trim().to_string();
+            rule.app_name = trimmed;
+            !normalized_app_rule_key(&rule.app_name).is_empty()
+        });
+        self.excluded_apps.retain_mut(|app| {
+            *app = app.trim().to_string();
+            !normalized_app_rule_key(app).is_empty()
+        });
+        self.excluded_keywords.retain_mut(|kw| {
+            *kw = kw.trim().to_string();
+            !kw.is_empty()
+        });
+        self.excluded_domains.retain_mut(|domain| {
+            *domain = domain.trim().to_string();
+            !domain.is_empty()
+        });
     }
 
     /// 收集所有域名黑名单（已提取域名、已去空）
@@ -542,6 +630,18 @@ impl PrivacyConfig {
             .map(|d| Self::extract_domain(d))
             .filter(|d| !d.is_empty())
             .collect()
+    }
+
+    /// 浏览器 URL 无法识别时的实际降级策略：
+    /// 显式配置了值时尊重用户选择；未显式配置时，若存在排除域名则默认 `Anonymize`，否则 `Record`。
+    pub fn effective_unknown_url_fallback(&self) -> UnknownUrlFallback {
+        self.unknown_url_fallback.unwrap_or_else(|| {
+            if self.collect_excluded_domains().is_empty() {
+                UnknownUrlFallback::Record
+            } else {
+                UnknownUrlFallback::Anonymize
+            }
+        })
     }
 }
 
@@ -811,12 +911,12 @@ fn update_config_backup(primary_path: &Path) -> io::Result<()> {
 }
 
 #[cfg(unix)]
-fn atomic_replace(source: &Path, target: &Path) -> io::Result<()> {
+pub fn atomic_replace(source: &Path, target: &Path) -> io::Result<()> {
     std::fs::rename(source, target)
 }
 
 #[cfg(windows)]
-fn atomic_replace(source: &Path, target: &Path) -> io::Result<()> {
+pub fn atomic_replace(source: &Path, target: &Path) -> io::Result<()> {
     use std::iter;
     use std::os::windows::ffi::OsStrExt;
 
@@ -857,18 +957,18 @@ fn atomic_replace(source: &Path, target: &Path) -> io::Result<()> {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn atomic_replace(source: &Path, target: &Path) -> io::Result<()> {
+pub fn atomic_replace(source: &Path, target: &Path) -> io::Result<()> {
     std::fs::rename(source, target)
 }
 
 #[cfg(unix)]
-fn sync_parent_directory(parent: &Path) -> io::Result<()> {
+pub fn sync_parent_directory(parent: &Path) -> io::Result<()> {
     File::open(parent)?.sync_all()
 }
 
 #[cfg(not(unix))]
-fn sync_parent_directory(_parent: &Path) -> io::Result<()> {
-    // Windows 原子替换已请求 MOVEFILE_WRITE_THROUGH；其他平台无通用目录句柄同步接口。
+pub fn sync_parent_directory(_parent: &Path) -> io::Result<()> {
+    // 非 Unix 平台无通用目录句柄 fsync 接口（Windows 同卷重命名依赖 NTFS 日志）。
     Ok(())
 }
 
@@ -890,6 +990,23 @@ where
         );
     }
     Ok(())
+}
+
+/// 飞书 / 钉钉 / 企业微信 Bot 的发送者绑定：只有绑定过的发送者才能查询本机数据。
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
+pub struct BotSenderBinding {
+    /// 已授权的发送者 ID（飞书 open_id、钉钉 staffId、企业微信 userid）
+    #[serde(default)]
+    pub allowed_senders: Vec<String>,
+    /// 一次性绑定码（在设置页生成，发送 `/bind 绑定码` 完成绑定）
+    #[serde(default)]
+    pub bind_code: Option<String>,
+    /// 绑定码过期时间（Unix 秒）
+    #[serde(default)]
+    pub bind_code_expires_at: Option<i64>,
+    /// 当前绑定码的错误尝试次数，达到上限后作废
+    #[serde(default)]
+    pub failed_attempts: u32,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -914,6 +1031,32 @@ pub struct WorkTimeSegment {
     pub end_hour: u8,
     #[serde(default)]
     pub end_minute: u8,
+}
+
+/// AI 按场景分流的任务类型
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AiTaskKind {
+    /// 每日工作日报生成
+    Report,
+    /// 工作助手对话问答
+    Assistant,
+    /// 应用与网站自动语义分类
+    Classification,
+    /// 桌宠主动 AI 提醒
+    Proactive,
+}
+
+/// 按任务场景指定使用的模型服务商/档案（留空表示跟随默认主模型 `text_model`）
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct TaskModelRouting {
+    #[serde(default)]
+    pub report_provider: Option<String>,
+    #[serde(default)]
+    pub assistant_provider: Option<String>,
+    #[serde(default)]
+    pub classification_provider: Option<String>,
+    #[serde(default)]
+    pub proactive_provider: Option<String>,
 }
 
 /// 应用配置
@@ -944,6 +1087,9 @@ pub struct AppConfig {
     /// 各服务商的模型配置快照（key 为 provider id；切换服务商时保留各家的地址/模型/Key，随配置一起保存）
     #[serde(default)]
     pub text_model_provider_cache: HashMap<String, ModelConfig>,
+    /// 按任务场景路由模型（日报 / 助手 / 自动分类 / 桌宠提醒，均默认跟随主模型）
+    #[serde(default)]
+    pub task_model_routing: TaskModelRouting,
     /// 视觉模型配置
     #[serde(default = "ModelConfig::default_vision")]
     pub vision_model: ModelConfig,
@@ -968,6 +1114,9 @@ pub struct AppConfig {
     /// 已删除的内置语义分类 key（防止 seed 复活）
     #[serde(default)]
     pub deleted_default_semantic_categories: Vec<String>,
+    /// 项目 / 标签工时归集定义（查询时按顺序匹配，默认不同步以防暴露本地路径）
+    #[serde(default)]
+    pub projects: Vec<crate::project::ProjectDefinition>,
     /// 存储配置
     #[serde(default)]
     pub storage: StorageConfig,
@@ -992,6 +1141,21 @@ pub struct AppConfig {
     /// 日报自动生成后是否自动导出 Markdown
     #[serde(default)]
     pub daily_report_auto_export: bool,
+    /// 日报导出是否附带 YAML Frontmatter（适配 Obsidian / Logseq）
+    #[serde(default)]
+    pub daily_report_export_frontmatter: bool,
+    /// 日报导出写入的目标标题区块（如 `## Work Review`；为空时覆盖整份文件）
+    #[serde(default)]
+    pub daily_report_export_section_heading: Option<String>,
+    /// 是否在日报中关联本地 Git 仓库当日提交
+    #[serde(default)]
+    pub git_report_enabled: bool,
+    /// 参与日报关联的本地 Git 仓库绝对路径列表（仅本机使用，不同步）
+    #[serde(default)]
+    pub git_repo_paths: Vec<String>,
+    /// 可选 Git 提交作者过滤（姓名或邮箱；留空时自动取仓库 `user.email`/`user.name`）
+    #[serde(default)]
+    pub git_author_filter: Option<String>,
     /// 日报自动生成时间 (HH:MM)，为空时使用工作结束时间
     #[serde(default)]
     pub daily_report_auto_generate_time: Option<String>,
@@ -1070,9 +1234,21 @@ pub struct AppConfig {
     /// 钉钉应用 App Secret
     #[serde(default)]
     pub dingtalk_app_secret: Option<String>,
+    /// 飞书 / 钉钉 / 企业微信 Bot 发送者绑定（key：feishu / dingtalk / wecom）
+    #[serde(default)]
+    pub bot_sender_bindings: HashMap<String, BotSenderBinding>,
+    /// 是否允许已授权 Bot 发送者直接发送自然语言提问（默认关闭；仅只读工作数据、不执行写工具或联网）
+    #[serde(default)]
+    pub bot_natural_language_enabled: bool,
     /// 是否启用 MCP Server
     #[serde(default)]
     pub mcp_server_enabled: bool,
+    /// MCP 客户端是否可读取 OCR 原文、截图路径与可执行文件路径（默认 false：脱敏输出）
+    #[serde(default)]
+    pub mcp_include_ocr: bool,
+    /// 本地 API 是否允许按 `?include_ocr=true` 返回 OCR 原文（默认 false：一律不返回）
+    #[serde(default)]
+    pub localhost_api_include_ocr: bool,
     /// 已注册的远程设备列表
     #[serde(default)]
     pub node_devices: Vec<NodeDevice>,
@@ -1173,6 +1349,9 @@ pub struct AppConfig {
     /// 本地 Ollama 时数据不出机，云端 API 时明示出网）
     #[serde(default)]
     pub memory_semantic_enabled: bool,
+    /// 是否开启后台定时增量语义索引（默认关闭；仅在开启语义记忆后生效，开启后会定期将新增/更新活动的文本送往已配置嵌入服务）
+    #[serde(default)]
+    pub semantic_auto_index: bool,
     /// 嵌入服务商："ollama"（本地默认）/ "openai"（OpenAI 兼容 /v1/embeddings）
     #[serde(default = "default_embedding_provider")]
     pub embedding_provider: String,
@@ -1321,6 +1500,7 @@ impl Default for AppConfig {
             report_generation_timeout_secs: default_report_generation_timeout_secs(),
             text_model_profiles: Vec::new(),
             text_model_provider_cache: HashMap::new(),
+            task_model_routing: TaskModelRouting::default(),
             vision_model: ModelConfig::default_vision(),
             privacy: PrivacyConfig::default(),
             app_category_rules: Vec::new(),
@@ -1329,6 +1509,7 @@ impl Default for AppConfig {
             custom_semantic_categories: Vec::new(),
             deleted_default_categories: Vec::new(),
             deleted_default_semantic_categories: Vec::new(),
+            projects: Vec::new(),
             storage: StorageConfig::default(),
             remote_storage: RemoteStorageConfig::default(),
             config_synced_at: 0,
@@ -1337,6 +1518,11 @@ impl Default for AppConfig {
             daily_report_system_prompt_override: None,
             daily_report_export_dir: None,
             daily_report_auto_export: false,
+            daily_report_export_frontmatter: false,
+            daily_report_export_section_heading: None,
+            git_report_enabled: false,
+            git_repo_paths: Vec::new(),
+            git_author_filter: None,
             daily_report_pinned_blocks: Vec::new(),
             daily_report_hidden_blocks: Vec::new(),
             daily_report_last_ai_order: Vec::new(),
@@ -1363,7 +1549,11 @@ impl Default for AppConfig {
             wecom_bot_secret: None,
             dingtalk_bot_enabled: false,
             dingtalk_app_secret: None,
+            bot_sender_bindings: HashMap::new(),
+            bot_natural_language_enabled: false,
             mcp_server_enabled: false,
+            mcp_include_ocr: false,
+            localhost_api_include_ocr: false,
             node_devices: Vec::new(),
             node_gateway: NodeGatewayConfig::default(),
             auto_start: false,
@@ -1398,7 +1588,7 @@ impl Default for AppConfig {
             ollama_host: "http://localhost:11434".to_string(),
             ollama_model: "llava".to_string(),
             openai_api_key: None,
-            openai_model: "gpt-6-luna".to_string(),
+            openai_model: AiProvider::OpenAI.default_model().to_string(),
             hide_dock_icon: false,
             lightweight_mode: false,
             break_reminder_enabled: false,
@@ -1412,6 +1602,7 @@ impl Default for AppConfig {
             assistant_search_provider: default_assistant_search_provider(),
             assistant_search_api_key: None,
             memory_semantic_enabled: false,
+            semantic_auto_index: false,
             embedding_provider: default_embedding_provider(),
             embedding_endpoint: default_embedding_endpoint(),
             embedding_model: default_embedding_model(),
@@ -1435,55 +1626,508 @@ impl Default for AppConfig {
     }
 }
 
+/// 可经 WebDAV 同步的偏好字段白名单（`AppConfig` 的 JSON 键名）。
+///
+/// 采用白名单而非黑名单：新增字段默认只留在本机。以下几类字段**不得**加入：
+/// 密钥/Token、模型与嵌入端点、会把本地数据发往外部服务的开关（AI 模式、联网、
+/// 语义索引、记忆合成、主动 AI）、Bot / MCP / 本地 API / 节点配置、远程存储、
+/// 存储与清理策略、本机路径与窗口坐标；含窗口标题等工作内容的数据（如桌宠待办）；
+/// 会改写模型指令的系统提示词覆盖；让记录器更不易被察觉的开关（隐藏 Dock 图标、轻量模式）。
+/// 隐私规则单独走 [`merge_privacy_additive`]。
+pub const SYNCED_PREFERENCE_FIELDS: &[&str] = &[
+    "screenshot_interval",
+    "locale",
+    "idle_threshold_minutes",
+    "assistant_timeout_secs",
+    "report_generation_timeout_secs",
+    "app_category_rules",
+    "custom_categories",
+    "website_semantic_rules",
+    "custom_semantic_categories",
+    "deleted_default_categories",
+    "deleted_default_semantic_categories",
+    "daily_report_custom_prompt",
+    "daily_report_prompt_presets",
+    "daily_report_auto_generate_time",
+    "daily_report_pinned_blocks",
+    "daily_report_hidden_blocks",
+    "daily_report_last_ai_order",
+    "theme",
+    "ui_visual_style",
+    "report_editor_font",
+    "work_start_hour",
+    "work_end_hour",
+    "work_start_minute",
+    "work_end_minute",
+    "work_time_segments",
+    "work_time_enabled",
+    "standard_work_hours",
+    "break_reminder_enabled",
+    "break_reminder_interval_minutes",
+    "daily_work_goal_minutes",
+    "goal_notifications",
+    "avatar_enabled",
+    "avatar_body_hidden",
+    "avatar_scale",
+    "avatar_opacity",
+    "avatar_preset",
+    "avatar_persona",
+    "avatar_click_through",
+    "hide_decorations",
+    "background_opacity",
+    "background_blur",
+];
+
+/// 同步隐私规则所用的 JSON 键名（只增不减合并，不走白名单直接覆盖）。
+pub const SYNCED_PRIVACY_FIELD: &str = "privacy";
+
+fn privacy_level_rank(level: PrivacyLevel) -> u8 {
+    match level {
+        PrivacyLevel::Full => 0,
+        PrivacyLevel::Anonymized => 1,
+        PrivacyLevel::Ignored => 2,
+    }
+}
+
+fn push_unique_case_insensitive(target: &mut Vec<String>, values: &[String]) {
+    for value in values {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if !target
+            .iter()
+            .any(|existing| existing.trim().eq_ignore_ascii_case(trimmed))
+        {
+            target.push(trimmed.to_string());
+        }
+    }
+}
+
+/// 隐私规则"只增不减"合并：远端只能新增或收紧规则，不能删除或降级本机规则。
+///
+/// - 同名应用（按归一化名称对齐，含别名与 `.exe`）取更严格的级别（忽略 > 脱敏 > 完整记录）；
+///   远端的"完整记录"规则或归一化后为空（如 `.exe`）的规则不新增，也不得降级遗留 `excluded_apps`。
+/// - 排除关键词、排除域名、旧版忽略应用取并集；`filter_sensitive` 取或。
+pub fn merge_privacy_additive(local: &PrivacyConfig, remote: &PrivacyConfig) -> PrivacyConfig {
+    const MAX_SYNCED_PRIVACY_ENTRIES: usize = 1024;
+
+    let mut merged = local.clone();
+    let local_excluded_keys: std::collections::HashSet<String> = merged
+        .excluded_apps
+        .iter()
+        .map(|app| normalized_app_rule_key(app))
+        .filter(|key| !key.is_empty())
+        .collect();
+
+    for remote_rule in remote.app_rules.iter().take(MAX_SYNCED_PRIVACY_ENTRIES) {
+        let name = remote_rule.app_name.trim();
+        let remote_key = normalized_app_rule_key(name);
+        if name.is_empty() || remote_key.is_empty() {
+            continue;
+        }
+        // 本机遗留 excluded_apps 已视为 Ignored，禁止远端通过 app_rules 写入更宽松级别降级
+        if local_excluded_keys.contains(&remote_key) && remote_rule.level != PrivacyLevel::Ignored {
+            continue;
+        }
+        let mut matched_any = false;
+        for existing in merged.app_rules.iter_mut() {
+            if normalized_app_rule_key(&existing.app_name) == remote_key {
+                matched_any = true;
+                if privacy_level_rank(remote_rule.level) > privacy_level_rank(existing.level) {
+                    existing.level = remote_rule.level;
+                }
+            }
+        }
+        if !matched_any
+            && remote_rule.level != PrivacyLevel::Full
+            && merged.app_rules.len() < MAX_SYNCED_PRIVACY_ENTRIES
+        {
+            merged.app_rules.push(AppPrivacyRule {
+                app_name: name.to_string(),
+                level: remote_rule.level,
+            });
+        }
+    }
+    push_unique_case_insensitive(
+        &mut merged.excluded_keywords,
+        &remote.excluded_keywords[..remote
+            .excluded_keywords
+            .len()
+            .min(MAX_SYNCED_PRIVACY_ENTRIES)],
+    );
+    push_unique_case_insensitive(
+        &mut merged.excluded_domains,
+        &remote.excluded_domains[..remote
+            .excluded_domains
+            .len()
+            .min(MAX_SYNCED_PRIVACY_ENTRIES)],
+    );
+    let valid_remote_excluded_apps: Vec<String> = remote
+        .excluded_apps
+        .iter()
+        .take(MAX_SYNCED_PRIVACY_ENTRIES)
+        .filter(|app| !normalized_app_rule_key(app).is_empty())
+        .cloned()
+        .collect();
+    push_unique_case_insensitive(&mut merged.excluded_apps, &valid_remote_excluded_apps);
+    merged.filter_sensitive = local.filter_sensitive || remote.filter_sensitive;
+    merged.skip_private_windows = local.skip_private_windows || remote.skip_private_windows;
+    merged.unknown_url_fallback = if local.effective_unknown_url_fallback()
+        == UnknownUrlFallback::Anonymize
+        || remote.effective_unknown_url_fallback() == UnknownUrlFallback::Anonymize
+    {
+        Some(UnknownUrlFallback::Anonymize)
+    } else {
+        local.unknown_url_fallback.or(remote.unknown_url_fallback)
+    };
+    merged
+}
+
 impl AppConfig {
-    /// 应用远端同步快照，保留本机专属字段（端口、窗口位置、自启、导出目录等）。
+    /// 生成用于上传的同步快照：仅包含白名单偏好与隐私规则，绝不含密钥、端点与本机字段。
+    pub fn synced_preferences_value(&self) -> serde_json::Value {
+        let full = serde_json::to_value(self).unwrap_or(serde_json::Value::Null);
+        let mut snapshot = serde_json::Map::new();
+        if let Some(object) = full.as_object() {
+            for key in SYNCED_PREFERENCE_FIELDS
+                .iter()
+                .copied()
+                .chain(std::iter::once(SYNCED_PRIVACY_FIELD))
+            {
+                if let Some(value) = object.get(key) {
+                    snapshot.insert(key.to_string(), value.clone());
+                }
+            }
+        }
+        serde_json::Value::Object(snapshot)
+    }
+
+    /// 应用远端同步快照（兼容旧版整份配置格式）。
+    ///
+    /// 只采纳白名单字段；隐私规则只增不减；其余字段（密钥、端点、Bot、远程存储、
+    /// 存储策略、本机路径等）一律保留本机值。单个字段类型不兼容时跳过该字段。
+    pub fn apply_synced_preferences(&mut self, remote: &serde_json::Value) {
+        let Some(remote_object) = remote.as_object() else {
+            return;
+        };
+        let Ok(serde_json::Value::Object(base)) = serde_json::to_value(&*self) else {
+            return;
+        };
+
+        let mut candidate = base.clone();
+        for key in SYNCED_PREFERENCE_FIELDS {
+            if let Some(value) = remote_object.get(*key) {
+                candidate.insert((*key).to_string(), value.clone());
+            }
+        }
+
+        let mut next: AppConfig = match serde_json::from_value(serde_json::Value::Object(candidate))
+        {
+            Ok(next) => next,
+            Err(_) => {
+                // 逐字段尝试，跳过类型不兼容的远端字段（如旧版本写入的历史格式）。
+                let mut accepted = base;
+                for key in SYNCED_PREFERENCE_FIELDS {
+                    let Some(value) = remote_object.get(*key) else {
+                        continue;
+                    };
+                    let mut trial = accepted.clone();
+                    trial.insert((*key).to_string(), value.clone());
+                    if serde_json::from_value::<AppConfig>(serde_json::Value::Object(trial.clone()))
+                        .is_ok()
+                    {
+                        accepted = trial;
+                    } else {
+                        log::warn!("跳过类型不兼容的同步字段: {key}");
+                    }
+                }
+                match serde_json::from_value(serde_json::Value::Object(accepted)) {
+                    Ok(next) => next,
+                    Err(_) => return,
+                }
+            }
+        };
+
+        if let Some(raw_privacy) = remote_object.get(SYNCED_PRIVACY_FIELD) {
+            match serde_json::from_value::<PrivacyConfig>(raw_privacy.clone()) {
+                Ok(remote_privacy) => {
+                    next.privacy = merge_privacy_additive(&self.privacy, &remote_privacy);
+                }
+                Err(error) => {
+                    log::warn!("远端同步隐私配置解析失败，保留本机隐私规则: {error}");
+                }
+            }
+        }
+        next.work_time_segments.truncate(32);
+        next.daily_report_prompt_presets.truncate(64);
+
+        *self = next;
+    }
+
+    /// 兼容入口：以整份 `AppConfig` 作为远端快照应用（内部同样只采纳白名单字段）。
     pub fn apply_synced_remote(&mut self, remote: AppConfig) {
-        let localhost_api_enabled = self.localhost_api_enabled;
-        let localhost_api_host = self.localhost_api_host.clone();
-        let localhost_api_port = self.localhost_api_port;
-        let auto_start = self.auto_start;
-        let auto_start_silent = self.auto_start_silent;
-        let macos_screen_capture_permission_prompted =
-            self.macos_screen_capture_permission_prompted;
-        let last_app_version = self.last_app_version.clone();
-        let daily_report_export_dir = self.daily_report_export_dir.clone();
-        let node_gateway = self.node_gateway.clone();
-        let avatar_x = self.avatar_x;
-        let avatar_y = self.avatar_y;
-        let telegram_bot_bind_code = self.telegram_bot_bind_code.clone();
-        let telegram_bot_bind_code_expires_at = self.telegram_bot_bind_code_expires_at;
-        let background_image = self.background_image.clone();
-        let metadata_retention = (
-            self.storage.metadata_cleanup_enabled,
-            self.storage.metadata_retention_days,
-        );
+        let remote_value = serde_json::to_value(remote).unwrap_or(serde_json::Value::Null);
+        self.apply_synced_preferences(&remote_value);
+    }
 
-        *self = remote;
+    /// 生成不含密钥与凭据的备份配置副本（默认备份策略，见 M3-2）。
+    pub fn redacted_for_backup(&self) -> Self {
+        fn redact_url_userinfo(raw: &str) -> String {
+            let trimmed = raw.trim();
+            if let Ok(mut url) = reqwest::Url::parse(trimmed) {
+                if !url.username().is_empty() || url.password().is_some() {
+                    let _ = url.set_username("");
+                    let _ = url.set_password(None);
+                    return url.to_string();
+                }
+            }
+            raw.to_string()
+        }
 
-        self.localhost_api_enabled = localhost_api_enabled;
-        self.localhost_api_host = localhost_api_host;
-        self.localhost_api_port = localhost_api_port;
-        self.auto_start = auto_start;
-        self.auto_start_silent = auto_start_silent;
-        self.macos_screen_capture_permission_prompted = macos_screen_capture_permission_prompted;
-        self.last_app_version = last_app_version;
-        self.daily_report_export_dir = daily_report_export_dir;
-        self.node_gateway = node_gateway;
-        self.avatar_x = avatar_x;
-        self.avatar_y = avatar_y;
-        self.telegram_bot_bind_code = telegram_bot_bind_code;
-        self.telegram_bot_bind_code_expires_at = telegram_bot_bind_code_expires_at;
-        self.background_image = background_image;
-        // 自动删除授权与期限属于本机，远端同步不得开启或缩短本机保留策略。
-        (
-            self.storage.metadata_cleanup_enabled,
-            self.storage.metadata_retention_days,
-        ) = metadata_retention;
+        let mut copy = self.clone();
+        copy.text_model.endpoint = redact_url_userinfo(&copy.text_model.endpoint);
+        copy.text_model.api_key = None;
+        copy.vision_model.endpoint = redact_url_userinfo(&copy.vision_model.endpoint);
+        copy.vision_model.api_key = None;
+        copy.ai_provider.endpoint = redact_url_userinfo(&copy.ai_provider.endpoint);
+        copy.ai_provider.api_key = None;
+        copy.openai_api_key = None;
+        for profile in &mut copy.text_model_profiles {
+            profile.model_config.endpoint = redact_url_userinfo(&profile.model_config.endpoint);
+            profile.model_config.api_key = None;
+        }
+        for model in copy.text_model_provider_cache.values_mut() {
+            model.endpoint = redact_url_userinfo(&model.endpoint);
+            model.api_key = None;
+        }
+        copy.remote_storage.s3.endpoint = redact_url_userinfo(&copy.remote_storage.s3.endpoint);
+        copy.remote_storage.s3.access_key.clear();
+        copy.remote_storage.s3.secret_key.clear();
+        copy.remote_storage.webdav.url = redact_url_userinfo(&copy.remote_storage.webdav.url);
+        copy.remote_storage.webdav.password.clear();
+        copy.telegram_bot_token = None;
+        copy.telegram_bot_proxy = copy.telegram_bot_proxy.as_deref().map(redact_url_userinfo);
+        copy.telegram_bot_bind_code = None;
+        copy.telegram_bot_bind_code_expires_at = None;
+        copy.feishu_app_secret = None;
+        copy.feishu_verification_token = None;
+        copy.feishu_encrypt_key = None;
+        copy.wecom_token = None;
+        copy.wecom_encoding_aes_key = None;
+        copy.wecom_bot_secret = None;
+        copy.dingtalk_app_secret = None;
+        copy.assistant_search_api_key = None;
+        copy.embedding_endpoint = redact_url_userinfo(&copy.embedding_endpoint);
+        copy.embedding_api_key = None;
+        for device in &mut copy.node_devices {
+            device.url = redact_url_userinfo(&device.url);
+            device.token.clear();
+        }
+        for binding in copy.bot_sender_bindings.values_mut() {
+            binding.bind_code = None;
+            binding.bind_code_expires_at = None;
+            binding.failed_attempts = 0;
+        }
+        copy
+    }
+
+    /// 恢复不含密钥的备份时，仅在服务目标地址与账户身份一致时回填本机已有密钥，
+    /// 避免把本机凭据误填到备份指向的新端点或不同账户上。
+    pub fn preserve_missing_secrets_from(&mut self, current: &AppConfig) {
+        let same_endpoint = |a: &str, b: &str| -> bool {
+            let ta = a.trim();
+            let tb = b.trim();
+            if ta.is_empty() || tb.is_empty() {
+                return false;
+            }
+            match (reqwest::Url::parse(ta), reqwest::Url::parse(tb)) {
+                (Ok(ua), Ok(ub)) => {
+                    // 仅对 scheme 与 host 做不区分大小写规范化（reqwest::Url 已自动规范化）；
+                    // 路径、查询串、用户名及显式端口一律保持大小写敏感的严格比对，
+                    // 防止大小写敏感的多租户路由（如 /TenantA vs /tenanta）被误判为同一端点。
+                    fn norm_path(u: &reqwest::Url) -> &str {
+                        let p = u.path();
+                        if p == "/" {
+                            ""
+                        } else {
+                            p.trim_end_matches('/')
+                        }
+                    }
+                    ua.scheme() == ub.scheme()
+                        && ua.host_str() == ub.host_str()
+                        && ua.port_or_known_default() == ub.port_or_known_default()
+                        && ua.username() == ub.username()
+                        && norm_path(&ua) == norm_path(&ub)
+                        && ua.query() == ub.query()
+                }
+                _ => ta.trim_end_matches('/') == tb.trim_end_matches('/'),
+            }
+        };
+        let same_non_empty_opt = |a: &Option<String>, b: &Option<String>| -> bool {
+            match (
+                a.as_deref().map(str::trim).filter(|s| !s.is_empty()),
+                b.as_deref().map(str::trim).filter(|s| !s.is_empty()),
+            ) {
+                (Some(x), Some(y)) => x == y,
+                _ => false,
+            }
+        };
+
+        if self.text_model.api_key.is_none()
+            && self.text_model.provider == current.text_model.provider
+            && same_endpoint(&self.text_model.endpoint, &current.text_model.endpoint)
+        {
+            self.text_model.api_key = current.text_model.api_key.clone();
+        }
+        if self.vision_model.api_key.is_none()
+            && self.vision_model.provider == current.vision_model.provider
+            && same_endpoint(&self.vision_model.endpoint, &current.vision_model.endpoint)
+        {
+            self.vision_model.api_key = current.vision_model.api_key.clone();
+        }
+        if self.ai_provider.api_key.is_none()
+            && self.ai_provider.provider == current.ai_provider.provider
+            && same_endpoint(&self.ai_provider.endpoint, &current.ai_provider.endpoint)
+        {
+            self.ai_provider.api_key = current.ai_provider.api_key.clone();
+        }
+        if self.openai_api_key.is_none()
+            && self.text_model.provider == current.text_model.provider
+            && same_endpoint(&self.text_model.endpoint, &current.text_model.endpoint)
+        {
+            self.openai_api_key = current.openai_api_key.clone();
+        }
+        for profile in &mut self.text_model_profiles {
+            if profile.model_config.api_key.is_none() {
+                if let Some(cur) = current.text_model_profiles.iter().find(|p| {
+                    p.id == profile.id
+                        && p.model_config.provider == profile.model_config.provider
+                        && same_endpoint(&p.model_config.endpoint, &profile.model_config.endpoint)
+                }) {
+                    profile.model_config.api_key = cur.model_config.api_key.clone();
+                }
+            }
+        }
+        for (provider_key, model) in &mut self.text_model_provider_cache {
+            if model.api_key.is_none() {
+                if let Some(cur) = current.text_model_provider_cache.get(provider_key) {
+                    if cur.provider == model.provider
+                        && same_endpoint(&cur.endpoint, &model.endpoint)
+                    {
+                        model.api_key = cur.api_key.clone();
+                    }
+                }
+            }
+        }
+        let s3_same_target = same_endpoint(
+            &self.remote_storage.s3.endpoint,
+            &current.remote_storage.s3.endpoint,
+        ) && !self.remote_storage.s3.bucket.trim().is_empty()
+            && self.remote_storage.s3.bucket.trim() == current.remote_storage.s3.bucket.trim();
+        let restored_s3_access = self.remote_storage.s3.access_key.trim();
+        let live_s3_access = current.remote_storage.s3.access_key.trim();
+        if s3_same_target {
+            if restored_s3_access.is_empty() && self.remote_storage.s3.secret_key.trim().is_empty()
+            {
+                // 脱敏备份同时清空了 access_key 与 secret_key：按成对凭据一起回填
+                self.remote_storage.s3.access_key = current.remote_storage.s3.access_key.clone();
+                self.remote_storage.s3.secret_key = current.remote_storage.s3.secret_key.clone();
+            } else if !restored_s3_access.is_empty()
+                && restored_s3_access == live_s3_access
+                && self.remote_storage.s3.secret_key.trim().is_empty()
+            {
+                // 仅当 access_key 严格一致时才补齐缺失的 secret_key，避免把旧密钥填给新账户
+                self.remote_storage.s3.secret_key = current.remote_storage.s3.secret_key.clone();
+            }
+        }
+        let webdav_same_target = same_endpoint(
+            &self.remote_storage.webdav.url,
+            &current.remote_storage.webdav.url,
+        ) && !self.remote_storage.webdav.username.trim().is_empty()
+            && self.remote_storage.webdav.username.trim()
+                == current.remote_storage.webdav.username.trim();
+        if webdav_same_target && self.remote_storage.webdav.password.is_empty() {
+            self.remote_storage.webdav.password = current.remote_storage.webdav.password.clone();
+        }
+        if self.telegram_bot_token.is_none()
+            && self.telegram_bot_enabled
+            && current.telegram_bot_enabled
+            && self.telegram_bot_allowed_chat_ids == current.telegram_bot_allowed_chat_ids
+        {
+            self.telegram_bot_token = current.telegram_bot_token.clone();
+        }
+        if same_non_empty_opt(&self.feishu_app_id, &current.feishu_app_id) {
+            if self.feishu_app_secret.is_none() {
+                self.feishu_app_secret = current.feishu_app_secret.clone();
+            }
+            if self.feishu_verification_token.is_none() {
+                self.feishu_verification_token = current.feishu_verification_token.clone();
+            }
+            if self.feishu_encrypt_key.is_none() {
+                self.feishu_encrypt_key = current.feishu_encrypt_key.clone();
+            }
+        }
+        if same_non_empty_opt(&self.wecom_corp_id, &current.wecom_corp_id) {
+            if self.wecom_token.is_none() {
+                self.wecom_token = current.wecom_token.clone();
+            }
+            if self.wecom_encoding_aes_key.is_none() {
+                self.wecom_encoding_aes_key = current.wecom_encoding_aes_key.clone();
+            }
+        }
+        if same_non_empty_opt(&self.wecom_bot_id, &current.wecom_bot_id)
+            && self.wecom_bot_secret.is_none()
+        {
+            self.wecom_bot_secret = current.wecom_bot_secret.clone();
+        }
+        if self.dingtalk_app_secret.is_none()
+            && self.dingtalk_bot_enabled
+            && current.dingtalk_bot_enabled
+            && self
+                .bot_sender_bindings
+                .get("dingtalk")
+                .map(|b| &b.allowed_senders)
+                == current
+                    .bot_sender_bindings
+                    .get("dingtalk")
+                    .map(|b| &b.allowed_senders)
+        {
+            self.dingtalk_app_secret = current.dingtalk_app_secret.clone();
+        }
+        if self.assistant_search_api_key.is_none()
+            && self
+                .assistant_search_provider
+                .eq_ignore_ascii_case(&current.assistant_search_provider)
+        {
+            self.assistant_search_api_key = current.assistant_search_api_key.clone();
+        }
+        if self.embedding_api_key.is_none()
+            && self
+                .embedding_provider
+                .eq_ignore_ascii_case(&current.embedding_provider)
+            && same_endpoint(&self.embedding_endpoint, &current.embedding_endpoint)
+        {
+            self.embedding_api_key = current.embedding_api_key.clone();
+        }
+        for device in &mut self.node_devices {
+            if device.token.is_empty() {
+                if let Some(cur) = current
+                    .node_devices
+                    .iter()
+                    .find(|d| same_endpoint(&d.url, &device.url) && d.name == device.name)
+                {
+                    device.token = cur.token.clone();
+                }
+            }
+        }
     }
 
     /// 规范化配置，兼容旧字段并补齐助手可用的文本模型档案
     pub fn normalize(&mut self) {
         self.migrate_legacy_config();
+        self.privacy.normalize();
+        crate::project::normalize_project_definitions(&mut self.projects);
         normalize_custom_categories(&mut self.custom_categories);
         normalize_app_category_rules(&mut self.app_category_rules, &self.custom_categories);
         // Seed defaults BEFORE rule validation so built-in categories are present
@@ -1526,6 +2170,18 @@ impl AppConfig {
         normalize_prompt_presets(&mut self.daily_report_prompt_presets);
         self.daily_report_export_dir =
             normalize_optional_string(self.daily_report_export_dir.take());
+        self.daily_report_export_section_heading =
+            normalize_optional_string(self.daily_report_export_section_heading.take());
+        self.git_author_filter = normalize_optional_string(self.git_author_filter.take());
+        normalize_git_repo_paths(&mut self.git_repo_paths);
+        self.task_model_routing.report_provider =
+            normalize_optional_string(self.task_model_routing.report_provider.take());
+        self.task_model_routing.assistant_provider =
+            normalize_optional_string(self.task_model_routing.assistant_provider.take());
+        self.task_model_routing.classification_provider =
+            normalize_optional_string(self.task_model_routing.classification_provider.take());
+        self.task_model_routing.proactive_provider =
+            normalize_optional_string(self.task_model_routing.proactive_provider.take());
         self.localhost_api_port = normalize_localhost_api_port(self.localhost_api_port);
         self.localhost_api_host = normalize_optional_string(self.localhost_api_host.take());
         self.wecom_bot_id = normalize_optional_string(self.wecom_bot_id.take());
@@ -1732,6 +2388,54 @@ impl AppConfig {
         &self.text_model.endpoint
     }
 
+    /// 按任务场景解析实际使用的文本模型配置：
+    /// 优先查找对应场景指定的模型档案或已缓存服务商，未配置或不完整时回退到主模型 `text_model`。
+    pub fn resolve_model_for_task(&self, task: AiTaskKind) -> ModelConfig {
+        let route_key = match task {
+            AiTaskKind::Report => self.task_model_routing.report_provider.as_deref(),
+            AiTaskKind::Assistant => self.task_model_routing.assistant_provider.as_deref(),
+            AiTaskKind::Classification => {
+                self.task_model_routing.classification_provider.as_deref()
+            }
+            AiTaskKind::Proactive => self.task_model_routing.proactive_provider.as_deref(),
+        }
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+        let Some(key) = route_key else {
+            return self.text_model.clone();
+        };
+
+        let candidate = self
+            .text_model_profiles
+            .iter()
+            .find(|profile| profile.id == key)
+            .map(|profile| profile.model_config.clone())
+            .or_else(|| {
+                if self.text_model.provider.as_str().eq_ignore_ascii_case(key) {
+                    Some(self.text_model.clone())
+                } else {
+                    None
+                }
+            })
+            .or_else(|| {
+                self.text_model_provider_cache
+                    .get(key)
+                    .cloned()
+                    .or_else(|| {
+                        self.text_model_provider_cache
+                            .iter()
+                            .find(|(provider_key, _)| provider_key.eq_ignore_ascii_case(key))
+                            .map(|(_, cached)| cached.clone())
+                    })
+            });
+
+        match candidate {
+            Some(model) if is_routable_model_configured(&model) => model,
+            _ => self.text_model.clone(),
+        }
+    }
+
     /// 获取视觉模型端点
     pub fn get_vision_endpoint(&self) -> &str {
         &self.vision_model.endpoint
@@ -1803,6 +2507,41 @@ impl AppConfig {
 
 fn is_model_configured(model_config: &ModelConfig) -> bool {
     !model_config.endpoint.trim().is_empty() && !model_config.model.trim().is_empty()
+}
+
+fn is_routable_model_configured(model_config: &ModelConfig) -> bool {
+    if !is_model_configured(model_config) {
+        return false;
+    }
+    if !model_config.provider.requires_api_key() {
+        return true;
+    }
+    model_config
+        .api_key
+        .as_deref()
+        .is_some_and(|key| !key.trim().is_empty())
+}
+
+fn normalize_git_repo_paths(paths: &mut Vec<String>) {
+    const MAX_GIT_REPOS: usize = 32;
+    let mut normalized = Vec::new();
+    for raw in paths.iter() {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if normalized
+            .iter()
+            .any(|existing: &String| existing.eq_ignore_ascii_case(trimmed))
+        {
+            continue;
+        }
+        normalized.push(trimmed.to_string());
+        if normalized.len() >= MAX_GIT_REPOS {
+            break;
+        }
+    }
+    *paths = normalized;
 }
 
 fn same_model_config(left: &ModelConfig, right: &ModelConfig) -> bool {
@@ -2167,14 +2906,17 @@ fn normalize_optional_string(value: Option<String>) -> Option<String> {
 mod tests {
     #![allow(clippy::field_reassign_with_default)]
 
+    use super::merge_privacy_additive;
     use super::{
         commit_pending_config, config_backup_path, default_avatar_opacity, default_avatar_persona,
         default_avatar_preset, default_avatar_scale, default_ui_visual_style,
         normalize_app_category_rules, normalize_avatar_followups, normalize_avatar_opacity,
         normalize_avatar_persona, normalize_avatar_preset, normalize_avatar_scale,
-        normalize_ui_visual_style, update_config_backup_with_sync, AiProvider, AppCategoryRule,
-        AppConfig, AvatarFollowupItem, ConfigLoadStatus, PendingConfigFile, RemoteStorageProvider,
-        ScreenshotDisplayMode, WebsiteSemanticRule, DEFAULT_LOCALHOST_API_PORT,
+        normalize_ui_visual_style, update_config_backup_with_sync, AiProvider, AiTaskKind,
+        AppCategoryRule, AppConfig, AppPrivacyRule, AvatarFollowupItem, ConfigLoadStatus,
+        ModelConfig, PendingConfigFile, PrivacyConfig, PrivacyLevel, RemoteStorageProvider,
+        ScreenshotDisplayMode, TaskModelRouting, WebsiteSemanticRule, DEFAULT_LOCALHOST_API_PORT,
+        SYNCED_PREFERENCE_FIELDS, SYNCED_PRIVACY_FIELD,
     };
     use std::io::{self, Write};
     use std::path::PathBuf;
@@ -2298,6 +3040,274 @@ mod tests {
                 .and_then(|m| m.api_key.as_deref()),
             Some("sk-test")
         );
+    }
+
+    #[test]
+    fn 同步白名单字段均应存在于配置序列化结果中() {
+        let value = serde_json::to_value(AppConfig::default()).unwrap();
+        let object = value.as_object().unwrap();
+        for key in SYNCED_PREFERENCE_FIELDS
+            .iter()
+            .chain(std::iter::once(&SYNCED_PRIVACY_FIELD))
+        {
+            assert!(object.contains_key(*key), "白名单字段不存在: {key}");
+        }
+    }
+
+    #[test]
+    fn 同步白名单不得包含密钥端点与外发开关() {
+        const FORBIDDEN: &[&str] = &[
+            "text_model",
+            "vision_model",
+            "text_model_profiles",
+            "text_model_provider_cache",
+            "ai_provider",
+            "ai_mode",
+            "openai_api_key",
+            "ollama_host",
+            "assistant_search_api_key",
+            "assistant_search_provider",
+            "assistant_web_access_enabled",
+            "embedding_api_key",
+            "embedding_endpoint",
+            "memory_semantic_enabled",
+            "semantic_auto_index",
+            "memory_enabled",
+            "avatar_proactive_ai_enabled",
+            "remote_storage",
+            "storage",
+            "localhost_api_enabled",
+            "localhost_api_host",
+            "localhost_api_port",
+            "mcp_server_enabled",
+            "node_devices",
+            "node_gateway",
+            "telegram_bot_enabled",
+            "telegram_bot_token",
+            "telegram_bot_allowed_chat_ids",
+            "feishu_bot_enabled",
+            "feishu_app_secret",
+            "wecom_bot_enabled",
+            "wecom_bot_secret",
+            "dingtalk_bot_enabled",
+            "dingtalk_app_secret",
+            "bot_natural_language_enabled",
+            "daily_report_export_dir",
+            "daily_report_auto_export",
+            "daily_report_export_frontmatter",
+            "daily_report_export_section_heading",
+            "task_model_routing",
+            "git_report_enabled",
+            "git_repo_paths",
+            "git_author_filter",
+            "auto_start",
+            "avatar_x",
+            "avatar_y",
+            "background_image",
+            "bot_sender_bindings",
+            "mcp_include_ocr",
+            "localhost_api_include_ocr",
+            "avatar_followups",
+            "daily_report_system_prompt_override",
+            "hide_dock_icon",
+            "lightweight_mode",
+        ];
+        for key in FORBIDDEN {
+            assert!(
+                !SYNCED_PREFERENCE_FIELDS.contains(key),
+                "敏感或本机字段不得进入同步白名单: {key}"
+            );
+        }
+        let defaults = AppConfig::default();
+        assert!(!defaults.semantic_auto_index);
+        assert!(!defaults.bot_natural_language_enabled);
+    }
+
+    #[test]
+    fn 同步快照不应包含任何密钥值() {
+        let mut config = AppConfig::default();
+        config.text_model.api_key = Some("sk-secret-text".to_string());
+        config.embedding_api_key = Some("sk-secret-embed".to_string());
+        config.telegram_bot_token = Some("tg-secret".to_string());
+        config.wecom_bot_secret = Some("wecom-secret".to_string());
+        config.remote_storage.webdav.password = "dav-secret".to_string();
+        config.daily_report_custom_prompt = "保留的提示词".to_string();
+
+        let snapshot = serde_json::to_string(&config.synced_preferences_value()).unwrap();
+        for secret in [
+            "sk-secret-text",
+            "sk-secret-embed",
+            "tg-secret",
+            "wecom-secret",
+            "dav-secret",
+        ] {
+            assert!(!snapshot.contains(secret), "同步快照泄露了密钥: {secret}");
+        }
+        assert!(snapshot.contains("保留的提示词"));
+    }
+
+    #[test]
+    fn 远端同步不得覆盖本机密钥端点与机器人配置() {
+        let mut local = AppConfig::default();
+        local.text_model.endpoint = "https://api.local-choice.example".to_string();
+        local.text_model.api_key = Some("local-key".to_string());
+        local.telegram_bot_allowed_chat_ids = vec![1];
+        local.storage.screenshot_retention_days = 30;
+
+        let mut remote = AppConfig::default();
+        remote.text_model.endpoint = "https://attacker.example".to_string();
+        remote.text_model.api_key = None;
+        remote.telegram_bot_allowed_chat_ids = vec![1, 666];
+        remote.assistant_web_access_enabled = true;
+        remote.storage.screenshot_retention_days = 1;
+        remote.theme = "dark".to_string();
+
+        local.apply_synced_remote(remote);
+        assert_eq!(
+            local.text_model.endpoint,
+            "https://api.local-choice.example"
+        );
+        assert_eq!(local.text_model.api_key.as_deref(), Some("local-key"));
+        assert_eq!(local.telegram_bot_allowed_chat_ids, vec![1]);
+        assert!(!local.assistant_web_access_enabled);
+        assert_eq!(local.storage.screenshot_retention_days, 30);
+        assert_eq!(local.theme, "dark");
+    }
+
+    #[test]
+    fn 远端同步的隐私规则只增不减() {
+        let mut local = AppConfig::default();
+        local.privacy.app_rules = vec![
+            AppPrivacyRule {
+                app_name: "WeChat".to_string(),
+                level: PrivacyLevel::Ignored,
+            },
+            AppPrivacyRule {
+                app_name: "Slack".to_string(),
+                level: PrivacyLevel::Anonymized,
+            },
+        ];
+        local.privacy.excluded_domains = vec!["bank.example".to_string()];
+
+        let mut remote = AppConfig::default();
+        remote.privacy.app_rules = vec![
+            // 试图降级本机规则
+            AppPrivacyRule {
+                app_name: "wechat".to_string(),
+                level: PrivacyLevel::Full,
+            },
+            // 收紧本机规则
+            AppPrivacyRule {
+                app_name: "Slack".to_string(),
+                level: PrivacyLevel::Ignored,
+            },
+            // 新增规则
+            AppPrivacyRule {
+                app_name: "1Password".to_string(),
+                level: PrivacyLevel::Ignored,
+            },
+            // 新增"完整记录"规则无意义，不应写入
+            AppPrivacyRule {
+                app_name: "Notes".to_string(),
+                level: PrivacyLevel::Full,
+            },
+        ];
+        // 远端删除了本机排除域名，并新增一个
+        remote.privacy.excluded_domains = vec!["mail.example".to_string()];
+
+        local.apply_synced_remote(remote);
+        let level_of = |name: &str| {
+            local
+                .privacy
+                .app_rules
+                .iter()
+                .find(|rule| rule.app_name.eq_ignore_ascii_case(name))
+                .map(|rule| rule.level)
+        };
+        assert_eq!(level_of("WeChat"), Some(PrivacyLevel::Ignored));
+        assert_eq!(level_of("Slack"), Some(PrivacyLevel::Ignored));
+        assert_eq!(level_of("1Password"), Some(PrivacyLevel::Ignored));
+        assert_eq!(level_of("Notes"), None);
+        assert!(local
+            .privacy
+            .excluded_domains
+            .contains(&"bank.example".to_string()));
+        assert!(local
+            .privacy
+            .excluded_domains
+            .contains(&"mail.example".to_string()));
+    }
+
+    #[test]
+    fn 忽略应用收集应归一化可执行名并与匹配侧对称() {
+        let mut privacy = PrivacyConfig::default();
+        privacy.app_rules.push(AppPrivacyRule {
+            app_name: "msedge.exe".to_string(),
+            level: PrivacyLevel::Ignored,
+        });
+        let ignored = privacy.collect_ignored_app_names();
+        assert!(ignored.contains(&"microsoft edge".to_string()));
+        assert!(crate::privacy::matches_ignored_app("msedge.exe", &ignored));
+        assert!(crate::privacy::matches_ignored_app(
+            "Microsoft Edge",
+            &ignored
+        ));
+    }
+
+    #[test]
+    fn 远端隐私同步不得用空归一化通配或降级遗留规则或被别名遮蔽() {
+        let mut local = PrivacyConfig::default();
+        local.excluded_apps = vec!["1Password".to_string()];
+        local.app_rules = vec![AppPrivacyRule {
+            app_name: "WeChat".to_string(),
+            level: PrivacyLevel::Full,
+        }];
+        let mut remote = PrivacyConfig::default();
+        remote.app_rules = vec![
+            // .exe 归一化后为空，不得接收成为通配规则
+            AppPrivacyRule {
+                app_name: ".exe".to_string(),
+                level: PrivacyLevel::Ignored,
+            },
+            // 不得把本机遗留 excluded_apps 降级为 Anonymized
+            AppPrivacyRule {
+                app_name: "1Password".to_string(),
+                level: PrivacyLevel::Anonymized,
+            },
+            // 中文/可执行别名收紧
+            AppPrivacyRule {
+                app_name: "WeChat.exe".to_string(),
+                level: PrivacyLevel::Ignored,
+            },
+        ];
+        remote.excluded_apps = vec![".exe".to_string()];
+        let merged = merge_privacy_additive(&local, &remote);
+        assert_eq!(merged.get_app_privacy_level("VS Code"), PrivacyLevel::Full);
+        assert_eq!(
+            merged.get_app_privacy_level("1Password"),
+            PrivacyLevel::Ignored
+        );
+        assert_eq!(
+            merged.get_app_privacy_level("WeChat"),
+            PrivacyLevel::Ignored
+        );
+        // 空关键词不应匹配任意窗口标题
+        let mut empty_kw = PrivacyConfig::default();
+        empty_kw.excluded_keywords = vec!["".to_string(), "   ".to_string()];
+        assert!(!empty_kw.should_anonymize_by_keyword("Normal Window"));
+    }
+
+    #[test]
+    fn 远端单个字段类型不兼容时应跳过该字段而保留其余字段() {
+        let mut local = AppConfig::default();
+        local.theme = "light".to_string();
+        let remote = serde_json::json!({
+            "theme": "dark",
+            "work_start_hour": "not-a-number",
+        });
+        local.apply_synced_preferences(&remote);
+        assert_eq!(local.theme, "dark");
+        assert_eq!(local.work_start_hour, AppConfig::default().work_start_hour);
     }
 
     #[test]
@@ -2915,7 +3925,20 @@ mod tests {
             AiProvider::MiniMax.default_endpoint(),
             "https://api.minimaxi.com/v1"
         );
-        assert_eq!(AiProvider::MiniMax.default_model(), "MiniMax-M3");
+        assert_eq!(AiProvider::MiniMax.default_model(), "MiniMax-M3.1-Flash");
+    }
+
+    #[test]
+    fn 默认模型清单应对齐当前在役官方模型() {
+        assert_eq!(AiProvider::OpenAI.default_model(), "gpt-6.2-sol");
+        assert_eq!(AiProvider::Gemini.default_model(), "gemini-4-hydrogen");
+        assert_eq!(AiProvider::DeepSeek.default_model(), "deepseek-flash");
+        assert_eq!(AiProvider::Qwen.default_model(), "qwen3.8-flash");
+        assert_eq!(AiProvider::Moonshot.default_model(), "kimi-k3");
+        assert_eq!(AiProvider::MiniMax.default_model(), "MiniMax-M3.1-Flash");
+        assert_eq!(AiProvider::Zhipu.default_model(), "glm-5.3-flash");
+        assert_eq!(AiProvider::Claude.default_model(), "claude-sonnet-5-5");
+        assert_eq!(AppConfig::default().openai_model, "gpt-6.2-sol");
     }
 
     #[test]
@@ -3105,5 +4128,101 @@ mod tests {
 
         assert_eq!(config.node_gateway.device_name, None);
         assert_eq!(config.node_gateway.device_name, None);
+    }
+
+    #[test]
+    fn 任务模型分流应按场景解析并在配置不完整时回退主模型() {
+        let mut config = AppConfig::default();
+        config.text_model = ModelConfig {
+            provider: AiProvider::OpenAI,
+            endpoint: "https://api.openai.com/v1".to_string(),
+            api_key: Some("sk-main".to_string()),
+            model: "gpt-main".to_string(),
+            enable_thinking: None,
+            thinking_budget: None,
+            max_output_tokens: None,
+        };
+        config.text_model_provider_cache.insert(
+            "ollama".to_string(),
+            ModelConfig {
+                provider: AiProvider::Ollama,
+                endpoint: "http://localhost:11434".to_string(),
+                api_key: None,
+                model: "qwen3:8b".to_string(),
+                enable_thinking: None,
+                thinking_budget: None,
+                max_output_tokens: None,
+            },
+        );
+        // 缺少 API Key 的云端缓存不应被选中
+        config.text_model_provider_cache.insert(
+            "claude".to_string(),
+            ModelConfig {
+                provider: AiProvider::Claude,
+                endpoint: "https://api.anthropic.com/v1".to_string(),
+                api_key: None,
+                model: "claude-sonnet".to_string(),
+                enable_thinking: None,
+                thinking_budget: None,
+                max_output_tokens: None,
+            },
+        );
+        config.task_model_routing = TaskModelRouting {
+            report_provider: Some("claude".to_string()),
+            assistant_provider: None,
+            classification_provider: Some("ollama".to_string()),
+            proactive_provider: Some("ollama".to_string()),
+        };
+
+        assert_eq!(
+            config
+                .resolve_model_for_task(AiTaskKind::Classification)
+                .model,
+            "qwen3:8b"
+        );
+        assert_eq!(
+            config
+                .resolve_model_for_task(AiTaskKind::Proactive)
+                .provider,
+            AiProvider::Ollama
+        );
+        // 未指定或缺少 Key 均回退主模型
+        assert_eq!(
+            config.resolve_model_for_task(AiTaskKind::Assistant).model,
+            "gpt-main"
+        );
+        assert_eq!(
+            config.resolve_model_for_task(AiTaskKind::Report).model,
+            "gpt-main"
+        );
+    }
+
+    #[test]
+    fn 配置规范化应清理空白分流标题与重复git仓库路径() {
+        let mut config = AppConfig::default();
+        config.daily_report_export_section_heading = Some("  ## Work Review  ".to_string());
+        config.git_author_filter = Some("   ".to_string());
+        config.git_repo_paths = vec![
+            "  D:\\repo-a  ".to_string(),
+            "d:\\repo-a".to_string(),
+            "   ".to_string(),
+            "D:\\repo-b".to_string(),
+        ];
+        config.task_model_routing.report_provider = Some("  ".to_string());
+        config.task_model_routing.classification_provider = Some(" ollama ".to_string());
+
+        config.normalize();
+
+        assert_eq!(
+            config.daily_report_export_section_heading.as_deref(),
+            Some("## Work Review")
+        );
+        assert_eq!(config.git_author_filter, None);
+        assert_eq!(config.git_repo_paths, vec!["D:\\repo-a", "D:\\repo-b"]);
+        assert_eq!(config.task_model_routing.report_provider, None);
+        assert_eq!(
+            config.task_model_routing.classification_provider.as_deref(),
+            Some("ollama")
+        );
     }
 }

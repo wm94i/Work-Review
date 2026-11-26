@@ -1,6 +1,6 @@
 [package]
 name = "work-review"
-version = "1.1.4-rc.2"
+version = "1.2.0-rc.1"
 description = "个人工作回顾与AI日报助手"
 authors = ["WorkReview Team"]
 edition = "2021"
@@ -30,6 +30,9 @@ base64 = "0.21"
 
 # HTTP 客户端
 reqwest = { version = "0.11", features = ["json", "socks"] }
+# 仅为实现 reqwest 0.11 的自定义 DNS 解析器（`Resolve` 需要 hyper 0.14 的 `Name` 类型）；
+# 已是 reqwest 的传递依赖，不引入新代码。用于助手联网工具拒绝解析到内网/本机的地址。
+hyper = { version = "0.14", default-features = false, features = ["client", "tcp"] }
 
 # 日期时间
 chrono = { version = "0.4", features = ["serde"] }

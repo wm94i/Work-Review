@@ -692,8 +692,28 @@ pub fn emit_avatar_input(app: &AppHandle, payload: &AvatarInputPayload) {
     let _ = app.emit_to(AVATAR_WINDOW_LABEL, AVATAR_INPUT_EVENT, payload);
 }
 
+#[cfg(target_os = "windows")]
+static AVATAR_HWND: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// 供截图隐私遮罩识别本应用的透明桌宠窗口，避免把它当成不透明遮挡物。
+#[cfg(target_os = "windows")]
+pub(crate) fn avatar_hwnd_raw() -> usize {
+    AVATAR_HWND.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(target_os = "windows")]
+fn record_avatar_hwnd(window: &WebviewWindow) {
+    if let Ok(hwnd) = window.hwnd() {
+        AVATAR_HWND.store(hwnd.0 as usize, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 fn ensure_avatar_window(app: &AppHandle, scale: f64, body_hidden: bool) -> tauri::Result<()> {
-    if app.get_webview_window(AVATAR_WINDOW_LABEL).is_some() {
+    if let Some(existing) = app.get_webview_window(AVATAR_WINDOW_LABEL) {
+        #[cfg(target_os = "windows")]
+        record_avatar_hwnd(&existing);
+        #[cfg(not(target_os = "windows"))]
+        let _ = existing;
         return Ok(());
     }
 
@@ -717,7 +737,11 @@ fn ensure_avatar_window(app: &AppHandle, scale: f64, body_hidden: bool) -> tauri
         .skip_taskbar(true)
         .shadow(false)
         .focused(false)
+        .on_new_window(|_, _| tauri::webview::NewWindowResponse::Deny)
         .build()?;
+
+    #[cfg(target_os = "windows")]
+    record_avatar_hwnd(&window);
 
     let _ = window.set_always_on_top(true);
     let _ = window.set_visible_on_all_workspaces(true);

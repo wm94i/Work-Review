@@ -1,14 +1,42 @@
-use crate::bot_common::{build_device_list, handle_cmd, status_payload, UNKNOWN_CMD_REPLY};
+use crate::bot_common::{
+    build_device_list, handle_cmd, route_inbound_bot_message, shared_bot_http_client,
+    status_payload, timestamp_within_window_ms as timestamp_within_window, BotPipelineAction,
+    InboundBotMessage, BOT_SIGN_WINDOW_MS as DINGTALK_SIGN_WINDOW_MS, UNKNOWN_CMD_REPLY,
+};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use reqwest::Client;
 use std::path::Path;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
+#[cfg(test)]
+use std::time::{SystemTime, UNIX_EPOCH};
 use subtle::ConstantTimeEq;
 use work_review_core::config::AppConfig;
 
-/// 钉钉签名允许的时间窗口：±5 分钟（与企微一致；钉钉 timestamp 单位为毫秒）。
-/// 钉钉回调通常秒级到达，5 分钟窗口足够；收紧后避免 ±1 小时窗口内被截获请求重放。
-const DINGTALK_SIGN_WINDOW_MS: i64 = 5 * 60 * 1000;
+static DINGTALK_NL_SEMAPHORE: once_cell::sync::Lazy<std::sync::Arc<tokio::sync::Semaphore>> =
+    once_cell::sync::Lazy::new(|| std::sync::Arc::new(tokio::sync::Semaphore::new(4)));
+
+async fn post_dingtalk_reply(client: &Client, session_webhook: &str, text: &str) {
+    let reply_body = serde_json::json!({
+        "msgtype": "text",
+        "text": { "content": text }
+    });
+    match client
+        .post(session_webhook)
+        .json(&reply_body)
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => {}
+        Ok(resp) => {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            let body_preview = body.chars().take(500).collect::<String>();
+            log::warn!("钉钉异步回复失败 (HTTP {status}): {body_preview}");
+        }
+        Err(e) => log::warn!("钉钉异步回复异常: {e}"),
+    }
+}
 
 pub struct DingtalkResponse {
     pub status: u16,
@@ -46,34 +74,24 @@ fn verify_dingtalk_sign(app_secret: &str, timestamp: &str, sign: &str) -> bool {
     computed.as_bytes().ct_eq(sign.as_bytes()).into()
 }
 
-/// 校验钉钉 timestamp 是否在允许窗口内（防重放）。
-/// 钉钉 timestamp 是毫秒级 Unix 时间戳的字符串。
-fn timestamp_within_window(timestamp_ms_str: &str, window_ms: i64) -> bool {
-    let ts: i64 = match timestamp_ms_str.parse() {
-        Ok(t) => t,
-        Err(_) => return false,
-    };
-    let now_ms = match SystemTime::now().duration_since(UNIX_EPOCH) {
-        Ok(d) => d.as_millis() as i64,
-        Err(_) => return false,
-    };
-    (now_ms - ts).abs() <= window_ms
-}
-
-/// 校验 sessionWebhook 是否落在钉钉官方域名下，避免 SSRF。
+/// 校验 sessionWebhook 是否落在钉钉官方域名下，并拒绝自定义群机器人 `/robot/send`（防重定向外泄）。
 fn is_allowed_dingtalk_webhook(url: &str) -> bool {
     let parsed = match reqwest::Url::parse(url) {
         Ok(u) => u,
         Err(_) => return false,
     };
-    if parsed.scheme() != "https" {
+    if parsed.scheme() != "https" || !parsed.username().is_empty() || parsed.password().is_some() {
         return false;
     }
     let host = match parsed.host_str() {
         Some(h) => h.to_lowercase(),
         None => return false,
     };
-    host == "oapi.dingtalk.com" || host.ends_with(".dingtalk.com")
+    if !(host == "oapi.dingtalk.com" || host.ends_with(".dingtalk.com")) {
+        return false;
+    }
+    // 禁止被重定向到第三方自定义机器人 webhook（仅允许会话回复或官方 API 路径）
+    !parsed.path().eq_ignore_ascii_case("/robot/send")
 }
 
 /// 从钉钉文本消息中剥离 @机器人 标记，但不破坏邮箱地址等中间出现的 @。
@@ -104,6 +122,7 @@ pub async fn handle_dingtalk_callback(
     body: &str,
     config: &AppConfig,
     data_dir: &Path,
+    state: &std::sync::Arc<std::sync::Mutex<crate::AppState>>,
 ) -> DingtalkResponse {
     let app_secret = match config.dingtalk_app_secret.as_deref() {
         Some(s) if !s.is_empty() => s,
@@ -154,19 +173,108 @@ pub async fn handle_dingtalk_callback(
         .unwrap_or("");
 
     let devices = build_device_list(config, data_dir);
-    let client = match Client::builder().timeout(Duration::from_secs(35)).build() {
-        Ok(c) => c,
-        Err(e) => return DingtalkResponse::error(500, format!("HTTP client error: {e}")),
-    };
+    let client = shared_bot_http_client();
 
-    let reply = handle_cmd(
-        &client,
-        &devices,
+    // 统一入站管线：去重 + 发送者授权 + NL 并发/限流 + 命令分发
+    let (sender_id, message_id) = crate::bot_common::dingtalk_sender_and_message_id(&event);
+    let inbound = InboundBotMessage::standard(
+        crate::bot_common::BOT_PLATFORM_DINGTALK,
+        message_id,
+        sender_id,
         &text,
-        crate::bot_common::report_generate_timeout(config),
-    )
-    .await
-    .unwrap_or_else(|| UNKNOWN_CMD_REPLY.to_string());
+        true,
+    );
+
+    let reply = match route_inbound_bot_message(
+        state,
+        &inbound,
+        &DINGTALK_NL_SEMAPHORE,
+        config.bot_natural_language_enabled,
+        None,
+    ) {
+        BotPipelineAction::Duplicate => {
+            return DingtalkResponse::json(
+                200,
+                &status_payload("ignored", "duplicate_message", None),
+            );
+        }
+        BotPipelineAction::ImmediateReply { reason, text: msg } => {
+            if msg.is_empty() {
+                return DingtalkResponse::json(200, &status_payload("ignored", reason, None));
+            }
+            if matches!(reason, "nl_busy" | "nl_rate_limited") {
+                if session_webhook.is_empty() {
+                    return DingtalkResponse::json(
+                        200,
+                        &status_payload("ok", "processed", Some("无 sessionWebhook，无法回复")),
+                    );
+                }
+                if !is_allowed_dingtalk_webhook(session_webhook) {
+                    return DingtalkResponse::error(
+                        400,
+                        "sessionWebhook 域名不在钉钉白名单内，已拒绝出站请求",
+                    );
+                }
+                let client_bg = client.clone();
+                let webhook_bg = session_webhook.to_string();
+                tokio::spawn(async move {
+                    post_dingtalk_reply(&client_bg, &webhook_bg, &msg).await;
+                });
+                return DingtalkResponse::json(
+                    200,
+                    &status_payload("ok", reason, Some("已回复限流/繁忙提示")),
+                );
+            }
+            msg
+        }
+        BotPipelineAction::NaturalLanguage { permit, question } => {
+            if session_webhook.is_empty() {
+                drop(permit);
+                return DingtalkResponse::json(
+                    200,
+                    &status_payload("ok", "processed", Some("无 sessionWebhook，无法回复")),
+                );
+            }
+            if !is_allowed_dingtalk_webhook(session_webhook) {
+                drop(permit);
+                return DingtalkResponse::error(
+                    400,
+                    "sessionWebhook 域名不在钉钉白名单内，已拒绝出站请求",
+                );
+            }
+            let state_bg = state.clone();
+            let client_bg = client.clone();
+            let webhook_bg = session_webhook.to_string();
+            tokio::spawn(async move {
+                let _permit = permit;
+                post_dingtalk_reply(
+                    &client_bg,
+                    &webhook_bg,
+                    crate::bot_common::BOT_NL_THINKING_REPLY,
+                )
+                .await;
+                let answer = crate::bot_common::run_bot_natural_language_query(
+                    &state_bg,
+                    &question,
+                    crate::bot_common::BOT_PLATFORM_DINGTALK,
+                )
+                .await;
+                post_dingtalk_reply(&client_bg, &webhook_bg, &answer).await;
+            });
+            return DingtalkResponse::json(
+                200,
+                &status_payload("ok", "nl_accepted", Some("已受理自然语言问答")),
+            );
+        }
+        BotPipelineAction::Command { text: cmd_text, .. } => handle_cmd(
+            &client,
+            &devices,
+            &cmd_text,
+            crate::bot_common::report_generate_timeout(config),
+        )
+        .await
+        .unwrap_or_else(|| UNKNOWN_CMD_REPLY.to_string()),
+    };
 
     // 通过 sessionWebhook 回复，但必须先校验目标域名属于钉钉，避免 SSRF。
     if session_webhook.is_empty() {

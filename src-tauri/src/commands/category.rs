@@ -22,15 +22,19 @@ pub struct AppCategoryOverviewItem {
     pub screenshot_url: Option<String>,
 }
 
-/// 应用分类概览 —— 内部复用版
+/// 应用分类概览 —— 内部复用版（过滤忽略应用，脱敏应用隐藏截图 URL）
 pub(crate) fn get_app_category_overview_inner(
     state: &Arc<Mutex<AppState>>,
 ) -> Result<Vec<AppCategoryOverviewItem>, AppError> {
     let s = state.lock().map_err(|e| AppError::Unknown(e.to_string()))?;
+    let (ignored_apps, _) = super::shared::collect_privacy_filters(&s);
     let overview = s.database.get_app_category_overview()?;
 
     Ok(overview
         .into_iter()
+        .filter(|item| {
+            !work_review_core::privacy::matches_ignored_app(&item.app_name, &ignored_apps)
+        })
         .map(|item| {
             let override_category = work_review_core::categorize::find_collected_category_override(
                 &s.config.app_category_rules,
@@ -38,12 +42,19 @@ pub(crate) fn get_app_category_overview_inner(
                 &s.config.custom_categories,
             );
             let is_overridden = override_category.is_some();
+            let screenshot_url = if s.config.privacy.get_app_privacy_level(&item.app_name)
+                == work_review_core::config::PrivacyLevel::Full
+            {
+                item.screenshot_url
+            } else {
+                None
+            };
             AppCategoryOverviewItem {
                 app_name: item.app_name,
                 category: override_category.unwrap_or(item.category),
                 total_duration: item.total_duration,
                 is_overridden,
-                screenshot_url: item.screenshot_url,
+                screenshot_url,
             }
         })
         .collect())

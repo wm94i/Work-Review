@@ -24,6 +24,8 @@ const MARKDOWN_MAX_BYTES: usize = 20_480;
 const RECONNECT_RETRY_SECONDS: u64 = 3;
 const RECONNECT_RETRY_MAX_SECONDS: u64 = 60;
 const KICKED_RETRY_SECONDS: u64 = 60;
+static WECOM_AIBOT_NL_SEMAPHORE: once_cell::sync::Lazy<Arc<tokio::sync::Semaphore>> =
+    once_cell::sync::Lazy::new(|| Arc::new(tokio::sync::Semaphore::new(4)));
 
 #[derive(Default)]
 struct SharedBotStatus {
@@ -371,6 +373,28 @@ pub fn extract_callback_req_id(text: &str) -> Option<String> {
     parse_frame(text).and_then(|frame| frame_req_id(&frame).map(str::to_string))
 }
 
+/// 提取消息体中的发送者 userid 与消息 ID（用于发送者授权与去重）。
+pub fn extract_sender_and_message_id(text: &str) -> (String, String) {
+    let Some(frame) = parse_frame(text) else {
+        return (String::new(), String::new());
+    };
+    let Some(body) = frame.body.as_ref() else {
+        return (String::new(), String::new());
+    };
+    let sender = body
+        .get("from")
+        .and_then(|from| from.get("userid"))
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .to_string();
+    let message_id = body
+        .get("msgid")
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .to_string();
+    (sender, message_id)
+}
+
 pub fn extract_text_content(text: &str) -> Option<String> {
     let frame = parse_frame(text)?;
     let content = frame
@@ -490,10 +514,7 @@ async fn connect_and_serve(
     set_running(shared, true);
     log::info!("企业微信智能机器人长连接已订阅");
 
-    let http = reqwest::Client::builder()
-        .timeout(Duration::from_secs(35))
-        .build()
-        .map_err(|e| format!("HTTP 客户端创建失败: {e}"))?;
+    let http = crate::bot_common::shared_bot_http_client();
 
     let mut ping_ticks = interval(HEARTBEAT_INTERVAL);
     ping_ticks.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -508,7 +529,7 @@ async fn connect_and_serve(
             }
             outgoing = out_rx.recv() => {
                 let Some(frame) = outgoing else {
-                    continue;
+                    return Ok(SessionEnd::Closed);
                 };
                 if let Err(e) = write.send(Message::Text(frame)).await {
                     return Err(redact_secret(&format!("发送回复失败: {e}"), secret));
@@ -533,16 +554,53 @@ async fn connect_and_serve(
                             }
                             IncomingKind::NonTextMessage => {
                                 if let Some(req_id) = extract_callback_req_id(&text) {
-                                    let _ = write.send(Message::Text(
-                                        build_respond_markdown_frame(&req_id, NON_TEXT_REPLY),
-                                    )).await;
+                                    let (sender_id, message_id) =
+                                        extract_sender_and_message_id(&text);
+                                    match crate::bot_common::gate_bot_message(
+                                        state,
+                                        crate::bot_common::BOT_PLATFORM_WECOM,
+                                        &message_id,
+                                        &sender_id,
+                                        "",
+                                    ) {
+                                        crate::bot_common::BotMessageGate::Duplicate => {}
+                                        crate::bot_common::BotMessageGate::Reply(reply) => {
+                                            let _ = write
+                                                .send(Message::Text(build_respond_markdown_frame(
+                                                    &req_id, &reply,
+                                                )))
+                                                .await;
+                                        }
+                                        crate::bot_common::BotMessageGate::Proceed => {
+                                            let _ = write
+                                                .send(Message::Text(build_respond_markdown_frame(
+                                                    &req_id,
+                                                    NON_TEXT_REPLY,
+                                                )))
+                                                .await;
+                                        }
+                                    }
                                 }
                             }
                             IncomingKind::EnterChat => {
                                 if let Some(req_id) = extract_callback_req_id(&text) {
-                                    let _ = write.send(Message::Text(
-                                        build_welcome_frame(&req_id, HELP),
-                                    )).await;
+                                    let (sender_id, _) = extract_sender_and_message_id(&text);
+                                    let welcome = if crate::bot_common::is_sender_authorized(
+                                        state,
+                                        crate::bot_common::BOT_PLATFORM_WECOM,
+                                        &sender_id,
+                                    ) {
+                                        HELP.to_string()
+                                    } else {
+                                        crate::bot_common::BotSenderDecision::NeedBind
+                                            .reply()
+                                            .unwrap_or_default()
+                                    };
+                                    let _ = write
+                                        .send(Message::Text(build_welcome_frame(
+                                            &req_id, &welcome,
+                                        )))
+                                        .await;
                                 }
                             }
                             IncomingKind::SubscribeAck | IncomingKind::PingAck | IncomingKind::Ignored => {}
@@ -588,30 +646,76 @@ async fn handle_text_message(
 ) -> Option<String> {
     let req_id = extract_callback_req_id(text)?;
     let content = extract_text_content(text).unwrap_or_default();
-    if content.is_empty() {
-        return Some(build_respond_markdown_frame(&req_id, UNKNOWN_CMD_REPLY));
-    }
 
-    let (devices, generate_timeout) = match state.lock() {
-        Ok(s) => (
-            build_device_list(&s.config, &s.data_dir),
-            Duration::from_secs(s.config.report_generation_timeout_secs.max(60)),
-        ),
-        Err(e) => {
-            log::warn!("企业微信 Bot 获取设备列表失败: {e}");
-            (Vec::new(), Duration::from_secs(120))
+    // 统一入站管线：去重 + 发送者授权 + 空文本 + NL 并发/限流 + 命令分发
+    let (sender_id, message_id) = extract_sender_and_message_id(text);
+    let inbound = crate::bot_common::InboundBotMessage::standard(
+        crate::bot_common::BOT_PLATFORM_WECOM,
+        &message_id,
+        &sender_id,
+        &content,
+        true,
+    );
+    let nl_enabled = crate::bot_common::is_bot_natural_language_enabled(state);
+
+    match crate::bot_common::route_inbound_bot_message(
+        state,
+        &inbound,
+        &WECOM_AIBOT_NL_SEMAPHORE,
+        nl_enabled,
+        Some(crate::bot_common::EMPTY_TEXT_REPLY),
+    ) {
+        crate::bot_common::BotPipelineAction::Duplicate => None,
+        crate::bot_common::BotPipelineAction::ImmediateReply { text: reply, .. } => {
+            Some(build_respond_markdown_frame(&req_id, &reply))
         }
-    };
+        crate::bot_common::BotPipelineAction::NaturalLanguage { permit, question } => {
+            let _permit = permit;
+            // 已由 connect_and_serve 中的 tokio::spawn 异步执行并通过 out_tx 回写，不阻塞 WS 心跳与读循环
+            let reply = crate::bot_common::run_bot_natural_language_query(
+                state,
+                &question,
+                crate::bot_common::BOT_PLATFORM_WECOM,
+            )
+            .await;
+            Some(build_respond_markdown_frame(&req_id, &reply))
+        }
+        crate::bot_common::BotPipelineAction::Command { text: cmd_text, .. } => {
+            let (devices, generate_timeout) = match state.lock() {
+                Ok(s) => (
+                    build_device_list(&s.config, &s.data_dir),
+                    Duration::from_secs(s.config.report_generation_timeout_secs.max(60)),
+                ),
+                Err(e) => {
+                    log::warn!("企业微信 Bot 获取设备列表失败: {e}");
+                    (Vec::new(), Duration::from_secs(120))
+                }
+            };
 
-    let reply = handle_cmd(http, &devices, &content, generate_timeout)
-        .await
-        .unwrap_or_else(|| UNKNOWN_CMD_REPLY.to_string());
-    Some(build_respond_markdown_frame(&req_id, &reply))
+            let reply = handle_cmd(http, &devices, &cmd_text, generate_timeout)
+                .await
+                .unwrap_or_else(|| UNKNOWN_CMD_REPLY.to_string());
+            Some(build_respond_markdown_frame(&req_id, &reply))
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn 应能提取发送者与消息id() {
+        let frame = r#"{"cmd":"aibot_msg_callback","headers":{"req_id":"r1"},"body":{"msgid":"m-1","from":{"userid":"zhangsan"},"msgtype":"text","text":{"content":"/help"}}}"#;
+        assert_eq!(
+            extract_sender_and_message_id(frame),
+            ("zhangsan".to_string(), "m-1".to_string())
+        );
+        assert_eq!(
+            extract_sender_and_message_id("not json"),
+            (String::new(), String::new())
+        );
+    }
 
     #[test]
     fn 群聊at前缀应剥离后留下命令() {

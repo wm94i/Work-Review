@@ -18,7 +18,7 @@ test('Localhost API 应提供受保护的即时截图端点', () => {
   assert.match(apiSource, /handle_capture_screenshot\(state\)\.await/);
   assert.match(apiSource, /ensure_api_capture_enabled/);
   assert.match(apiSource, /spawn_blocking/);
-  assert.match(apiSource, /capture_for_window\(active_window\.as_ref\(\)\)/);
+  assert.match(apiSource, /capture_for_window_with_options\(active_window\.as_ref\(\), false\)/);
   assert.match(apiSource, /generate_full_image_base64/);
 });
 

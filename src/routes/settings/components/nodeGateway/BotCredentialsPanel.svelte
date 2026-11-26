@@ -1,6 +1,7 @@
 <script lang="ts">
   import { t } from '$lib/i18n/index.ts';
   import { createEventDispatcher } from 'svelte';
+  import BotSenderBindingPanel from './BotSenderBindingPanel.svelte';
 
   type EnabledKey =
     | 'feishu_bot_enabled'
@@ -11,6 +12,7 @@
     | 'feishu_app_id'
     | 'feishu_app_secret'
     | 'feishu_verification_token'
+    | 'feishu_encrypt_key'
     | 'wecom_corp_id'
     | 'wecom_token'
     | 'wecom_encoding_aes_key'
@@ -23,6 +25,7 @@
     feishu_app_id: string;
     feishu_app_secret: string;
     feishu_verification_token: string;
+    feishu_encrypt_key: string;
     wecom_corp_id: string;
     wecom_token: string;
     wecom_encoding_aes_key: string;
@@ -46,6 +49,8 @@
   export let iconPath = '';
   export let fields: CredentialField[] = [];
   export let saving = false;
+  /** 需要发送者授权的平台；为 null 时不显示授权区块 */
+  export let bindingPlatform: 'feishu' | 'dingtalk' | null = null;
 
   const dispatch = createEventDispatcher<{ save: null }>();
   let secretVisible: Partial<Record<CredentialFieldKey, boolean>> = {};
@@ -133,6 +138,9 @@
       </div>
       {#if hintKey}
         <p class="text-[11px] text-slate-400 dark:text-[#636c76]">{t(hintKey)}</p>
+      {/if}
+      {#if bindingPlatform}
+        <BotSenderBindingPanel platform={bindingPlatform} disabled={saving} />
       {/if}
     </div>
   {/if}

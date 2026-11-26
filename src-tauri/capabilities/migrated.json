@@ -1,6 +1,6 @@
 {
   "identifier": "migrated",
-  "description": "permissions that were migrated from v1",
+  "description": "Frontend IPC permissions (least privilege): window management, dialogs, opening external links and app restart",
   "local": true,
   "windows": [
     "main",
@@ -8,21 +8,6 @@
   ],
   "permissions": [
     "core:default",
-    "fs:allow-read-file",
-    "fs:allow-write-file",
-    "fs:allow-read-dir",
-    "fs:allow-copy-file",
-    "fs:allow-mkdir",
-    "fs:allow-remove",
-    "fs:allow-rename",
-    "fs:allow-exists",
-    {
-      "identifier": "fs:scope",
-      "allow": [
-        "$APP/**",
-        "$RESOURCE/**"
-      ]
-    },
     "core:window:allow-create",
     "core:window:allow-center",
     "core:window:allow-request-user-attention",
@@ -56,29 +41,12 @@
     "core:window:allow-set-ignore-cursor-events",
     "core:window:allow-start-dragging",
     "core:webview:allow-print",
-    {
-      "identifier": "shell:allow-execute",
-      "allow": [
-        {
-          "args": [{ "validator": "\\S+" }],
-          "cmd": "open",
-          "name": "open",
-          "sidecar": false
-        }
-      ]
-    },
     "shell:allow-open",
     "dialog:allow-open",
     "dialog:allow-save",
     "dialog:allow-message",
     "dialog:allow-ask",
     "dialog:allow-confirm",
-    "dialog:default",
-    "shell:default",
-    "fs:default",
-    "process:allow-restart",
-    "updater:allow-check",
-    "updater:allow-download-and-install",
-    "updater:default"
+    "process:allow-restart"
   ]
 }

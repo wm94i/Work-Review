@@ -3,10 +3,10 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 
 test('桌宠模型生成提醒应有独立开关且不影响本地规则提醒', async () => {
-  const [settingsSource, configSource, mainSource, zhCNSource, enSource, zhTWSource] = await Promise.all([
+  const [settingsSource, configSource, avatarTaskSource, zhCNSource, enSource, zhTWSource] = await Promise.all([
     readFile(new URL('./routes/settings/components/SettingsAppearance.svelte', import.meta.url), 'utf8'),
     readFile(new URL('../crates/core/src/config.rs', import.meta.url), 'utf8'),
-    readFile(new URL('../src-tauri/src/main.rs', import.meta.url), 'utf8'),
+    readFile(new URL('../src-tauri/src/tasks/avatar.rs', import.meta.url), 'utf8'),
     readFile(new URL('./lib/i18n/locales/zh-CN.ts', import.meta.url), 'utf8'),
     readFile(new URL('./lib/i18n/locales/en.ts', import.meta.url), 'utf8'),
     readFile(new URL('./lib/i18n/locales/zh-TW.ts', import.meta.url), 'utf8'),
@@ -16,10 +16,10 @@ test('桌宠模型生成提醒应有独立开关且不影响本地规则提醒',
   assert.match(configSource, /avatar_proactive_ai_enabled: false/);
   assert.match(configSource, /桌宠模型生成提醒默认应关闭/);
 
-  assert.match(mainSource, /avatar_proactive_ai_enabled/);
-  assert.match(mainSource, /avatar_proactive_ai_should_run\(/);
-  assert.match(mainSource, /if avatar_proactive_ai_should_run\(/);
-  assert.match(mainSource, /avatar_proactive_ai_should_run\([\s\S]{0,260}avatar_proactive_ai_enabled[\s\S]{0,260}&text_model/);
+  assert.match(avatarTaskSource, /avatar_proactive_ai_enabled/);
+  assert.match(avatarTaskSource, /avatar_proactive_ai_should_run\(/);
+  assert.match(avatarTaskSource, /if avatar_proactive_ai_should_run\(/);
+  assert.match(avatarTaskSource, /avatar_proactive_ai_should_run\([\s\S]{0,260}avatar_proactive_ai_enabled[\s\S]{0,260}&text_model/);
 
   assert.match(settingsSource, /toggleAvatarProactiveAi/);
   assert.match(settingsSource, /config\.avatar_proactive_ai_enabled/);

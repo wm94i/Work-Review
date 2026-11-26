@@ -8,15 +8,28 @@ use work_review_core::error::{AppError, Result};
 /// 递归遍历目录（替代 walkdir）
 fn walk_dir_recursive(dir: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
-    if let Ok(entries) = fs::read_dir(dir) {
-        for entry in entries.filter_map(|e| e.ok()) {
-            let path = entry.path();
-            if path.is_dir() {
-                files.extend(walk_dir_recursive(&path));
-            } else {
-                files.push(path);
+    match fs::read_dir(dir) {
+        Ok(entries) => {
+            for entry in entries {
+                let entry = match entry {
+                    Ok(e) => e,
+                    Err(e) => {
+                        log::warn!("遍历存储目录条目失败 {}: {e}", dir.display());
+                        continue;
+                    }
+                };
+                let path = entry.path();
+                if path.is_dir() {
+                    files.extend(walk_dir_recursive(&path));
+                } else {
+                    files.push(path);
+                }
             }
         }
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            log::warn!("读取存储目录失败 {}: {e}", dir.display());
+        }
+        Err(_) => {}
     }
     files
 }

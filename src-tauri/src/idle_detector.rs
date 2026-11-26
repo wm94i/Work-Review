@@ -18,23 +18,35 @@ const IDLE_SAMPLE_CACHE_TTL_MS: u64 = 500;
 
 /// 空闲检测器
 pub struct IdleDetector {
-    /// 空闲超时时间（秒）
-    idle_timeout_secs: u64,
+    /// 空闲超时时间（秒），支持配置热更新即时生效
+    idle_timeout_secs: AtomicU64,
 }
 
 impl IdleDetector {
     /// 创建空闲检测器
     pub fn new(idle_timeout_minutes: u64) -> Self {
         Self {
-            idle_timeout_secs: idle_timeout_minutes * 60,
+            idle_timeout_secs: AtomicU64::new(idle_timeout_minutes.max(1) * 60),
         }
+    }
+
+    /// 实时更新空闲阈值（分钟），配置变更后立即生效
+    pub fn set_threshold_minutes(&self, idle_timeout_minutes: u64) {
+        self.idle_timeout_secs
+            .store(idle_timeout_minutes.max(1) * 60, Ordering::Relaxed);
+    }
+
+    /// 获取当前生效的空闲阈值（秒）
+    pub fn threshold_secs(&self) -> u64 {
+        self.idle_timeout_secs.load(Ordering::Relaxed)
     }
 
     /// 第一阶段：检查键鼠是否超时
     /// 返回 true 表示键鼠超时（可能空闲），需要进一步用截图哈希确认
+    #[allow(dead_code)]
     pub fn is_input_idle(&self) -> bool {
         let idle_secs = get_idle_seconds();
-        idle_secs >= self.idle_timeout_secs
+        idle_secs >= self.threshold_secs()
     }
 
     /// 第二阶段：用截图哈希判断屏幕是否长时间无变化。
@@ -330,5 +342,15 @@ mod tests {
         assert_eq!(parse_dbus_idle_ms(screensaver), Some(4200));
         assert_eq!(parse_dbus_idle_ms(""), None);
         assert_eq!(parse_dbus_idle_ms("   string \"oops\"\n"), None);
+    }
+
+    #[test]
+    fn 空闲阈值支持运行时热更新且最小为1分钟() {
+        let detector = IdleDetector::new(5);
+        assert_eq!(detector.threshold_secs(), 300);
+        detector.set_threshold_minutes(12);
+        assert_eq!(detector.threshold_secs(), 720);
+        detector.set_threshold_minutes(0);
+        assert_eq!(detector.threshold_secs(), 60);
     }
 }

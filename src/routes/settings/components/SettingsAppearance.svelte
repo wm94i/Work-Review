@@ -848,17 +848,17 @@
       <!-- 模糊度 -->
       <div class="settings-block">
         <div class="flex items-center justify-between">
-          <span class="settings-text">{t('settingsAppearance.bgBlur')}</span>
+          <span id="settings-appearance-bg-blur-label" class="settings-text">{t('settingsAppearance.bgBlur')}</span>
           <span class="settings-muted">{blurLabels[config.background_blur ?? 1]}</span>
         </div>
-        <div class="flex gap-2">
+        <div class="ui-seg-group" role="group" aria-labelledby="settings-appearance-bg-blur-label">
           {#each [0, 1, 2] as level}
+            {@const selected = (config.background_blur ?? 1) === level}
             <button
+              type="button"
+              aria-pressed={selected}
               on:click={() => updateBgBlur(level)}
-              class="segment-btn
-                {(config.background_blur ?? 1) === level
-                  ? 'settings-segment-active'
-                  : 'settings-segment-base'}"
+              class="ui-seg-item {selected ? 'ui-seg-item-active' : ''}"
             >
               {blurLabels[level]}
             </button>

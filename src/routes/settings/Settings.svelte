@@ -1,11 +1,12 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { onDestroy, onMount } from 'svelte';
   import type { ComponentProps } from 'svelte';
   import { invoke } from '@tauri-apps/api/core';
   import { cache } from '../../lib/stores/cache.ts';
   import { locale, t } from '$lib/i18n/index.ts';
   import { formatUserError } from '$lib/utils/errorDisplay.ts';
   import { showToast } from '../../lib/stores/toast.ts';
+  import { resolveActiveSettingsSection } from './settingsScrollSpy.ts';
 
   import SettingsGeneral from './components/SettingsGeneral.svelte';
   import SettingsAppearance from './components/SettingsAppearance.svelte';
@@ -14,6 +15,7 @@
   import SettingsNodeGateway from './components/SettingsNodeGateway.svelte';
   import SettingsSystem from './components/SettingsSystem.svelte';
   import SettingsPrivacy from './components/SettingsPrivacy.svelte';
+  import SettingsProjects from './components/SettingsProjects.svelte';
   import SettingsStorage from './components/SettingsStorage.svelte';
 
   type GeneralConfig = ComponentProps<SettingsGeneral>['config'];
@@ -21,6 +23,7 @@
   type AiConfig = ComponentProps<SettingsAI>['config'];
   type NodeGatewayConfig = ComponentProps<SettingsNodeGateway>['config'];
   type PrivacyConfig = ComponentProps<SettingsPrivacy>['config'];
+  type ProjectsConfig = ComponentProps<SettingsProjects>['config'];
   type StorageConfig = ComponentProps<SettingsStorage>['config'];
   type AiProvider = NonNullable<ComponentProps<SettingsAI>['providers']>[number];
   type StorageStats = NonNullable<ComponentProps<SettingsStorage>['storageStats']>;
@@ -35,7 +38,6 @@
 
   interface RootSettingsFields {
     ai_provider: LegacyModelConfig;
-    text_model_profiles: unknown[];
     daily_report_custom_prompt: string;
     daily_report_prompt_presets: unknown[];
     vision_model: LegacyModelConfig;
@@ -52,6 +54,7 @@
     & AiConfig
     & NodeGatewayConfig
     & PrivacyConfig
+    & ProjectsConfig
     & StorageConfig
     & RootSettingsFields;
 
@@ -61,6 +64,7 @@
     | 'feishu_app_id'
     | 'feishu_app_secret'
     | 'feishu_verification_token'
+    | 'feishu_encrypt_key'
     | 'wecom_corp_id'
     | 'wecom_token'
     | 'wecom_encoding_aes_key'
@@ -91,7 +95,7 @@
   } & {
     ai_provider: LegacyModelConfig | null;
     text_model: AiConfig['text_model'] | null;
-    text_model_profiles?: unknown[];
+    text_model_profiles?: AiConfig['text_model_profiles'];
     daily_report_custom_prompt?: string;
     daily_report_prompt_presets?: unknown[];
     node_gateway: (Partial<NodeGatewayConfig['node_gateway']> & { device_name: string | null }) | null;
@@ -106,7 +110,7 @@
     ui_visual_style: string;
   };
 
-  type SettingsTabId = 'general' | 'appearance' | 'ai' | 'avatar' | 'privacy' | 'storage' | 'node';
+  type SettingsTabId = 'general' | 'appearance' | 'ai' | 'avatar' | 'projects' | 'privacy' | 'storage' | 'node';
 
   interface SettingsTab {
     id: SettingsTabId;
@@ -119,6 +123,8 @@
   let loading = true;
   let saving = false;
   let dirty = false;
+  let restoringBackup = false;
+  let saveConfigPromise: Promise<void> | null = null;
   let error: string | null = null;
   let success = false;
   let providers: AiProvider[] = [];
@@ -131,14 +137,274 @@
   let successTimer: ReturnType<typeof setTimeout> | null = null;
   $: currentLocale = $locale;
 
-  // 当前激活的标签
+  // 当前激活的导航项（连续滚动时随视口自动高亮，点击导航可平滑定位）
   let activeTab: SettingsTabId = 'general';
+  let tabRailEl: HTMLElement | null = null;
+  let stageShellEl: HTMLElement | null = null;
+  let activeScrollContainer: HTMLElement | null = null;
+  let scrollLockTarget: SettingsTabId | null = null;
+  let scrollLockTimer: ReturnType<typeof setTimeout> | null = null;
+
+  let scrollLockRafId: number | null = null;
+
+  const SCROLL_SPY_ACTIVATION_OFFSET = 120;
+  const SCROLL_LOCK_DURATION_MS = 700;
+
+  function clearScrollLock() {
+    scrollLockTarget = null;
+    if (scrollLockTimer !== null) {
+      clearTimeout(scrollLockTimer);
+      scrollLockTimer = null;
+    }
+    if (scrollLockRafId !== null && typeof cancelAnimationFrame === 'function') {
+      cancelAnimationFrame(scrollLockRafId);
+      scrollLockRafId = null;
+    }
+  }
+
+  function isHorizontalTabRail(): boolean {
+    if (!tabRailEl || typeof window === 'undefined' || typeof window.getComputedStyle !== 'function') {
+      return false;
+    }
+    return window.getComputedStyle(tabRailEl).flexDirection === 'row';
+  }
+
+  function getStickyScrollTopOffset(): number {
+    if (tabRailEl && isHorizontalTabRail()) {
+      return Math.ceil(tabRailEl.getBoundingClientRect().height) + 12;
+    }
+    return 16;
+  }
+
+  function keepActiveNavItemVisible(tabId: SettingsTabId) {
+    if (!tabRailEl) return;
+    const activeButton = tabRailEl.querySelector<HTMLElement>(`[data-settings-nav="${tabId}"]`);
+    if (!activeButton) return;
+
+    // 仅在导航容器内部按需滚动，避免 scrollIntoView 误触发外层主滚动区回弹
+    const railRect = tabRailEl.getBoundingClientRect();
+    const btnRect = activeButton.getBoundingClientRect();
+    if (tabRailEl.scrollWidth > tabRailEl.clientWidth + 1) {
+      if (btnRect.left < railRect.left) {
+        tabRailEl.scrollLeft -= railRect.left - btnRect.left + 8;
+      } else if (btnRect.right > railRect.right) {
+        tabRailEl.scrollLeft += btnRect.right - railRect.right + 8;
+      }
+    }
+    if (tabRailEl.scrollHeight > tabRailEl.clientHeight + 1) {
+      if (btnRect.top < railRect.top) {
+        tabRailEl.scrollTop -= railRect.top - btnRect.top + 8;
+      } else if (btnRect.bottom > railRect.bottom) {
+        tabRailEl.scrollTop += btnRect.bottom - railRect.bottom + 8;
+      }
+    }
+  }
+
+  function syncActiveSectionFromScroll() {
+    if (!stageShellEl || scrollLockTarget !== null) return;
+
+    const sectionEls = Array.from(
+      stageShellEl.querySelectorAll<HTMLElement>('[data-settings-section]'),
+    );
+    if (sectionEls.length === 0) return;
+
+    const containerTop = activeScrollContainer
+      ? activeScrollContainer.getBoundingClientRect().top
+      : 0;
+    const measurements = sectionEls
+      .map((el) => ({
+        id: el.dataset.settingsSection as SettingsTabId,
+        top: el.getBoundingClientRect().top - containerTop,
+      }))
+      .filter((item) => Boolean(item.id));
+
+    const atBottom = activeScrollContainer
+      ? activeScrollContainer.scrollHeight > activeScrollContainer.clientHeight + 8
+        && activeScrollContainer.scrollTop + activeScrollContainer.clientHeight
+          >= activeScrollContainer.scrollHeight - 12
+      : typeof document !== 'undefined'
+        && document.documentElement.scrollHeight > window.innerHeight + 8
+        && window.scrollY + window.innerHeight >= document.documentElement.scrollHeight - 12;
+
+    const stickyExtra = isHorizontalTabRail() ? getStickyScrollTopOffset() : 0;
+    const nextActive = resolveActiveSettingsSection(measurements, {
+      activationOffset: SCROLL_SPY_ACTIVATION_OFFSET + stickyExtra,
+      atBottom,
+      fallback: activeTab,
+    });
+
+    if (nextActive !== activeTab) {
+      activeTab = nextActive;
+      keepActiveNavItemVisible(nextActive);
+    }
+  }
+
+  function scrollToSection(tabId: SettingsTabId) {
+    activeTab = tabId;
+    keepActiveNavItemVisible(tabId);
+
+    if (!stageShellEl) return;
+    const target = stageShellEl.querySelector<HTMLElement>(`[data-settings-section="${tabId}"]`);
+    if (!target) return;
+
+    const prefersReducedMotion = typeof window !== 'undefined'
+      && typeof window.matchMedia === 'function'
+      && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    const behavior: ScrollBehavior = prefersReducedMotion ? 'auto' : 'smooth';
+
+    clearScrollLock();
+    scrollLockTarget = tabId;
+    if (behavior === 'auto' && typeof requestAnimationFrame === 'function') {
+      scrollLockRafId = requestAnimationFrame(() => {
+        scrollLockTarget = null;
+        scrollLockRafId = null;
+      });
+    } else {
+      scrollLockTimer = setTimeout(() => {
+        scrollLockTarget = null;
+        scrollLockTimer = null;
+      }, SCROLL_LOCK_DURATION_MS);
+    }
+
+    const topOffset = getStickyScrollTopOffset();
+    if (activeScrollContainer && typeof activeScrollContainer.scrollTo === 'function') {
+      const containerRect = activeScrollContainer.getBoundingClientRect();
+      const targetRect = target.getBoundingClientRect();
+      const nextTop = Math.max(
+        0,
+        activeScrollContainer.scrollTop + (targetRect.top - containerRect.top) - topOffset,
+      );
+      activeScrollContainer.scrollTo({ top: nextTop, behavior });
+    } else if (typeof window !== 'undefined' && typeof window.scrollTo === 'function') {
+      const nextTop = Math.max(
+        0,
+        window.scrollY + target.getBoundingClientRect().top - topOffset,
+      );
+      window.scrollTo({ top: nextTop, behavior });
+    } else if (typeof target.scrollIntoView === 'function') {
+      target.scrollIntoView({ behavior, block: 'start' });
+    }
+  }
+
+  const SCROLL_INTERRUPT_KEYS = new Set([
+    'ArrowDown',
+    'ArrowUp',
+    'PageDown',
+    'PageUp',
+    'Home',
+    'End',
+    ' ',
+  ]);
+
+  function attachScrollSpy(node: HTMLElement) {
+    stageShellEl = node;
+    tabRailEl = node.parentElement?.querySelector<HTMLElement>('.settings-tab-rail') ?? null;
+    activeScrollContainer = node.closest<HTMLElement>('.app-shell-main-scroll');
+    const scrollTarget: HTMLElement | Window = activeScrollContainer ?? window;
+    let rafId: number | null = null;
+
+    const cancelScheduledSync = () => {
+      if (rafId !== null) {
+        cancelAnimationFrame(rafId);
+        rafId = null;
+      }
+    };
+
+    const scheduleSync = () => {
+      // 点击定位锁定期间禁止入队 rAF，防止最后一帧 scroll → scrollend 解除锁 → 旧 rAF 误回写
+      if (scrollLockTarget !== null || rafId !== null) return;
+      rafId = requestAnimationFrame(() => {
+        rafId = null;
+        syncActiveSectionFromScroll();
+      });
+    };
+
+    const handleUserInterrupt = () => {
+      if (scrollLockTarget !== null) {
+        clearScrollLock();
+        scheduleSync();
+      }
+    };
+
+    const handlePointerInterrupt = (event: Event) => {
+      if (scrollLockTarget === null) return;
+      if (tabRailEl && event.target instanceof Node && tabRailEl.contains(event.target)) {
+        return;
+      }
+      handleUserInterrupt();
+    };
+
+    const handleKeyInterrupt = (event: KeyboardEvent) => {
+      if (scrollLockTarget === null || !SCROLL_INTERRUPT_KEYS.has(event.key)) return;
+      const targetEl = event.target as HTMLElement | null;
+      if (
+        targetEl
+        && (targetEl.tagName === 'INPUT'
+          || targetEl.tagName === 'TEXTAREA'
+          || targetEl.tagName === 'SELECT'
+          || targetEl.isContentEditable)
+      ) {
+        return;
+      }
+      handleUserInterrupt();
+    };
+
+    const handleScrollEnd = () => {
+      if (scrollLockTarget !== null) {
+        // 先取消任何残余 rAF 再解除点击定位锁，保留用户显式选中的导航项，避免末尾较短分组被 atBottom 抢占
+        cancelScheduledSync();
+        clearScrollLock();
+      }
+    };
+
+    let resizeObserver: ResizeObserver | null = null;
+    if (typeof ResizeObserver === 'function') {
+      resizeObserver = new ResizeObserver(() => {
+        scheduleSync();
+      });
+      resizeObserver.observe(node);
+    }
+
+    scrollTarget.addEventListener('scroll', scheduleSync, { passive: true });
+    scrollTarget.addEventListener('scrollend', handleScrollEnd, { passive: true });
+    scrollTarget.addEventListener('wheel', handleUserInterrupt, { passive: true });
+    scrollTarget.addEventListener('touchstart', handleUserInterrupt, { passive: true });
+    scrollTarget.addEventListener('pointerdown', handlePointerInterrupt, { passive: true });
+    window.addEventListener('keydown', handleKeyInterrupt, { passive: true });
+    window.addEventListener('resize', scheduleSync, { passive: true });
+    scheduleSync();
+
+    return {
+      destroy() {
+        scrollTarget.removeEventListener('scroll', scheduleSync);
+        scrollTarget.removeEventListener('scrollend', handleScrollEnd);
+        scrollTarget.removeEventListener('wheel', handleUserInterrupt);
+        scrollTarget.removeEventListener('touchstart', handleUserInterrupt);
+        scrollTarget.removeEventListener('pointerdown', handlePointerInterrupt);
+        window.removeEventListener('keydown', handleKeyInterrupt);
+        window.removeEventListener('resize', scheduleSync);
+        resizeObserver?.disconnect();
+        cancelScheduledSync();
+        clearScrollLock();
+        if (stageShellEl === node) {
+          stageShellEl = null;
+          tabRailEl = null;
+          activeScrollContainer = null;
+        }
+      },
+    };
+  }
+
+  onDestroy(() => {
+    clearScrollLock();
+  });
 
   const tabs: SettingsTab[] = [
     { id: 'general', labelKey: 'settings.tabs.general', icon: 'general' },
     { id: 'appearance', labelKey: 'settings.tabs.appearance', icon: 'appearance' },
     { id: 'ai', labelKey: 'settings.tabs.ai', icon: 'ai' },
     { id: 'avatar', labelKey: 'settings.tabs.avatar', icon: 'avatar', beta: true },
+    { id: 'projects', labelKey: 'settings.tabs.projects', icon: 'projects' },
     { id: 'privacy', labelKey: 'settings.tabs.privacy', icon: 'privacy' },
     { id: 'storage', labelKey: 'settings.tabs.storage', icon: 'storage' },
     { id: 'node', labelKey: 'settings.tabs.node', icon: 'node', beta: true },
@@ -177,6 +443,14 @@
       if (!loadedConfig.text_model_provider_cache) {
         loadedConfig.text_model_provider_cache = {};
       }
+      if (!loadedConfig.task_model_routing || typeof loadedConfig.task_model_routing !== 'object') {
+        loadedConfig.task_model_routing = {
+          report_provider: null,
+          assistant_provider: null,
+          classification_provider: null,
+          proactive_provider: null,
+        };
+      }
       if (typeof loadedConfig.daily_report_custom_prompt !== 'string') {
         loadedConfig.daily_report_custom_prompt = '';
       }
@@ -185,6 +459,24 @@
       }
       if (typeof loadedConfig.daily_report_auto_export !== 'boolean') {
         loadedConfig.daily_report_auto_export = false;
+      }
+      if (typeof loadedConfig.daily_report_export_frontmatter !== 'boolean') {
+        loadedConfig.daily_report_export_frontmatter = false;
+      }
+      if (
+        typeof loadedConfig.daily_report_export_section_heading !== 'string' &&
+        loadedConfig.daily_report_export_section_heading !== null
+      ) {
+        loadedConfig.daily_report_export_section_heading = null;
+      }
+      if (typeof loadedConfig.git_report_enabled !== 'boolean') {
+        loadedConfig.git_report_enabled = false;
+      }
+      if (!Array.isArray(loadedConfig.git_repo_paths)) {
+        loadedConfig.git_repo_paths = [];
+      }
+      if (typeof loadedConfig.git_author_filter !== 'string' && loadedConfig.git_author_filter !== null) {
+        loadedConfig.git_author_filter = null;
       }
       if (!Array.isArray(loadedConfig.daily_report_prompt_presets)) {
         loadedConfig.daily_report_prompt_presets = [];
@@ -228,6 +520,9 @@
       if (typeof loadedConfig.feishu_verification_token !== 'string' && loadedConfig.feishu_verification_token !== null) {
         loadedConfig.feishu_verification_token = null;
       }
+      if (typeof loadedConfig.feishu_encrypt_key !== 'string' && loadedConfig.feishu_encrypt_key !== null) {
+        loadedConfig.feishu_encrypt_key = null;
+      }
       if (typeof loadedConfig.wecom_bot_enabled !== 'boolean') {
         loadedConfig.wecom_bot_enabled = false;
       }
@@ -252,7 +547,17 @@
       if (typeof loadedConfig.dingtalk_app_secret !== 'string' && loadedConfig.dingtalk_app_secret !== null) {
         loadedConfig.dingtalk_app_secret = null;
       }
-      if (!loadedConfig.node_gateway || typeof loadedConfig.node_gateway !== 'object') {
+      if (typeof loadedConfig.semantic_auto_index !== 'boolean') {
+        loadedConfig.semantic_auto_index = false;
+      }
+      if (typeof loadedConfig.bot_natural_language_enabled !== 'boolean') {
+        loadedConfig.bot_natural_language_enabled = false;
+      }
+      if (
+        !loadedConfig.node_gateway ||
+        typeof loadedConfig.node_gateway !== 'object' ||
+        Array.isArray(loadedConfig.node_gateway)
+      ) {
         loadedConfig.node_gateway = {
           device_name: null,
         };
@@ -263,8 +568,25 @@
       ) {
         loadedConfig.node_gateway.device_name = null;
       }
-      if (!loadedConfig.vision_model) {
+      if (
+        !loadedConfig.vision_model ||
+        typeof loadedConfig.vision_model !== 'object' ||
+        Array.isArray(loadedConfig.vision_model)
+      ) {
         loadedConfig.vision_model = { provider: 'ollama', endpoint: 'http://localhost:11434', api_key: null, model: 'llava' };
+      } else {
+        if (typeof loadedConfig.vision_model.provider !== 'string' || !loadedConfig.vision_model.provider.trim()) {
+          loadedConfig.vision_model.provider = 'ollama';
+        }
+        if (typeof loadedConfig.vision_model.endpoint !== 'string') {
+          loadedConfig.vision_model.endpoint = 'http://localhost:11434';
+        }
+        if (typeof loadedConfig.vision_model.model !== 'string') {
+          loadedConfig.vision_model.model = 'llava';
+        }
+        if (typeof loadedConfig.vision_model.api_key !== 'string' && loadedConfig.vision_model.api_key !== null) {
+          loadedConfig.vision_model.api_key = null;
+        }
       }
       if (typeof loadedConfig.lightweight_mode !== 'boolean') {
         loadedConfig.lightweight_mode = false;
@@ -304,9 +626,19 @@
         loadedConfig.storage.screenshot_width_mode = 'auto';
       }
       if (!loadedConfig.app_category_rules) loadedConfig.app_category_rules = [];
+      if (!Array.isArray(loadedConfig.projects)) loadedConfig.projects = [];
       if (!loadedConfig.privacy) loadedConfig.privacy = {};
       if (!loadedConfig.privacy.app_rules) loadedConfig.privacy.app_rules = [];
       if (!loadedConfig.privacy.excluded_keywords) loadedConfig.privacy.excluded_keywords = [];
+      if (typeof loadedConfig.privacy.skip_private_windows !== 'boolean') {
+        loadedConfig.privacy.skip_private_windows = true;
+      }
+      if (
+        loadedConfig.privacy.unknown_url_fallback !== 'record' &&
+        loadedConfig.privacy.unknown_url_fallback !== 'anonymize'
+      ) {
+        loadedConfig.privacy.unknown_url_fallback = null;
+      }
       delete loadedConfig.privacy.sensitive_keywords;
 
       config = loadedConfig as SettingsConfig;
@@ -342,39 +674,72 @@
 
   // 保存配置
   async function saveConfig() {
-    if (!config) return;
+    if (!config || restoringBackup) return;
+    if (saveConfigPromise) return saveConfigPromise;
     const currentConfig = config;
     saving = true;
     error = null;
     success = false;
 
+    const run = (async () => {
+      try {
+        const rawInterval = Number(currentConfig.screenshot_interval);
+        currentConfig.screenshot_interval = Number.isFinite(rawInterval)
+          ? Math.max(5, Math.min(600, Math.round(rawInterval)))
+          : 30;
+        delete currentConfig.privacy?.sensitive_keywords;
+        await invoke<void>('save_config', { config: currentConfig });
+        success = true;
+        dirty = false;
+        cache.setConfig(currentConfig);
+        showToast(t('settings.saveSuccessToast'), 'success');
+
+        if (successTimer !== null) clearTimeout(successTimer);
+        successTimer = setTimeout(() => {
+          success = false;
+          successTimer = null;
+        }, 3000);
+      } catch (e) {
+        error = formatUserError(e, t('common.loadFailedRetry'));
+      } finally {
+        saving = false;
+      }
+    })();
+
+    saveConfigPromise = run;
     try {
-      delete currentConfig.privacy?.sensitive_keywords;
-      await invoke<void>('save_config', { config: currentConfig });
-      success = true;
-      dirty = false;
-      cache.setConfig(currentConfig);
-      showToast(t('settings.saveSuccessToast'), 'success');
-      
-      if (successTimer !== null) clearTimeout(successTimer);
-      successTimer = setTimeout(() => {
-        success = false;
-        successTimer = null;
-      }, 3000);
-    } catch (e) {
-      error = formatUserError(e, t('common.loadFailedRetry'));
+      await run;
     } finally {
-      saving = false;
+      if (saveConfigPromise === run) {
+        saveConfigPromise = null;
+      }
+    }
+  }
+
+  async function waitForPendingSave(): Promise<void> {
+    if (saveConfigPromise) {
+      try {
+        await saveConfigPromise;
+      } catch {
+        // 保存失败已在 saveConfig 内处理
+      }
     }
   }
 
   function handleSettingsChange(event: CustomEvent<unknown>) {
+    if (restoringBackup) return;
     const detail = event.detail;
     const autosaved = typeof detail === 'object'
       && detail !== null
       && 'autosaved' in detail
       && detail.autosaved === true;
-    dirty = !autosaved;
+    if (!autosaved) {
+      dirty = true;
+    }
+  }
+
+  function handleChildToast(event: CustomEvent<{ message: string; type: 'success' | 'error' }>) {
+    showToast(event.detail.message, event.detail.type);
   }
 
   // 清理缓存回调
@@ -403,6 +768,17 @@
     } catch (e) {
       console.error('切换数据目录后刷新状态失败:', e);
     }
+  }
+
+  function handleRestoreStateChange(event: CustomEvent<{ restoring: boolean }>) {
+    restoringBackup = event.detail.restoring;
+  }
+
+  async function handleBackupRestored() {
+    dirty = false;
+    restoringBackup = true;
+    cache.clear();
+    await loadConfig();
   }
 
   onMount(() => {
@@ -444,7 +820,7 @@
     <div class="settings-save-dock">
       <button
         on:click={saveConfig}
-        disabled={loading || saving}
+        disabled={loading || saving || restoringBackup}
         class="settings-action-primary px-4 rounded-xl"
       >
         {#if saving}
@@ -484,7 +860,9 @@
         <nav class="settings-tab-rail" aria-label={t('settings.title')}>
           {#each tabs as tab}
             <button
-              on:click={() => activeTab = tab.id}
+              type="button"
+              data-settings-nav={tab.id}
+              on:click={() => scrollToSection(tab.id)}
               class="settings-tab-rail-item {activeTab === tab.id ? 'settings-tab-rail-item-active' : ''}"
               aria-current={activeTab === tab.id ? 'page' : undefined}
             >
@@ -499,6 +877,8 @@
                   <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M5 7h14M5 12h14M5 17h10" /><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M4 5a2 2 0 012-2h12a2 2 0 012 2v14a2 2 0 01-2 2H6a2 2 0 01-2-2V5z" /></svg>
                 {:else if tab.icon === 'avatar'}
                   <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M7.5 9.5l1.5-3 3 2 3-2 1.5 3M7 14.5c0-2.5 2.239-4.5 5-4.5s5 2 5 4.5S14.761 19 12 19s-5-2-5-4.5z" /><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M10 14h.01M14 14h.01M10.5 16.5c.6.5 1 .75 1.5.75s.9-.25 1.5-.75" /></svg>
+                {:else if tab.icon === 'projects'}
+                  <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M3 7a2 2 0 012-2h4l2 2h8a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2V7z" /></svg>
                 {:else if tab.icon === 'privacy'}
                   <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" /></svg>
                 {:else if tab.icon === 'storage'}
@@ -517,40 +897,133 @@
           {/each}
         </nav>
 
-        <div class="settings-stage-shell">
-        {#if activeTab === 'general'}
-          <SettingsGeneral bind:config on:change={() => dirty = true} />
-        {:else if activeTab === 'appearance'}
-          <SettingsAppearance bind:config mode="background-only" on:change={handleSettingsChange} />
-        {:else if activeTab === 'node'}
-          <SettingsNodeGateway bind:config {dataDir} on:change={() => dirty = true} />
-        {:else if activeTab === 'ai'}
-          <div class="settings-card settings-ai-shell">
-            <h3 class="settings-card-title">{t('settings.aiCardTitle')}</h3>
-            <p class="settings-card-desc">{t('settings.aiCardDescription')}</p>
-            <SettingsAI bind:config {providers} on:change={() => dirty = true} />
-          </div>
-        {:else if activeTab === 'avatar'}
-          <SettingsAvatar bind:config on:change={() => dirty = true} />
-        {:else if activeTab === 'privacy'}
-          <SettingsPrivacy
-            bind:config
-            {runningApps}
-            {recentApps}
-            on:change={handleSettingsChange}
-            on:refresh-apps={() => { loadRunningApps(); loadRecentApps(); }}
-          />
-        {:else if activeTab === 'storage'}
-          <SettingsStorage
-            bind:config
-            {storageStats}
-            {dataDir}
-            {defaultDataDir}
-            on:change={() => dirty = true}
-            on:clearCache={handleClearCache}
-            on:dataDirChanged={handleDataDirChanged}
-          />
-        {/if}
+        <div class="settings-stage-shell" use:attachScrollSpy>
+          <section
+            id="settings-section-general"
+            data-settings-section="general"
+            class="settings-scroll-section"
+            class:settings-scroll-section-active={activeTab === 'general'}
+          >
+            <div class="settings-scroll-section-header">
+              <span class="settings-scroll-section-title">{t('settings.tabs.general')}</span>
+              <span class="settings-scroll-section-line" aria-hidden="true"></span>
+            </div>
+            <SettingsGeneral bind:config on:change={() => dirty = true} />
+          </section>
+
+          <section
+            id="settings-section-appearance"
+            data-settings-section="appearance"
+            class="settings-scroll-section"
+            class:settings-scroll-section-active={activeTab === 'appearance'}
+          >
+            <div class="settings-scroll-section-header">
+              <span class="settings-scroll-section-title">{t('settings.tabs.appearance')}</span>
+              <span class="settings-scroll-section-line" aria-hidden="true"></span>
+            </div>
+            <SettingsAppearance bind:config mode="background-only" on:change={handleSettingsChange} />
+          </section>
+
+          <section
+            id="settings-section-ai"
+            data-settings-section="ai"
+            class="settings-scroll-section"
+            class:settings-scroll-section-active={activeTab === 'ai'}
+          >
+            <div class="settings-scroll-section-header">
+              <span class="settings-scroll-section-title">{t('settings.tabs.ai')}</span>
+              <span class="settings-scroll-section-line" aria-hidden="true"></span>
+            </div>
+            <div class="settings-card settings-ai-shell">
+              <h3 class="settings-card-title">{t('settings.aiCardTitle')}</h3>
+              <p class="settings-card-desc">{t('settings.aiCardDescription')}</p>
+              <SettingsAI bind:config {providers} on:change={() => dirty = true} />
+            </div>
+          </section>
+
+          <section
+            id="settings-section-avatar"
+            data-settings-section="avatar"
+            class="settings-scroll-section"
+            class:settings-scroll-section-active={activeTab === 'avatar'}
+          >
+            <div class="settings-scroll-section-header">
+              <span class="settings-scroll-section-title">{t('settings.tabs.avatar')}</span>
+              <span class="settings-scroll-section-line" aria-hidden="true"></span>
+            </div>
+            <SettingsAvatar bind:config on:change={() => dirty = true} />
+          </section>
+
+          <section
+            id="settings-section-projects"
+            data-settings-section="projects"
+            class="settings-scroll-section"
+            class:settings-scroll-section-active={activeTab === 'projects'}
+          >
+            <div class="settings-scroll-section-header">
+              <span class="settings-scroll-section-title">{t('settings.tabs.projects')}</span>
+              <span class="settings-scroll-section-line" aria-hidden="true"></span>
+            </div>
+            <SettingsProjects bind:config on:change={handleSettingsChange} />
+          </section>
+
+          <section
+            id="settings-section-privacy"
+            data-settings-section="privacy"
+            class="settings-scroll-section"
+            class:settings-scroll-section-active={activeTab === 'privacy'}
+          >
+            <div class="settings-scroll-section-header">
+              <span class="settings-scroll-section-title">{t('settings.tabs.privacy')}</span>
+              <span class="settings-scroll-section-line" aria-hidden="true"></span>
+            </div>
+            <SettingsPrivacy
+              bind:config
+              {runningApps}
+              {recentApps}
+              on:change={handleSettingsChange}
+              on:refresh-apps={() => { loadRunningApps(); loadRecentApps(); }}
+            />
+          </section>
+
+          <section
+            id="settings-section-storage"
+            data-settings-section="storage"
+            class="settings-scroll-section"
+            class:settings-scroll-section-active={activeTab === 'storage'}
+          >
+            <div class="settings-scroll-section-header">
+              <span class="settings-scroll-section-title">{t('settings.tabs.storage')}</span>
+              <span class="settings-scroll-section-line" aria-hidden="true"></span>
+            </div>
+            <SettingsStorage
+              bind:config
+              {storageStats}
+              {dataDir}
+              {defaultDataDir}
+              hasUnsavedChanges={dirty}
+              restoreLocked={restoringBackup}
+              {waitForPendingSave}
+              on:change={handleSettingsChange}
+              on:clearCache={handleClearCache}
+              on:dataDirChanged={handleDataDirChanged}
+              on:restoreStateChange={handleRestoreStateChange}
+              on:backupRestored={handleBackupRestored}
+            />
+          </section>
+
+          <section
+            id="settings-section-node"
+            data-settings-section="node"
+            class="settings-scroll-section"
+            class:settings-scroll-section-active={activeTab === 'node'}
+          >
+            <div class="settings-scroll-section-header">
+              <span class="settings-scroll-section-title">{t('settings.tabs.node')}</span>
+              <span class="settings-scroll-section-line" aria-hidden="true"></span>
+            </div>
+            <SettingsNodeGateway bind:config {dataDir} on:change={handleSettingsChange} on:toast={handleChildToast} />
+          </section>
         </div>
       </div>
     </div>

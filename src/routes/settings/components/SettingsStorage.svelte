@@ -1,11 +1,13 @@
 <script lang="ts">
-  import { createEventDispatcher } from 'svelte';
+  import { createEventDispatcher, onDestroy } from 'svelte';
   import { invoke } from '@tauri-apps/api/core';
   import { ask, open as openDialog } from '@tauri-apps/plugin-dialog';
   import { cache } from '../../../lib/stores/cache.ts';
   import { locale, t } from '$lib/i18n/index.ts';
   import { showToast } from '$lib/stores/toast.ts';
+  import { formatUserError } from '$lib/utils/errorDisplay.ts';
   import CollapsibleSection from '../../../lib/components/CollapsibleSection.svelte';
+  import LocalizedDatePicker from '../../../lib/components/LocalizedDatePicker.svelte';
 
   interface ScreenshotStorageSettings {
     screenshots_enabled: boolean;
@@ -48,7 +50,26 @@
     storage: ScreenshotStorageSettings;
     daily_report_export_dir: string | null;
     daily_report_auto_export: boolean;
+    daily_report_export_frontmatter?: boolean;
+    daily_report_export_section_heading?: string | null;
+    git_report_enabled?: boolean;
+    git_repo_paths?: string[];
+    git_author_filter?: string | null;
     remote_storage?: RemoteStorageSettings;
+  }
+
+  interface GitCommitEntry {
+    hash: string;
+    timestamp: number;
+    timeLabel: string;
+    subject: string;
+  }
+
+  interface GitRepoSummary {
+    repoName: string;
+    repoPath: string;
+    branch?: string | null;
+    commits: GitCommitEntry[];
   }
 
   interface StorageStats {
@@ -90,16 +111,50 @@
     preservedEntries: string[];
     message: string;
   }
+
+  type DataExportFormat = 'csv' | 'json';
+
+  interface ExportActivitiesResult {
+    path: string;
+    count: number;
+    format: DataExportFormat;
+  }
+
+  interface ExportDailyStatsResult {
+    path: string;
+    days: number;
+    format: DataExportFormat;
+  }
+
+  interface CreateBackupResult {
+    backupDir: string;
+    fileCount: number;
+    totalBytes: number;
+    includesScreenshots: boolean;
+    includesSecrets: boolean;
+  }
+
+  interface RestoreBackupResult {
+    restoredFrom: string;
+    safetyBackupDir: string;
+    restoredFiles: number;
+    schemaVersion: number;
+  }
   
   export let config: StorageConfig;
   export let storageStats: StorageStats | null = null;
   export let dataDir = '';
   export let defaultDataDir = '';
+  export let hasUnsavedChanges = false;
+  export let restoreLocked = false;
+  export let waitForPendingSave: () => Promise<void> = async () => {};
   
   const dispatch = createEventDispatcher<{
-    change: StorageConfig;
+    change: StorageConfig | { autosaved: true };
     clearCache: void;
     dataDirChanged: ChangeDataDirResult;
+    restoreStateChange: { restoring: boolean };
+    backupRestored: RestoreBackupResult;
   }>();
   $: currentLocale = $locale;
   let isClearing = false;
@@ -116,6 +171,206 @@
   let s3SecretKeyVisible = false;
   let s3AccessKeyVisible = false;
   let webdavPasswordVisible = false;
+  let isPreviewingGit = false;
+  let gitPreviewLoaded = false;
+  let gitPreviewResults: GitRepoSummary[] = [];
+  let gitPreviewError = '';
+  let gitPreviewRequestId = 0;
+
+  function resetGitPreview() {
+    gitPreviewRequestId += 1;
+    isPreviewingGit = false;
+    gitPreviewLoaded = false;
+    gitPreviewResults = [];
+    gitPreviewError = '';
+  }
+
+  function getOffsetLocalIsoDate(offsetDays: number): string {
+    const now = new Date();
+    now.setDate(now.getDate() + offsetDays);
+    const year = now.getFullYear();
+    const month = String(now.getMonth() + 1).padStart(2, '0');
+    const day = String(now.getDate()).padStart(2, '0');
+    return `${year}-${month}-${day}`;
+  }
+
+  const dataExportFormats: DataExportFormat[] = ['csv', 'json'];
+  let dataExportFrom = getOffsetLocalIsoDate(-6);
+  let dataExportTo = getOffsetLocalIsoDate(0);
+  let dataExportFormat: DataExportFormat = 'csv';
+  let dataExportIncludeOcr = false;
+  let isExportingData = false;
+
+  let backupIncludeScreenshots = false;
+  let backupIncludeSecrets = false;
+  let isCreatingBackup = false;
+  let isRestoringBackup = false;
+  let restoreRestartPending = false;
+
+  async function runExportActivities() {
+    if (isExportingData) return;
+    isExportingData = true;
+    try {
+      const selected = await openDialog({
+        directory: true,
+        multiple: false,
+        defaultPath: config.daily_report_export_dir || dataDir || undefined,
+      });
+      if (!selected || Array.isArray(selected)) return;
+
+      const result = await invoke<ExportActivitiesResult>('export_activities', {
+        dateFrom: dataExportFrom,
+        dateTo: dataExportTo,
+        format: dataExportFormat,
+        includeOcr: dataExportIncludeOcr,
+        targetDir: selected,
+      });
+      showToast(
+        t('settingsStorage.dataExportActivitiesSuccess', {
+          count: result.count,
+          path: result.path,
+        }),
+        'success',
+      );
+    } catch (e) {
+      showToast(
+        t('settingsStorage.dataExportFailed', {
+          error: formatUserError(e, t('common.loadFailedRetry')),
+        }),
+        'error',
+      );
+    } finally {
+      isExportingData = false;
+    }
+  }
+
+  async function runExportDailyStats() {
+    if (isExportingData) return;
+    isExportingData = true;
+    try {
+      const selected = await openDialog({
+        directory: true,
+        multiple: false,
+        defaultPath: config.daily_report_export_dir || dataDir || undefined,
+      });
+      if (!selected || Array.isArray(selected)) return;
+
+      const result = await invoke<ExportDailyStatsResult>('export_daily_stats', {
+        dateFrom: dataExportFrom,
+        dateTo: dataExportTo,
+        format: dataExportFormat,
+        targetDir: selected,
+      });
+      showToast(
+        t('settingsStorage.dataExportStatsSuccess', {
+          days: result.days,
+          path: result.path,
+        }),
+        'success',
+      );
+    } catch (e) {
+      showToast(
+        t('settingsStorage.dataExportFailed', {
+          error: formatUserError(e, t('common.loadFailedRetry')),
+        }),
+        'error',
+      );
+    } finally {
+      isExportingData = false;
+    }
+  }
+
+  async function runCreateBackup() {
+    if (isCreatingBackup || isRestoringBackup || restoreRestartPending || restoreLocked) return;
+    isCreatingBackup = true;
+    try {
+      const selected = await openDialog({
+        directory: true,
+        multiple: false,
+      });
+      if (!selected || Array.isArray(selected)) return;
+
+      const result = await invoke<CreateBackupResult>('create_backup', {
+        targetDir: selected,
+        includeScreenshots: backupIncludeScreenshots,
+        includeSecrets: backupIncludeSecrets,
+      });
+      showToast(
+        t('settingsStorage.backupCreatedToast', {
+          files: result.fileCount,
+          path: result.backupDir,
+        }),
+        'success',
+      );
+    } catch (e) {
+      showToast(
+        t('settingsStorage.backupFailed', {
+          error: formatUserError(e, t('common.loadFailedRetry')),
+        }),
+        'error',
+      );
+    } finally {
+      isCreatingBackup = false;
+    }
+  }
+
+  async function runRestoreBackup() {
+    if (isCreatingBackup || isRestoringBackup || restoreRestartPending || restoreLocked) return;
+    isRestoringBackup = true;
+    cancelPendingPollingInterval();
+    dispatch('restoreStateChange', { restoring: true });
+    let restoredOk = false;
+    try {
+      const selected = await openDialog({
+        directory: true,
+        multiple: false,
+      });
+      if (!selected || Array.isArray(selected)) return;
+
+      const baseMsg = t('settingsStorage.restoreConfirmMessage', { dir: selected });
+      const confirmMsg = hasUnsavedChanges
+        ? `${baseMsg}\n\n${t('settingsStorage.restoreUnsavedWarning')}`
+        : baseMsg;
+      const confirmed = await ask(confirmMsg, {
+        title: t('settingsStorage.restoreConfirmTitle'),
+        kind: 'warning',
+      });
+      if (!confirmed) return;
+
+      // 在触发后端恢复前，先取消排队并等待进行中的整份保存 / 轮询间隔补丁落盘完成，防止竞态覆盖。
+      cancelPendingPollingInterval();
+      await Promise.all([
+        waitForPendingSave(),
+        pollingFlushPromise ?? Promise.resolve(),
+      ]);
+
+      const result = await invoke<RestoreBackupResult>('restore_backup', {
+        backupDir: selected,
+      });
+      restoredOk = true;
+      restoreRestartPending = true;
+      cache.clear();
+      dispatch('backupRestored', result);
+      showToast(
+        t('settingsStorage.restoreSuccessToast', {
+          files: result.restoredFiles,
+        }),
+        'success',
+      );
+    } catch (e) {
+      showToast(
+        t('settingsStorage.restoreFailed', {
+          error: formatUserError(e, t('common.loadFailedRetry')),
+        }),
+        'error',
+      );
+    } finally {
+      isRestoringBackup = false;
+      if (!restoredOk) {
+        dispatch('restoreStateChange', { restoring: false });
+      }
+    }
+  }
   const screenshotModes: ScreenshotMode[] = [
     {
       value: 'active_window',
@@ -279,7 +534,276 @@
     }
   }
 
+  let pollingSaveTimer: ReturnType<typeof setTimeout> | null = null;
+  let debouncedPollingInterval: number | null = null;
+  let pendingPollingInterval: number | null = null;
+  let inFlightPollingInterval: number | null = null;
+  let pollingFlushInFlight = false;
+  let pollingFlushPromise: Promise<void> | null = null;
+  const POLLING_SAVE_FLASH_MS = 1200;
+  let pollingInputFocused = false;
+  let pollingInputValue = String(normalizePollingInterval(config?.screenshot_interval));
+  let pollingSaveFlashPhase: 0 | 1 | 2 = 0;
+  let pollingFlashTimer: ReturnType<typeof setTimeout> | null = null;
+  let destroyed = false;
+
+  function clearPollingFlashTimer() {
+    if (pollingFlashTimer) {
+      clearTimeout(pollingFlashTimer);
+      pollingFlashTimer = null;
+    }
+  }
+
+  function triggerPollingSaveFlash() {
+    if (destroyed) return;
+    clearPollingFlashTimer();
+    pollingSaveFlashPhase = pollingSaveFlashPhase === 1 ? 2 : 1;
+    pollingFlashTimer = setTimeout(() => {
+      pollingFlashTimer = null;
+      pollingSaveFlashPhase = 0;
+    }, POLLING_SAVE_FLASH_MS);
+  }
+
+  function clearPollingSaveTimer() {
+    if (pollingSaveTimer) {
+      clearTimeout(pollingSaveTimer);
+      pollingSaveTimer = null;
+    }
+    debouncedPollingInterval = null;
+  }
+
+  function cancelPendingPollingInterval() {
+    clearPollingSaveTimer();
+    pendingPollingInterval = null;
+  }
+
+  $: if (restoreLocked || restoreRestartPending || isRestoringBackup) {
+    cancelPendingPollingInterval();
+  }
+
+  function normalizePollingInterval(raw: unknown, fallback = 30): number {
+    const numeric = Number(raw);
+    if (!Number.isFinite(numeric)) return fallback;
+    return Math.max(5, Math.min(600, Math.round(numeric)));
+  }
+
+  $: pollingSliderValue =
+    pendingPollingInterval
+    ?? debouncedPollingInterval
+    ?? inFlightPollingInterval
+    ?? normalizePollingInterval(config?.screenshot_interval);
+
+  $: if (
+    !pollingInputFocused
+    && pollingSaveTimer === null
+    && debouncedPollingInterval === null
+    && pendingPollingInterval === null
+    && !pollingFlushInFlight
+    && config
+  ) {
+    const synced = String(normalizePollingInterval(config.screenshot_interval));
+    if (pollingInputValue !== synced) {
+      pollingInputValue = synced;
+    }
+  }
+
+  async function flushPollingIntervalQueue() {
+    if (pollingFlushInFlight) return;
+    if (restoreLocked || restoreRestartPending || isRestoringBackup) {
+      pendingPollingInterval = null;
+      return;
+    }
+    pollingFlushInFlight = true;
+    const run = (async () => {
+      try {
+        while (pendingPollingInterval !== null) {
+          if (restoreLocked || restoreRestartPending || isRestoringBackup) {
+            pendingPollingInterval = null;
+            return;
+          }
+          const nextValue = pendingPollingInterval;
+          pendingPollingInterval = null;
+          inFlightPollingInterval = nextValue;
+          try {
+            await invoke('patch_config', { patch: { screenshot_interval: nextValue } });
+            if (
+              !destroyed
+              && config
+              && pendingPollingInterval === null
+              && debouncedPollingInterval === null
+            ) {
+              config.screenshot_interval = nextValue;
+            }
+            if (
+              !destroyed
+              && pendingPollingInterval === null
+              && debouncedPollingInterval === null
+              && !restoreLocked
+              && !restoreRestartPending
+              && !isRestoringBackup
+            ) {
+              triggerPollingSaveFlash();
+              dispatch('change', { autosaved: true });
+            }
+          } catch (e) {
+            if (
+              pendingPollingInterval === null
+              && !restoreLocked
+              && !restoreRestartPending
+              && !isRestoringBackup
+            ) {
+              if (!destroyed) {
+                handleChange();
+              }
+              showToast(String(e), 'error');
+            }
+          } finally {
+            inFlightPollingInterval = null;
+          }
+        }
+      } finally {
+        pollingFlushInFlight = false;
+      }
+    })();
+    pollingFlushPromise = run;
+    try {
+      await run;
+    } finally {
+      if (pollingFlushPromise === run) {
+        pollingFlushPromise = null;
+      }
+    }
+  }
+
+  function persistPollingInterval(nextValue: number) {
+    if (restoreLocked || restoreRestartPending || isRestoringBackup) return;
+    pendingPollingInterval = nextValue;
+    void flushPollingIntervalQueue();
+  }
+
+  function scheduleDebouncedPollingSave(normalized: number) {
+    if (restoreLocked || restoreRestartPending || isRestoringBackup) {
+      cancelPendingPollingInterval();
+      return;
+    }
+    clearPollingSaveTimer();
+    debouncedPollingInterval = normalized;
+    pollingSaveTimer = setTimeout(() => {
+      pollingSaveTimer = null;
+      const toSave = debouncedPollingInterval;
+      debouncedPollingInterval = null;
+      if (toSave !== null) {
+        void persistPollingInterval(toSave);
+      }
+    }, 600);
+  }
+
+  function handlePollingNumberInput(event: Event) {
+    const target = event.currentTarget as HTMLInputElement | null;
+    const rawText = target ? target.value : pollingInputValue;
+    pollingInputValue = rawText;
+
+    if (restoreLocked || restoreRestartPending || isRestoringBackup) {
+      cancelPendingPollingInterval();
+      return;
+    }
+
+    if (rawText.trim() === '') {
+      clearPollingSaveTimer();
+      return;
+    }
+
+    const parsed = Number(rawText);
+    if (!Number.isFinite(parsed)) {
+      clearPollingSaveTimer();
+      return;
+    }
+
+    const normalized = normalizePollingInterval(parsed);
+    config.screenshot_interval = normalized;
+    scheduleDebouncedPollingSave(normalized);
+  }
+
+  function handlePollingNumberCommit() {
+    if (restoreLocked || restoreRestartPending || isRestoringBackup) {
+      cancelPendingPollingInterval();
+      return;
+    }
+    clearPollingSaveTimer();
+
+    const fallback = normalizePollingInterval(config?.screenshot_interval);
+    if (pollingInputValue.trim() === '') {
+      pollingInputValue = String(fallback);
+      return;
+    }
+
+    const normalized = normalizePollingInterval(pollingInputValue, fallback);
+    pollingInputValue = String(normalized);
+    config.screenshot_interval = normalized;
+    void persistPollingInterval(normalized);
+  }
+
+  function handlePollingNumberBlur() {
+    pollingInputFocused = false;
+    if (restoreLocked || restoreRestartPending || isRestoringBackup) {
+      cancelPendingPollingInterval();
+      return;
+    }
+    const fallback = normalizePollingInterval(config?.screenshot_interval);
+    if (pollingInputValue.trim() === '') {
+      clearPollingSaveTimer();
+      pollingInputValue = String(fallback);
+      return;
+    }
+    const normalized = normalizePollingInterval(pollingInputValue, fallback);
+    const hasPendingDebounce = pollingSaveTimer !== null || debouncedPollingInterval !== null;
+    pollingInputValue = String(normalized);
+    if (hasPendingDebounce || normalized !== config.screenshot_interval) {
+      clearPollingSaveTimer();
+      config.screenshot_interval = normalized;
+      void persistPollingInterval(normalized);
+    }
+  }
+
+  function handlePollingRangeInput(event: Event) {
+    const target = event.currentTarget as HTMLInputElement | null;
+    if (!target) return;
+    if (restoreLocked || restoreRestartPending || isRestoringBackup) {
+      cancelPendingPollingInterval();
+      return;
+    }
+    const normalized = normalizePollingInterval(target.value, normalizePollingInterval(config?.screenshot_interval));
+    pollingInputValue = String(normalized);
+    config.screenshot_interval = normalized;
+    scheduleDebouncedPollingSave(normalized);
+  }
+
+  function handlePollingRangeChange(event: Event) {
+    const target = event.currentTarget as HTMLInputElement | null;
+    if (!target) return;
+    if (restoreLocked || restoreRestartPending || isRestoringBackup) {
+      cancelPendingPollingInterval();
+      return;
+    }
+    clearPollingSaveTimer();
+    const normalized = normalizePollingInterval(target.value, normalizePollingInterval(config?.screenshot_interval));
+    pollingInputValue = String(normalized);
+    config.screenshot_interval = normalized;
+    void persistPollingInterval(normalized);
+  }
+
+  onDestroy(() => {
+    destroyed = true;
+    clearPollingFlashTimer();
+    const toFlush = debouncedPollingInterval;
+    clearPollingSaveTimer();
+    if (toFlush !== null && !restoreLocked && !restoreRestartPending && !isRestoringBackup) {
+      persistPollingInterval(toFlush);
+    }
+  });
+
   function handleChange(_event?: Event) {
+    if (restoreLocked || restoreRestartPending || isRestoringBackup) return;
     dispatch('change', config);
   }
 
@@ -302,6 +826,66 @@
     config.daily_report_export_dir = null;
     handleChange();
   }
+
+  async function addGitRepoDir() {
+    const selected = await openDialog({
+      directory: true,
+      multiple: false,
+    });
+    if (!selected || Array.isArray(selected)) {
+      return;
+    }
+    const existing = Array.isArray(config.git_repo_paths) ? config.git_repo_paths : [];
+    // 保留目录选择器返回的原始路径，不做 trim() 以免破坏带尾随空格的合法目录名。
+    if (!existing.some((item) => item === selected)) {
+      config.git_repo_paths = [...existing, selected];
+      resetGitPreview();
+      handleChange();
+    }
+  }
+
+  function removeGitRepoDir(pathToRemove: string) {
+    config.git_repo_paths = (config.git_repo_paths || []).filter((item) => item !== pathToRemove);
+    resetGitPreview();
+    handleChange();
+  }
+
+  function getLocalIsoDate(): string {
+    const now = new Date();
+    const year = now.getFullYear();
+    const month = String(now.getMonth() + 1).padStart(2, '0');
+    const day = String(now.getDate()).padStart(2, '0');
+    return `${year}-${month}-${day}`;
+  }
+
+  async function previewTodayGitCommits() {
+    const repos = config.git_repo_paths || [];
+    if (repos.length === 0) return;
+    const reqId = ++gitPreviewRequestId;
+    isPreviewingGit = true;
+    gitPreviewError = '';
+    try {
+      const results = await invoke<GitRepoSummary[]>('get_git_commits_for_date', {
+        date: getLocalIsoDate(),
+        repoPaths: repos,
+        authorFilter: config.git_author_filter?.trim() || null,
+      });
+      if (reqId !== gitPreviewRequestId) return;
+      gitPreviewResults = results;
+      gitPreviewLoaded = true;
+    } catch (e) {
+      if (reqId !== gitPreviewRequestId) return;
+      gitPreviewError = String(e);
+      gitPreviewResults = [];
+      gitPreviewLoaded = false;
+    } finally {
+      if (reqId === gitPreviewRequestId) {
+        isPreviewingGit = false;
+      }
+    }
+  }
+
+  $: gitPreviewCommitCount = gitPreviewResults.reduce((sum, repo) => sum + repo.commits.length, 0);
 
   async function testRemoteStorage() {
     isTestingRemote = true;
@@ -370,7 +954,7 @@
     </div>
 
     <!-- 轮询间隔 -->
-    <div class="settings-block">
+    <div class="settings-block {pollingSaveFlashPhase === 1 ? 'ui-save-flash-a' : pollingSaveFlashPhase === 2 ? 'ui-save-flash-b' : ''}">
       <div class="flex items-center justify-between">
         <label for="screenshot-interval" class="settings-text">{t('settingsStorage.pollingInterval')}</label>
         <div class="flex items-center gap-2">
@@ -379,12 +963,12 @@
             aria-label={t('settingsStorage.pollingInterval')}
             min="5"
             max="600"
-            step="5"
-            bind:value={config.screenshot_interval}
-            on:change={() => {
-              config.screenshot_interval = Math.max(5, Math.min(600, Number(config.screenshot_interval) || 30));
-              handleChange();
-            }}
+            step="1"
+            value={pollingInputValue}
+            on:focus={() => { pollingInputFocused = true; }}
+            on:input={handlePollingNumberInput}
+            on:change={handlePollingNumberCommit}
+            on:blur={handlePollingNumberBlur}
             class="w-16 rounded-md border border-slate-200 bg-white px-2 py-1 text-center text-sm dark:border-[#484f58] dark:bg-[#21262d]"
           />
           <span class="text-xs settings-subtle">{t('settingsStorage.secondsUnit')}</span>
@@ -393,20 +977,19 @@
       <input
         id="screenshot-interval"
         type="range"
-        bind:value={config.screenshot_interval}
-        on:change={() => {
-          config.screenshot_interval = Math.max(5, Math.min(600, Number(config.screenshot_interval) || 30));
-          handleChange();
-        }}
-        min="10"
-        max="120"
-        step="5"
+        value={pollingSliderValue}
+        on:input={handlePollingRangeInput}
+        on:change={handlePollingRangeChange}
+        min="5"
+        max="600"
+        step="1"
         class="range-input"
       />
       <div class="flex justify-between text-xs settings-subtle">
         <span>{t('settingsStorage.precise')}</span>
         <span>{t('settingsStorage.powerSave')}</span>
       </div>
+      <p class="settings-muted mt-1">{t('settingsStorage.pollingHint')}</p>
     </div>
 
     <!-- 数据保留 -->
@@ -510,26 +1093,37 @@
     </div>
 
     <div class="settings-block">
-      <p class="settings-text mb-2">{t('settingsStorage.screenshotMode')}</p>
-      <div class="flex gap-2">
+      <p id="settings-storage-screenshot-mode-label" class="settings-text mb-2">{t('settingsStorage.screenshotMode')}</p>
+      <div class="ui-choice-grid" role="group" aria-labelledby="settings-storage-screenshot-mode-label">
         {#each localizedScreenshotModes as mode}
+          {@const isSelected = config.storage.screenshot_display_mode === mode.value}
           <button
             type="button"
+            aria-pressed={isSelected}
             on:click={() => {
               config.storage.screenshot_display_mode = mode.value;
               handleChange();
             }}
-            class="flex-1 min-h-16 px-3 py-2.5 rounded-lg text-sm font-medium leading-none transition-all duration-150
-                   {config.storage.screenshot_display_mode === mode.value
-                     ? 'settings-segment-active'
-                     : 'settings-segment-base'}"
+            class="ui-choice-card {isSelected ? 'ui-choice-card-active' : ''}"
           >
-            <div class="flex h-full flex-col items-center justify-center gap-1 text-center">
-              <div class="leading-none">{mode.label}</div>
-              <div class="text-[10px] leading-snug {config.storage.screenshot_display_mode === mode.value ? 'text-white/70' : 'settings-subtle'}">
-                {mode.description}
+            <div class="ui-choice-head">
+              <div class="ui-choice-title-group">
+                <span class="ui-choice-icon" aria-hidden="true">
+                  {#if mode.value === 'active_window'}
+                    <svg class="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8" d="M4 6a2 2 0 012-2h12a2 2 0 012 2v12a2 2 0 01-2 2H6a2 2 0 01-2-2V6zm0 3h16" />
+                    </svg>
+                  {:else}
+                    <svg class="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8" d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z" />
+                    </svg>
+                  {/if}
+                </span>
+                <span class="ui-choice-title">{mode.label}</span>
               </div>
+              <span class="ui-choice-indicator" aria-hidden="true"></span>
             </div>
+            <p class="ui-choice-desc">{mode.description}</p>
           </button>
         {/each}
       </div>
@@ -539,46 +1133,54 @@
 
 <!-- 截图分辨率 -->
 <div class="settings-card mb-5" data-locale={currentLocale}>
-  <h3 class="settings-card-title">{t('settingsStorage.widthMode')}</h3>
+  <h3 id="settings-storage-width-mode-label" class="settings-card-title">{t('settingsStorage.widthMode')}</h3>
 
   <div class="settings-section">
     <div class="settings-block">
-      <div class="flex gap-2">
+      <div class="ui-choice-grid" role="group" aria-labelledby="settings-storage-width-mode-label">
         <button
           type="button"
+          aria-pressed={config.storage.screenshot_width_mode === 'auto'}
           on:click={() => {
             config.storage.screenshot_width_mode = 'auto';
             handleChange();
           }}
-          class="flex-1 min-h-16 px-3 py-2.5 rounded-lg text-sm font-medium leading-none transition-all duration-150
-                 {config.storage.screenshot_width_mode === 'auto'
-                   ? 'settings-segment-active'
-                   : 'settings-segment-base'}"
+          class="ui-choice-card {config.storage.screenshot_width_mode === 'auto' ? 'ui-choice-card-active' : ''}"
         >
-          <div class="flex h-full flex-col items-center justify-center gap-1 text-center">
-            <div class="leading-none">{t('settingsStorage.widthModeAuto')}</div>
-            <div class="text-[10px] leading-snug {config.storage.screenshot_width_mode === 'auto' ? 'text-white/70' : 'settings-subtle'}">
-              {t('settingsStorage.widthModeAutoDesc')}
+          <div class="ui-choice-head">
+            <div class="ui-choice-title-group">
+              <span class="ui-choice-icon" aria-hidden="true">
+                <svg class="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8" d="M4 8V4m0 0h4M4 4l5 5m11-1V4m0 0h-4m4 0l-5 5M4 16v4m0 0h4m-4 0l5-5m11 5l-5-5m5 5v-4m0 4h-4" />
+                </svg>
+              </span>
+              <span class="ui-choice-title">{t('settingsStorage.widthModeAuto')}</span>
             </div>
+            <span class="ui-choice-indicator" aria-hidden="true"></span>
           </div>
+          <p class="ui-choice-desc">{t('settingsStorage.widthModeAutoDesc')}</p>
         </button>
         <button
           type="button"
+          aria-pressed={config.storage.screenshot_width_mode === 'fixed'}
           on:click={() => {
             config.storage.screenshot_width_mode = 'fixed';
             handleChange();
           }}
-          class="flex-1 min-h-16 px-3 py-2.5 rounded-lg text-sm font-medium leading-none transition-all duration-150
-                 {config.storage.screenshot_width_mode === 'fixed'
-                   ? 'settings-segment-active'
-                   : 'settings-segment-base'}"
+          class="ui-choice-card {config.storage.screenshot_width_mode === 'fixed' ? 'ui-choice-card-active' : ''}"
         >
-          <div class="flex h-full flex-col items-center justify-center gap-1 text-center">
-            <div class="leading-none">{t('settingsStorage.widthModeFixed')}</div>
-            <div class="text-[10px] leading-snug {config.storage.screenshot_width_mode === 'fixed' ? 'text-white/70' : 'settings-subtle'}">
-              {t('settingsStorage.widthModeFixedDesc')}
+          <div class="ui-choice-head">
+            <div class="ui-choice-title-group">
+              <span class="ui-choice-icon" aria-hidden="true">
+                <svg class="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8" d="M6 12h12M6 12l3-3m-3 3l3 3m9-3l-3-3m3 3l-3 3M4 6v12m16-12v12" />
+                </svg>
+              </span>
+              <span class="ui-choice-title">{t('settingsStorage.widthModeFixed')}</span>
             </div>
+            <span class="ui-choice-indicator" aria-hidden="true"></span>
           </div>
+          <p class="ui-choice-desc">{t('settingsStorage.widthModeFixedDesc')}</p>
         </button>
       </div>
     </div>
@@ -645,7 +1247,12 @@
         <button
           type="button"
           class="switch-track {config.daily_report_auto_export ? 'bg-emerald-500' : 'bg-slate-300 dark:bg-[#484f58]'} {!config.daily_report_export_dir ? 'opacity-60 cursor-not-allowed' : ''}"
-          on:click={() => { if (config.daily_report_export_dir) config.daily_report_auto_export = !config.daily_report_auto_export; }}
+          on:click={() => {
+            if (config.daily_report_export_dir) {
+              config.daily_report_auto_export = !config.daily_report_auto_export;
+              handleChange();
+            }
+          }}
           disabled={!config.daily_report_export_dir}
           role="switch"
           aria-label={t('settingsStorage.autoExport')}
@@ -654,7 +1261,168 @@
           <span class="switch-thumb {config.daily_report_auto_export ? 'translate-x-5' : 'translate-x-0'}"></span>
         </button>
       </div>
+
+      <div class="mt-4 border-t border-slate-200/70 pt-4 dark:border-[#30363d]/80 space-y-3">
+        <label class="flex items-start justify-between gap-3 cursor-pointer">
+          <div>
+            <span class="settings-text">{t('settingsStorage.exportFrontmatter')}</span>
+            <p class="settings-muted mt-0.5">{t('settingsStorage.exportFrontmatterHint')}</p>
+          </div>
+          <input
+            type="checkbox"
+            checked={Boolean(config.daily_report_export_frontmatter)}
+            on:change={(e) => {
+              config.daily_report_export_frontmatter = e.currentTarget.checked;
+              handleChange();
+            }}
+            class="mt-1 h-4 w-4 rounded border-slate-300 dark:border-[#484f58]"
+          />
+        </label>
+
+        <label class="block">
+          <span class="settings-text">{t('settingsStorage.exportSectionHeading')}</span>
+          <p class="settings-muted mt-0.5">{t('settingsStorage.exportSectionHeadingHint')}</p>
+          <input
+            type="text"
+            value={config.daily_report_export_section_heading ?? ''}
+            on:input={(e) => {
+              const raw = e.currentTarget.value;
+              config.daily_report_export_section_heading = raw.trim() ? raw : null;
+              handleChange();
+            }}
+            placeholder={t('settingsStorage.exportSectionHeadingPlaceholder')}
+            class="mt-1.5 w-full rounded-md bg-white/80 px-3 py-1.5 text-sm font-mono text-slate-900 ring-1 ring-slate-200 focus:ring-primary-300 dark:bg-[#30363d]/50 dark:text-[#e6edf3] dark:ring-[#484f58] dark:focus:ring-primary-600 focus:outline-none"
+          />
+        </label>
+      </div>
     </div>
+  </div>
+</div>
+
+<!-- Git 提交产出关联 -->
+<div class="settings-card mb-5" data-locale={currentLocale}>
+  <h3 class="settings-card-title">{t('settingsStorage.gitTitle')}</h3>
+  <p class="settings-muted mb-3">{t('settingsStorage.gitHint')}</p>
+
+  <div class="settings-section space-y-4">
+    <div class="settings-row">
+      <div>
+        <span class="settings-text">{t('settingsStorage.gitEnabled')}</span>
+        <p class="settings-muted mt-0.5">{t('settingsStorage.gitEnabledHint')}</p>
+      </div>
+      <button
+        type="button"
+        on:click={() => {
+          config.git_report_enabled = !config.git_report_enabled;
+          handleChange();
+        }}
+        class="switch-track {config.git_report_enabled ? 'bg-emerald-500' : 'bg-slate-300 dark:bg-[#484f58]'}"
+        role="switch"
+        aria-label={t('settingsStorage.gitEnabled')}
+        aria-checked={Boolean(config.git_report_enabled)}
+      >
+        <span class="switch-thumb {config.git_report_enabled ? 'translate-x-5' : 'translate-x-0'}"></span>
+      </button>
+    </div>
+
+    {#if config.git_report_enabled}
+      <div class="settings-subsection space-y-3">
+        <div class="flex items-center justify-between gap-2">
+          <span class="settings-text">{t('settingsStorage.gitRepos')}</span>
+          <button
+            type="button"
+            on:click={addGitRepoDir}
+            class="settings-action-secondary"
+          >
+            {t('settingsStorage.gitAddRepo')}
+          </button>
+        </div>
+
+        {#if (config.git_repo_paths || []).length === 0}
+          <p class="settings-muted">{t('settingsStorage.gitEmptyRepos')}</p>
+        {:else}
+          <ul class="space-y-1.5">
+            {#each config.git_repo_paths || [] as repoPath (repoPath)}
+              <li class="flex items-center justify-between gap-2 rounded-lg bg-slate-50/90 px-3 py-1.5 text-xs dark:bg-[#161b22]/60">
+                <span class="min-w-0 truncate font-mono text-slate-700 dark:text-[#c9d1d9]" title={repoPath}>{repoPath}</span>
+                <button
+                  type="button"
+                  on:click={() => removeGitRepoDir(repoPath)}
+                  class="shrink-0 text-xs text-rose-500 hover:text-rose-600 dark:text-rose-400"
+                >
+                  {t('settingsStorage.gitRemoveRepo')}
+                </button>
+              </li>
+            {/each}
+          </ul>
+        {/if}
+
+        <label class="block">
+          <span class="settings-text">{t('settingsStorage.gitAuthorFilter')}</span>
+          <p class="settings-muted mt-0.5">{t('settingsStorage.gitAuthorFilterHint')}</p>
+          <input
+            type="text"
+            value={config.git_author_filter ?? ''}
+            on:input={(e) => {
+              const raw = e.currentTarget.value;
+              config.git_author_filter = raw.trim() ? raw : null;
+              resetGitPreview();
+              handleChange();
+            }}
+            placeholder={t('settingsStorage.gitAuthorFilterPlaceholder')}
+            class="mt-1.5 w-full rounded-md bg-white/80 px-3 py-1.5 text-sm text-slate-900 ring-1 ring-slate-200 focus:ring-primary-300 dark:bg-[#30363d]/50 dark:text-[#e6edf3] dark:ring-[#484f58] dark:focus:ring-primary-600 focus:outline-none"
+          />
+        </label>
+
+        {#if (config.git_repo_paths || []).length > 0}
+          <div class="pt-1">
+            <button
+              type="button"
+              on:click={previewTodayGitCommits}
+              disabled={isPreviewingGit}
+              class="settings-action-secondary disabled:opacity-50"
+            >
+              {isPreviewingGit ? t('settingsStorage.gitPreviewing') : t('settingsStorage.gitPreviewToday')}
+            </button>
+
+            {#if gitPreviewError}
+              <p class="mt-2 text-xs text-rose-500 dark:text-rose-400">{gitPreviewError}</p>
+            {:else if gitPreviewLoaded}
+              {#if gitPreviewCommitCount === 0}
+                <p class="settings-muted mt-2">{t('settingsStorage.gitPreviewEmpty')}</p>
+              {:else}
+                <div class="mt-2.5 rounded-lg border border-slate-200/80 bg-slate-50/70 p-2.5 text-xs dark:border-[#30363d] dark:bg-[#161b22]/50">
+                  <p class="font-medium text-slate-700 dark:text-[#c9d1d9]">
+                    {t('settingsStorage.gitPreviewSummary', {
+                      repos: gitPreviewResults.length,
+                      count: gitPreviewCommitCount,
+                    })}
+                  </p>
+                  <div class="mt-2 space-y-2">
+                    {#each gitPreviewResults as repo (repo.repoPath)}
+                      <div>
+                        <p class="font-semibold text-slate-600 dark:text-[#adbac7]">{repo.repoName} ({repo.commits.length})</p>
+                        <ul class="mt-1 space-y-0.5 text-slate-500 dark:text-[#7d8590]">
+                          {#each repo.commits.slice(0, 5) as commit (commit.hash)}
+                            <li class="truncate">
+                              <span class="font-mono text-[11px] text-slate-600 dark:text-[#adbac7]">{commit.hash}</span>
+                              {commit.subject}
+                              {#if commit.timeLabel}
+                                <span class="ms-1 opacity-75">({commit.timeLabel})</span>
+                              {/if}
+                            </li>
+                          {/each}
+                        </ul>
+                      </div>
+                    {/each}
+                  </div>
+                </div>
+              {/if}
+            {/if}
+          </div>
+        {/if}
+      </div>
+    {/if}
   </div>
 </div>
 
@@ -674,23 +1442,22 @@
         </div>
         <span class="text-sm font-medium text-slate-700 dark:text-[#c9d1d9]">{t('settingsStorage.remoteProvider')}</span>
       </div>
-      <div class="flex gap-2">
+      <div class="ui-seg-group" role="group" aria-label={t('settingsStorage.remoteProvider')}>
         {#each [
           { value: 'none', label: t('settingsStorage.remoteProviderNone') },
           { value: 's3', label: t('settingsStorage.remoteProviderS3') },
           { value: 'webdav', label: t('settingsStorage.remoteProviderWebDav') },
         ] as opt}
+          {@const selected = (config.remote_storage?.provider || 'none') === opt.value}
           <button
             type="button"
+            aria-pressed={selected}
             on:click={() => {
               if (!config.remote_storage) config.remote_storage = { provider: 'none', s3: {}, webdav: {}, sync_app_config: false };
               config.remote_storage = { ...config.remote_storage, provider: opt.value };
               handleChange();
             }}
-            class="flex-1 min-h-9 px-3 py-2 text-xs font-medium rounded-lg leading-none transition-all
-                   {(config.remote_storage?.provider || 'none') === opt.value
-                     ? 'settings-segment-active'
-                     : 'settings-segment-base'}"
+            class="ui-seg-item {selected ? 'ui-seg-item-active' : ''}"
           >
             {opt.label}
           </button>
@@ -985,6 +1752,122 @@
     {/if}
   </div>
 </CollapsibleSection>
+
+<!-- 数据导出与一键备份 -->
+<div class="settings-card mb-5" data-locale={currentLocale}>
+  <h3 class="settings-card-title">{t('settingsStorage.dataPortabilityTitle')}</h3>
+  <p class="settings-muted mb-4">{t('settingsStorage.dataPortabilityDesc')}</p>
+
+  <div class="settings-section space-y-5">
+    <div class="settings-subsection space-y-3">
+      <p class="settings-text font-medium">{t('settingsStorage.dataExportTitle')}</p>
+      <p class="settings-muted">{t('settingsStorage.dataExportHint')}</p>
+
+      <div class="flex flex-wrap items-center gap-3">
+        <LocalizedDatePicker
+          mode="range"
+          bind:startDate={dataExportFrom}
+          bind:endDate={dataExportTo}
+          localeCode={currentLocale}
+          max={getLocalIsoDate()}
+          triggerClass="page-control-input w-auto"
+        />
+
+        <fieldset
+          class="ui-seg-group"
+          aria-label={t('settingsStorage.dataExportFormat')}
+        >
+          {#each dataExportFormats as fmt}
+            <label
+              class="ui-seg-item select-none uppercase focus-within:ring-2 focus-within:ring-inset focus-within:ring-primary-400 {dataExportFormat === fmt ? 'ui-seg-item-active' : ''}"
+            >
+              <input
+                type="radio"
+                name="data-export-format"
+                value={fmt}
+                bind:group={dataExportFormat}
+                class="sr-only"
+              />
+              {fmt}
+            </label>
+          {/each}
+        </fieldset>
+      </div>
+
+      <label class="inline-flex items-center gap-2 text-xs settings-muted cursor-pointer select-none">
+        <input
+          type="checkbox"
+          bind:checked={dataExportIncludeOcr}
+          class="h-4 w-4 rounded border-slate-300 dark:border-[#484f58]"
+        />
+        <span>{t('settingsStorage.dataExportIncludeOcr')}</span>
+      </label>
+
+      <div class="flex flex-wrap gap-2.5">
+        <button
+          type="button"
+          on:click={runExportActivities}
+          disabled={isExportingData}
+          class="settings-action-secondary disabled:opacity-50"
+        >
+          {isExportingData ? t('settingsStorage.dataExporting') : t('settingsStorage.exportActivitiesBtn')}
+        </button>
+        <button
+          type="button"
+          on:click={runExportDailyStats}
+          disabled={isExportingData}
+          class="settings-action-secondary disabled:opacity-50"
+        >
+          {isExportingData ? t('settingsStorage.dataExporting') : t('settingsStorage.exportDailyStatsBtn')}
+        </button>
+      </div>
+    </div>
+
+    <div class="settings-subsection space-y-3">
+      <p class="settings-text font-medium">{t('settingsStorage.backupSectionTitle')}</p>
+      <p class="settings-muted">{t('settingsStorage.backupSectionHint')}</p>
+
+      <div class="space-y-2">
+        <label class="flex items-start gap-2 text-xs settings-muted cursor-pointer select-none">
+          <input
+            type="checkbox"
+            bind:checked={backupIncludeScreenshots}
+            class="mt-0.5 h-4 w-4 rounded border-slate-300 dark:border-[#484f58]"
+          />
+          <span>{t('settingsStorage.backupIncludeScreenshots')}</span>
+        </label>
+
+        <label class="flex items-start gap-2 text-xs settings-muted cursor-pointer select-none">
+          <input
+            type="checkbox"
+            bind:checked={backupIncludeSecrets}
+            class="mt-0.5 h-4 w-4 rounded border-slate-300 dark:border-[#484f58]"
+          />
+          <span>{t('settingsStorage.backupIncludeSecrets')}</span>
+        </label>
+      </div>
+
+      <div class="flex flex-wrap gap-2.5 pt-1">
+        <button
+          type="button"
+          on:click={runCreateBackup}
+          disabled={isCreatingBackup || isRestoringBackup || restoreRestartPending || restoreLocked}
+          class="settings-action-primary disabled:opacity-50"
+        >
+          {isCreatingBackup ? t('settingsStorage.creatingBackup') : t('settingsStorage.createBackupBtn')}
+        </button>
+        <button
+          type="button"
+          on:click={runRestoreBackup}
+          disabled={isCreatingBackup || isRestoringBackup || restoreRestartPending || restoreLocked}
+          class="settings-action-secondary disabled:opacity-50"
+        >
+          {isRestoringBackup || restoreRestartPending || restoreLocked ? t('settingsStorage.restoringBackup') : t('settingsStorage.restoreBackupBtn')}
+        </button>
+      </div>
+    </div>
+  </div>
+</div>
 
 <div class="settings-card mb-5" data-locale={currentLocale}>
   <h3 class="settings-card-title">{t('settingsStorage.dataDirTitle')}</h3>

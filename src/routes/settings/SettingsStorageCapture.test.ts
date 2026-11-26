@@ -81,3 +81,13 @@ test('WebDAV 应提供常用配置同步开关', async () => {
   assert.match(source, /settingsStorage\.syncAppConfig/);
   assert.match(source, /sync_app_config/);
 });
+
+test('轮询间隔滑块应与 5~600 秒范围一致并在修改后局部自动保存', async () => {
+  const source = await readFile(
+    new URL('./components/SettingsStorage.svelte', import.meta.url),
+    'utf8'
+  );
+  assert.match(source, /id="screenshot-interval"[\s\S]*?min="5"[\s\S]*?max="600"[\s\S]*?step="1"/);
+  assert.match(source, /Math\.round\(numeric\)/);
+  assert.match(source, /invoke\('patch_config',\s*\{\s*patch:\s*\{\s*screenshot_interval:\s*nextValue\s*\}\s*\}\)/);
+});

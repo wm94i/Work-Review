@@ -97,11 +97,12 @@ test('拆分后应包含三个分组的 CollapsibleSection', async () => {
 });
 
 test('企业微信 Bot 应走智能机器人长连接并轮询状态', async () => {
-  const [gatewaySource, wecomSource, configSource, mainSource] = await Promise.all([
+  const [gatewaySource, wecomSource, configSource, mainSource, handlerSource] = await Promise.all([
     readFile(new URL('./components/SettingsNodeGateway.svelte', import.meta.url), 'utf8'),
     readFile(new URL('./components/nodeGateway/WecomBotPanel.svelte', import.meta.url), 'utf8'),
     readFile(new URL('../../../crates/core/src/config.rs', import.meta.url), 'utf8'),
     readFile(new URL('../../../src-tauri/src/main.rs', import.meta.url), 'utf8'),
+    readFile(new URL('../../../src-tauri/src/commands/mod.rs', import.meta.url), 'utf8'),
   ]);
 
   assert.match(gatewaySource, /function startWecomStatusPolling\(\)/);
@@ -113,5 +114,6 @@ test('企业微信 Bot 应走智能机器人长连接并轮询状态', async () 
   assert.match(wecomSource, /nodeGatewayPage\.wecomConnected/);
   assert.match(configSource, /pub wecom_bot_id: Option<String>/);
   assert.match(configSource, /pub wecom_bot_secret: Option<String>/);
-  assert.match(mainSource, /commands::get_wecom_bot_status/);
+  assert.match(mainSource, /\.invoke_handler\(commands::handler\(\)\)/);
+  assert.match(handlerSource, /\bget_wecom_bot_status\b/);
 });

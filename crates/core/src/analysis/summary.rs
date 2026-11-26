@@ -288,6 +288,7 @@ fn api_response_error(provider: &str, status: StatusCode, error_text: &str) -> A
 fn is_max_tokens_too_large(error_text: &str) -> bool {
     let lower = error_text.to_lowercase();
     lower.contains("max_tokens")
+        || lower.contains("max_completion_tokens")
         || lower.contains("maxtokens")
         || lower.contains("max_output_tokens")
         || lower.contains("maxoutputtokens")
@@ -297,7 +298,9 @@ fn is_max_tokens_too_large(error_text: &str) -> bool {
 /// 检测是否因缺少必填的 max_tokens 参数导致 400
 fn is_max_tokens_required(error_text: &str) -> bool {
     let lower = error_text.to_lowercase();
-    (lower.contains("max_tokens") || lower.contains("maxtokens"))
+    (lower.contains("max_tokens")
+        || lower.contains("max_completion_tokens")
+        || lower.contains("maxtokens"))
         && (lower.contains("required") || lower.contains("must be") || lower.contains("missing"))
 }
 
@@ -393,29 +396,45 @@ impl SummaryAnalyzer {
         let result: serde_json::Value = response.json().await?;
         extract_ai_text(&result, "/response", "Ollama")
     }
+    fn openai_retry_token_budgets(&self) -> (u32, u32, u32) {
+        if crate::generation_params::uses_openai_reasoning_chat_params(self.provider, &self.model) {
+            // 推理系模型将隐藏思考 token 计入 max_completion_tokens，重试预算需留足空间
+            (8192, 4096, 2048)
+        } else {
+            (4096, 2048, 1024)
+        }
+    }
+
     async fn generate_with_openai_compatible(&self, prompt: &str) -> Result<String> {
+        let (required_budget, step_down_1, step_down_2) = self.openai_retry_token_budgets();
         // 第一轮：不设 max_tokens，让模型用自身默认值
         match self.try_openai_compatible_request(prompt, None).await {
             Ok(content) => return Ok(content),
             Err(AppError::Analysis(ref msg)) if is_max_tokens_too_large(msg) => {
-                log::info!("max_tokens 过大，降到 2048 重试");
+                log::info!("输出 token 上限过大，降到 {step_down_1} 重试");
             }
             Err(AppError::Analysis(ref msg)) if is_max_tokens_required(msg) => {
-                log::info!("max_tokens 必填，补上 4096 重试");
-                return self.try_openai_compatible_request(prompt, Some(4096)).await;
+                log::info!("输出 token 上限必填，补上 {required_budget} 重试");
+                return self
+                    .try_openai_compatible_request(prompt, Some(required_budget))
+                    .await;
             }
             Err(e) => return Err(e),
         }
-        // 第二轮：降到 2048
-        match self.try_openai_compatible_request(prompt, Some(2048)).await {
+        // 第二轮降档
+        match self
+            .try_openai_compatible_request(prompt, Some(step_down_1))
+            .await
+        {
             Ok(content) => return Ok(content),
             Err(AppError::Analysis(ref msg)) if is_max_tokens_too_large(msg) => {
-                log::info!("max_tokens=2048 仍超限，降到 1024 重试");
+                log::info!("输出 token 上限={step_down_1} 仍超限，降到 {step_down_2} 重试");
             }
             Err(e) => return Err(e),
         }
-        // 第三轮：降到 1024
-        self.try_openai_compatible_request(prompt, Some(1024)).await
+        // 第三轮兜底降档
+        self.try_openai_compatible_request(prompt, Some(step_down_2))
+            .await
     }
 
     async fn try_openai_compatible_request(
@@ -435,11 +454,16 @@ impl SummaryAnalyzer {
                     "content": prompt
                 }
             ],
-            "temperature": 0.2,
             "stream": false,
         });
+        if !crate::generation_params::uses_openai_reasoning_chat_params(self.provider, &self.model)
+        {
+            payload["temperature"] = json!(0.2);
+        }
         if let Some(tokens) = max_tokens {
-            payload["max_tokens"] = json!(tokens);
+            let field =
+                crate::generation_params::openai_max_tokens_field(self.provider, &self.model);
+            payload[field] = json!(tokens);
         }
 
         let mut last_error: Option<String> = None;
@@ -696,6 +720,41 @@ impl SummaryAnalyzer {
             });
 
         let timeline = generate_activity_timeline(activities, self.locale);
+        let focus_metrics = crate::work_intelligence::compute_focus_metrics(activities);
+        let focus_line =
+            crate::work_intelligence::format_focus_metrics_for_prompt(&focus_metrics, self.locale);
+        let project_prompt_line = {
+            let named: Vec<String> = stats
+                .project_usage
+                .iter()
+                .filter(|p| p.key != crate::project::UNASSIGNED_PROJECT_KEY && p.duration > 0)
+                .take(5)
+                .map(|p| {
+                    format!(
+                        "{}: {}",
+                        p.name,
+                        format_duration_for_locale(p.duration, self.locale)
+                    )
+                })
+                .collect();
+            if named.is_empty() {
+                String::new()
+            } else {
+                let prefix = match self.locale {
+                    AppLocale::ZhCn => "项目分布：",
+                    AppLocale::ZhTw => "專案分布：",
+                    AppLocale::En => "Project breakdown: ",
+                    AppLocale::Ar => "توزيع المشاريع: ",
+                };
+                format!("\n{prefix}{}", join_list(self.locale, named))
+            }
+        };
+        let focus_prompt_line = match (focus_line.is_empty(), project_prompt_line.is_empty()) {
+            (true, true) => String::new(),
+            (false, true) => format!("\n{focus_line}"),
+            (true, false) => project_prompt_line,
+            (false, false) => format!("\n{focus_line}{project_prompt_line}"),
+        };
 
         // 为 override 分支保留引用（base_prompt 构建后会 move 这些变量）
         let apps_list_for_override = apps_list.clone();
@@ -713,7 +772,7 @@ impl SummaryAnalyzer {
 工作时长：{}
 主要应用：{}
 访问网站：{}
-按小时活跃度：{}
+按小时活跃度：{}{}
 屏幕内容关键词：{}
 
 【活动时间线】
@@ -751,6 +810,7 @@ impl SummaryAnalyzer {
                     urls_list
                 },
                 hourly_summary,
+                focus_prompt_line,
                 if top_keywords.is_empty() {
                     empty_value(self.locale).to_string()
                 } else {
@@ -768,7 +828,7 @@ impl SummaryAnalyzer {
 工作時長：{}
 主要應用：{}
 造訪網站：{}
-按小時活躍度：{}
+按小時活躍度：{}{}
 畫面內容關鍵詞：{}
 
 【活動時間線】
@@ -806,6 +866,7 @@ impl SummaryAnalyzer {
                     urls_list
                 },
                 hourly_summary,
+                focus_prompt_line,
                 if top_keywords.is_empty() {
                     empty_value(self.locale).to_string()
                 } else {
@@ -823,7 +884,7 @@ impl SummaryAnalyzer {
 Work duration: {}
 Main apps: {}
 Visited websites: {}
-Hourly activity: {}
+Hourly activity: {}{}
 Screen-content keywords: {}
 
 [Activity Timeline]
@@ -861,6 +922,7 @@ Close with one sentence about the day's work state."#,
                     urls_list
                 },
                 hourly_summary,
+                focus_prompt_line,
                 if top_keywords.is_empty() {
                     empty_value(self.locale).to_string()
                 } else {
@@ -878,7 +940,7 @@ Close with one sentence about the day's work state."#,
 مدة العمل: {}
 أهم التطبيقات: {}
 المواقع المزارة: {}
-النشاط بالساعة: {}
+النشاط بالساعة: {}{}
 الكلمات المفتاحية للشاشة: {}
 
 [سجل الأنشطة الزمني]
@@ -916,6 +978,7 @@ Close with one sentence about the day's work state."#,
                     urls_list
                 },
                 hourly_summary,
+                focus_prompt_line,
                 if top_keywords.is_empty() {
                     empty_value(self.locale).to_string()
                 } else {
@@ -934,42 +997,46 @@ Close with one sentence about the day's work state."#,
                 // 将日期和统计数据注入到用户模板中
                 let injected = match self.locale {
                     AppLocale::ZhCn => format!(
-                        "【日期】\n{}\n\n【今日原始数据】\n工作时长：{}\n主要应用：{}\n访问网站：{}\n按小时活跃度：{}\n屏幕内容关键词：{}\n\n【活动时间线】\n{}",
+                        "【日期】\n{}\n\n【今日原始数据】\n工作时长：{}\n主要应用：{}\n访问网站：{}\n按小时活跃度：{}{}\n屏幕内容关键词：{}\n\n【活动时间线】\n{}",
                         date,
                         format_duration_for_locale(stats.total_duration, self.locale),
                         if apps_list_for_override.is_empty() { empty_value(self.locale).to_string() } else { apps_list_for_override.clone() },
                         if urls_list_for_override.is_empty() { empty_value(self.locale).to_string() } else { urls_list_for_override.clone() },
                         hourly_summary,
+                        focus_prompt_line,
                         if keywords_for_override.is_empty() { empty_value(self.locale).to_string() } else { keywords_for_override.clone() },
                         timeline,
                     ),
                     AppLocale::ZhTw => format!(
-                        "【日期】\n{}\n\n【今日原始資料】\n工作時長：{}\n主要應用：{}\n造訪網站：{}\n按小時活躍度：{}\n畫面內容關鍵詞：{}\n\n【活動時間線】\n{}",
+                        "【日期】\n{}\n\n【今日原始資料】\n工作時長：{}\n主要應用：{}\n造訪網站：{}\n按小時活躍度：{}{}\n畫面內容關鍵詞：{}\n\n【活動時間線】\n{}",
                         date,
                         format_duration_for_locale(stats.total_duration, self.locale),
                         if apps_list_for_override.is_empty() { empty_value(self.locale).to_string() } else { apps_list_for_override.clone() },
                         if urls_list_for_override.is_empty() { empty_value(self.locale).to_string() } else { urls_list_for_override.clone() },
                         hourly_summary,
+                        focus_prompt_line,
                         if keywords_for_override.is_empty() { empty_value(self.locale).to_string() } else { keywords_for_override.clone() },
                         timeline,
                     ),
                     AppLocale::En => format!(
-                        "[Date]\n{}\n\n[Raw Data]\nWork duration: {}\nTop apps: {}\nWebsites: {}\nHourly activity: {}\nScreen keywords: {}\n\n[Activity Timeline]\n{}",
+                        "[Date]\n{}\n\n[Raw Data]\nWork duration: {}\nTop apps: {}\nWebsites: {}\nHourly activity: {}{}\nScreen keywords: {}\n\n[Activity Timeline]\n{}",
                         date,
                         format_duration_for_locale(stats.total_duration, self.locale),
                         if apps_list_for_override.is_empty() { empty_value(self.locale).to_string() } else { apps_list_for_override.clone() },
                         if urls_list_for_override.is_empty() { empty_value(self.locale).to_string() } else { urls_list_for_override.clone() },
                         hourly_summary,
+                        focus_prompt_line,
                         if keywords_for_override.is_empty() { empty_value(self.locale).to_string() } else { keywords_for_override.clone() },
                         timeline,
                     ),
                     AppLocale::Ar => format!(
-                        "[التاريخ]\n{}\n\n[البيانات الأولية]\nمدة العمل: {}\nأهم التطبيقات: {}\nالمواقع: {}\nالنشاط بالساعة: {}\nالكلمات المفتاحية للشاشة: {}\n\n[سجل الأنشطة الزمني]\n{}",
+                        "[التاريخ]\n{}\n\n[البيانات الأولية]\nمدة العمل: {}\nأهم التطبيقات: {}\nالمواقع: {}\nالنشاط بالساعة: {}{}\nالكلمات المفتاحية للشاشة: {}\n\n[سجل الأنشطة الزمني]\n{}",
                         date,
                         format_duration_for_locale(stats.total_duration, self.locale),
                         if apps_list_for_override.is_empty() { empty_value(self.locale).to_string() } else { apps_list_for_override.clone() },
                         if urls_list_for_override.is_empty() { empty_value(self.locale).to_string() } else { urls_list_for_override.clone() },
                         hourly_summary,
+                        focus_prompt_line,
                         if keywords_for_override.is_empty() { empty_value(self.locale).to_string() } else { keywords_for_override.clone() },
                         timeline,
                     ),
@@ -1243,6 +1310,7 @@ mod tests {
                 hour: 10,
                 duration: 3600,
             }],
+            project_usage: vec![],
         }
     }
 

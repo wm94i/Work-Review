@@ -1,6 +1,7 @@
 pub mod cloud;
 pub mod hourly;
 pub mod local;
+pub mod obsidian;
 pub mod report_blocks;
 pub mod summary;
 

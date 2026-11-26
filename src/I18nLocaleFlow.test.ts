@@ -11,8 +11,9 @@ async function readCommandsSource() {
 }
 
 test('前端应向日报生成与工作助手透传当前 locale，并让日期输入跟随语言切换', async () => {
-  const [appSource, reportSource, askSource, timelineSource, summarySource, summaryDrawerSource] = await Promise.all([
+  const [appSource, storageTaskSource, reportSource, askSource, timelineSource, summarySource, summaryDrawerSource] = await Promise.all([
     readFile(new URL('./App.svelte', import.meta.url), 'utf8'),
+    readFile(new URL('../src-tauri/src/tasks/storage.rs', import.meta.url), 'utf8'),
     readFile(new URL('./routes/report/Report.svelte', import.meta.url), 'utf8'),
     readFile(new URL('./routes/ask/Ask.svelte', import.meta.url), 'utf8'),
     readFile(new URL('./routes/timeline/Timeline.svelte', import.meta.url), 'utf8'),
@@ -20,7 +21,11 @@ test('前端应向日报生成与工作助手透传当前 locale，并让日期�
     readFile(new URL('./routes/timeline/HourlySummaryDrawer.svelte', import.meta.url), 'utf8'),
   ]);
 
-  assert.match(appSource, /invoke\('generate_report', \{ date: today, force: false, locale: currentLocale \}\)/);
+  assert.match(appSource, /safeListen\(\s*'auto-report-generated'/);
+  assert.match(
+    storageTaskSource,
+    /async fn auto_report_and_insight_task[\s\S]*commands::generate_report_inner\(\s*today\.clone\(\),\s*Some\(false\),\s*Some\(locale\.clone\(\)\),/,
+  );
   assert.match(reportSource, /invoke\('generate_report', \{ date: targetDate, force, locale: targetLocale \}\)/);
   assert.match(reportSource, /invoke<DailyReport \| null>\('get_saved_report', \{ date: targetDate, locale: targetLocale \}\)/);
   assert.match(

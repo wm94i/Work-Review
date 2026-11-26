@@ -1,3 +1,4 @@
+import { mount } from 'svelte';
 import './app.css';
 import App from './App.svelte';
 
@@ -7,6 +8,6 @@ if (!target) {
   throw new Error('找不到应用挂载节点 #app');
 }
 
-const app = new App({ target });
+const app = mount(App, { target });
 
 export default app;

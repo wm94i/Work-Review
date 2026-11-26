@@ -228,7 +228,7 @@ Supported providers: Ollama (local) / LM Studio (local) / OpenAI compatible / De
 - To update, download the portable ZIP, exit, replace the EXE and preserve `Data`; do not run the installer. External data locations cannot be selected in portable mode. After exiting and backing up, moving `Data` away restores this PC's normal data location.
 - WebView2 cache, autostart registration and user-selected external export paths remain system-managed. `Data` may contain API keys: never share it publicly.
 
-**Available for testing in [v1.1.4-rc.2](https://github.com/wm94i/Work-Review/releases/tag/v1.1.4-rc.2); `v1.1.4-rc.1` and earlier releases do not include this support.**
+**Available for testing in [v1.2.0-rc.1](https://github.com/wm94i/Work-Review/releases/tag/v1.2.0-rc.1); `v1.1.4-rc.1` and earlier releases do not include this support.**
 
 > **Windows 11 Smart App Control**: If Windows shows "Smart App Control blocked this app from running", it's because Work Review is signed with a self-signed certificate (not a commercial EV certificate). You can turn off Smart App Control in "Windows Security → App & browser control → Smart App Control". See [#139](https://github.com/wm94i/Work-Review/issues/139).
 
@@ -315,10 +315,11 @@ Or via query parameter: `?token=<token>`
 |------|------|------|
 | GET | `/health` | Health check (no auth) |
 | GET | `/v1/device` | Device info |
-| GET | `/v1/timeline/{date}` | Timeline (`date` format `YYYY-MM-DD`, supports `?limit=&offset=`) |
-| GET | `/v1/activities/{date}` | Activity list (supports `?limit=&offset=&category=`) |
+| GET | `/v1/timeline/{date}` | Timeline (`date` format `YYYY-MM-DD`, supports `?limit=&offset=&include_ocr=`; default 500, max 2000 rows; OCR text only when `localhost_api_include_ocr` is enabled in config.json and the request sets `include_ocr=true`) |
+| GET | `/v1/activities/{date}` | Activity list (supports `?limit=&include_ocr=`; same limits and OCR rule as the timeline) |
 | GET | `/v1/stats/today` | Today's stats |
 | GET | `/v1/stats/overview` | Overview stats (`?mode=today|date|week|range`) |
+| GET | `/v1/stats/focus` | Focus & fragmentation metrics (`?mode=today|date|week|range`) |
 | GET | `/v1/stats/daily/{date}` | Stats for a given date |
 | GET | `/v1/reports` | Report list (`?limit=`) |
 | GET | `/v1/reports/{date}` | Report for a given date (`?locale=`) |
@@ -353,7 +354,7 @@ curl -H "Authorization: Bearer $(cat ~/work-review/localhost_api_token.txt)" \
 <details>
 <summary>MCP Server</summary>
 
-Connects work records to AI coding tools (Claude Code / Cursor / VS Code Copilot, etc.) via the stdio protocol.
+Connects work records to AI coding tools (Claude Code / Cursor / VS Code Copilot, etc.) via the stdio protocol. By default MCP omits raw OCR text and screenshot paths (`mcp_include_ocr: false` in `config.json`) and applies current privacy rules. Feishu / DingTalk / WeCom bots require sender binding via `/bind <code>` generated in **Settings → Integrations**.
 
 ```bash
 cargo build --release -p work-review-mcp-server

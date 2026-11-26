@@ -130,33 +130,58 @@ impl ScreenLockMonitor {
             }
         }
 
-        // 无 systemd 的桌面环境：一次 pgrep 覆盖常见锁屏进程，再尝试 Cinnamon D-Bus。
-        if let Some(output) = run_linux_lock_command(Command::new("pgrep").args([
-            "-f",
-            "^(cinnamon-screensaver|gnome-screensaver|xscreensaver|i3lock|swaylock)( .*)?$",
-        ])) {
+        // 无 systemd 的桌面环境：只匹配实际锁屏前台进程（i3lock / swaylock / hyprlock），
+        // 绝不匹配常驻屏保守护进程（gnome-screensaver / cinnamon-screensaver / xscreensaver），
+        // 否则未锁屏也会被永久误判为锁屏。
+        if let Some(output) = run_linux_lock_command(
+            Command::new("pgrep").args(["-f", LINUX_ACTIVE_LOCKER_PGREP_PATTERN]),
+        ) {
             if output.status.success() {
-                log::debug!("锁屏检测: 常见锁屏进程正在运行");
+                log::debug!("锁屏检测: 活跃锁屏进程正在运行");
                 return true;
             }
         }
 
-        run_linux_lock_command(Command::new("dbus-send").args([
-            "--session",
-            "--dest=org.cinnamon.ScreenSaver",
-            "--type=method_call",
-            "--print-reply",
-            "/org/cinnamon/ScreenSaver",
-            "org.cinnamon.ScreenSaver.GetActive",
-        ]))
-        .is_some_and(|output| {
-            let locked = output.status.success()
-                && String::from_utf8_lossy(&output.stdout).contains("boolean true");
-            if locked {
-                log::debug!("锁屏检测: Cinnamon ScreenSaver 报告已激活");
+        // 依次通过 D-Bus GetActive 查询桌面屏保是否处于激活状态
+        const DBUS_SCREENSAVERS: &[(&str, &str, &str)] = &[
+            (
+                "org.freedesktop.ScreenSaver",
+                "/org/freedesktop/ScreenSaver",
+                "org.freedesktop.ScreenSaver.GetActive",
+            ),
+            (
+                "org.gnome.ScreenSaver",
+                "/org/gnome/ScreenSaver",
+                "org.gnome.ScreenSaver.GetActive",
+            ),
+            (
+                "org.cinnamon.ScreenSaver",
+                "/org/cinnamon/ScreenSaver",
+                "org.cinnamon.ScreenSaver.GetActive",
+            ),
+        ];
+
+        for (dest, path, method) in DBUS_SCREENSAVERS {
+            if let Some(output) = run_linux_lock_command(Command::new("dbus-send").args([
+                "--session",
+                &format!("--dest={dest}"),
+                "--type=method_call",
+                "--print-reply",
+                path,
+                method,
+            ])) {
+                if output.status.success() {
+                    let locked =
+                        parse_dbus_screensaver_active(&String::from_utf8_lossy(&output.stdout));
+                    if locked {
+                        log::debug!("锁屏检测: {dest} 报告屏幕已锁定");
+                    }
+                    return locked;
+                }
             }
-            locked
-        })
+        }
+
+        false
     }
 
     /// 检查屏幕是否锁定 (其他平台)
@@ -172,8 +197,16 @@ impl ScreenLockMonitor {
 }
 
 #[cfg(any(target_os = "linux", test))]
+const LINUX_ACTIVE_LOCKER_PGREP_PATTERN: &str = "^(i3lock|swaylock|hyprlock)( .*)?$";
+
+#[cfg(any(target_os = "linux", test))]
 fn loginctl_reports_locked(stdout: &str) -> bool {
     matches!(stdout.trim(), "yes" | "LockedHint=yes")
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn parse_dbus_screensaver_active(stdout: &str) -> bool {
+    stdout.contains("boolean true")
 }
 
 #[cfg(target_os = "linux")]
@@ -209,7 +242,9 @@ impl Default for ScreenLockMonitor {
 
 #[cfg(test)]
 mod tests {
-    use super::loginctl_reports_locked;
+    use super::{
+        loginctl_reports_locked, parse_dbus_screensaver_active, LINUX_ACTIVE_LOCKER_PGREP_PATTERN,
+    };
 
     #[test]
     fn loginctl锁屏结果只接受明确的yes() {
@@ -217,5 +252,16 @@ mod tests {
         assert!(loginctl_reports_locked("LockedHint=yes\n"));
         assert!(!loginctl_reports_locked("no\n"));
         assert!(!loginctl_reports_locked(""));
+    }
+
+    #[test]
+    fn linux_pgrep回退不得匹配常驻屏保守护进程() {
+        assert!(!LINUX_ACTIVE_LOCKER_PGREP_PATTERN.contains("gnome-screensaver"));
+        assert!(!LINUX_ACTIVE_LOCKER_PGREP_PATTERN.contains("cinnamon-screensaver"));
+        assert!(!LINUX_ACTIVE_LOCKER_PGREP_PATTERN.contains("xscreensaver"));
+        assert!(LINUX_ACTIVE_LOCKER_PGREP_PATTERN.contains("i3lock"));
+        assert!(LINUX_ACTIVE_LOCKER_PGREP_PATTERN.contains("swaylock"));
+        assert!(parse_dbus_screensaver_active("   boolean true\n"));
+        assert!(!parse_dbus_screensaver_active("   boolean false\n"));
     }
 }

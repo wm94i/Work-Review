@@ -120,7 +120,7 @@ async fn upload_s3(
     // Content-Type 按扩展名推导；同时参与 SigV4 签名，签名与实际请求头必须一致
     let content_type = content_type_for_extension(&object_key);
 
-    let canonical_uri = format!("/{}/{}", config.bucket, url_encode_path(&object_key));
+    let canonical_uri = s3_canonical_uri(endpoint, &config.bucket, &object_key)?;
     let canonical_querystring = "";
 
     let canonical_headers = format!(
@@ -199,6 +199,22 @@ fn content_type_for_extension(path: &str) -> &'static str {
         "png" => "image/png",
         "json" => "application/json",
         _ => "application/octet-stream",
+    }
+}
+
+/// 构造 S3 SigV4 `canonical_uri`：保留自定义 endpoint 的路径前缀（例如反代 `/minio`），
+/// 再拼接编码后的 bucket 与 object_key，确保与实际 PUT URL 路径一致。
+fn s3_canonical_uri(endpoint: &str, bucket: &str, object_key: &str) -> Result<String> {
+    let parsed = reqwest::Url::parse(endpoint)
+        .map_err(|e| AppError::Config(format!("S3 endpoint URL 解析失败: {e}")))?;
+    let base_path = parsed.path().trim_matches('/');
+    let encoded_bucket = url_encode_path(bucket.trim_matches('/'));
+    let encoded_key = url_encode_path(object_key.trim_start_matches('/'));
+    if base_path.is_empty() {
+        Ok(format!("/{encoded_bucket}/{encoded_key}"))
+    } else {
+        let encoded_base = url_encode_path(base_path);
+        Ok(format!("/{encoded_base}/{encoded_bucket}/{encoded_key}"))
     }
 }
 
@@ -353,12 +369,29 @@ pub async fn pull_app_config_bytes(config: &RemoteStorageConfig) -> Result<Optio
             body.chars().take(300).collect::<String>()
         )));
     }
-    Ok(Some(
-        resp.bytes()
-            .await
-            .map_err(|e| AppError::Unknown(format!("读取 WebDAV 配置失败: {e}")))?
-            .to_vec(),
-    ))
+    const MAX_REMOTE_CONFIG_BYTES: usize = 2 * 1024 * 1024;
+    if let Some(len) = resp.content_length() {
+        if len > MAX_REMOTE_CONFIG_BYTES as u64 {
+            return Err(AppError::Unknown(
+                "远端同步配置文件超过 2MB 上限".to_string(),
+            ));
+        }
+    }
+    let mut out = Vec::new();
+    let mut resp = resp;
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|e| AppError::Unknown(format!("读取 WebDAV 配置失败: {e}")))?
+    {
+        if out.len().saturating_add(chunk.len()) > MAX_REMOTE_CONFIG_BYTES {
+            return Err(AppError::Unknown(
+                "远端同步配置文件超过 2MB 上限".to_string(),
+            ));
+        }
+        out.extend_from_slice(&chunk);
+    }
+    Ok(Some(out))
 }
 
 /// 逐级确保远程目录存在（带进程内缓存，已确认过的目录不再重复 MKCOL）。
@@ -439,7 +472,7 @@ fn public_url_or_fallback(base_url: Option<&str>, object_path: &str, fallback: &
 mod tests {
     use super::{
         content_type_for_extension, ensure_s3_endpoint_allowed, ensure_webdav_endpoint_allowed,
-        public_url_or_fallback, remote_object_path,
+        public_url_or_fallback, remote_object_path, s3_canonical_uri,
     };
 
     #[test]
@@ -514,6 +547,27 @@ mod tests {
                 "https://webdav.example.com/archive/screenshots/shot.jpg",
             ),
             "https://webdav.example.com/archive/screenshots/shot.jpg"
+        );
+    }
+
+    #[test]
+    fn s3_sigv4_canonical_uri应保留端点路径前缀并编码特殊字符() {
+        assert_eq!(
+            s3_canonical_uri("https://s3.example.com", "my-bucket", "a/b c.jpg").unwrap(),
+            "/my-bucket/a/b%20c.jpg"
+        );
+        assert_eq!(
+            s3_canonical_uri(
+                "https://proxy.example.com/minio/",
+                "my-bucket",
+                "2026-08-05/shot.jpg"
+            )
+            .unwrap(),
+            "/minio/my-bucket/2026-08-05/shot.jpg"
+        );
+        assert_eq!(
+            s3_canonical_uri("https://proxy.example.com/v1/s3", "bucket", "dir/中文.jpg").unwrap(),
+            "/v1/s3/bucket/dir/%E4%B8%AD%E6%96%87.jpg"
         );
     }
 }

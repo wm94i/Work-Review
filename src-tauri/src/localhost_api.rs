@@ -135,6 +135,7 @@ struct HttpResponse {
     reason: &'static str,
     content_type: &'static str,
     body: Vec<u8>,
+    deprecation_warning: Option<&'static str>,
 }
 
 impl HttpResponse {
@@ -151,6 +152,7 @@ impl HttpResponse {
             reason,
             content_type: "application/json; charset=utf-8",
             body,
+            deprecation_warning: None,
         }
     }
 
@@ -164,12 +166,17 @@ impl HttpResponse {
     }
 
     fn to_bytes(&self) -> Vec<u8> {
+        let extra = self
+            .deprecation_warning
+            .map(|msg| format!("Deprecation: true\r\nWarning: 299 - \"{msg}\"\r\n"))
+            .unwrap_or_default();
         let headers = format!(
-            "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\n\r\n",
+            "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\n{}\r\n",
             self.status,
             self.reason,
             self.content_type,
-            self.body.len()
+            self.body.len(),
+            extra
         );
         let mut bytes = headers.into_bytes();
         bytes.extend_from_slice(&self.body);
@@ -667,9 +674,35 @@ fn handle_device_info(state: &Arc<Mutex<AppState>>) -> Result<HttpResponse> {
 }
 
 /// GET /v1/context — 返回用户当前工作上下文（真实前台窗口 + 最近应用）。
+/// 补齐浏览器实时窗口的 URL（fast 路径为低开销默认不取 URL），确保 `excluded_domains` 规则生效。
+fn resolve_live_active_window(
+    state: &Arc<Mutex<AppState>>,
+) -> Option<crate::monitor::ActiveWindow> {
+    let mut active_window = crate::monitor::get_active_window_fast().ok()?;
+    if active_window.browser_url.is_none()
+        && work_review_core::categorize::is_browser_app(&active_window.app_name)
+    {
+        let cached_url = state.lock().ok().and_then(|s| {
+            s.cached_active_window.as_ref().and_then(|(_, cached)| {
+                (cached.app_name == active_window.app_name
+                    && cached.window_title == active_window.window_title)
+                    .then(|| cached.browser_url.clone())
+                    .flatten()
+            })
+        });
+        active_window.browser_url = cached_url.or_else(|| {
+            crate::monitor::resolve_browser_url_for_window(
+                &active_window.app_name,
+                &active_window.window_title,
+            )
+        });
+    }
+    Some(active_window)
+}
+
 /// 供 MCP Server 的 get_current_context 工具委托调用，拿到独立进程无法直接采集的前台窗口。
 fn handle_current_context(state: &Arc<Mutex<AppState>>) -> Result<HttpResponse> {
-    let active_window = crate::monitor::get_active_window_fast().ok();
+    let active_window = resolve_live_active_window(state);
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
 
     let s = state.lock().map_err(|e| AppError::Unknown(e.to_string()))?;
@@ -700,11 +733,13 @@ fn build_current_context_response(
     recent_apps: Vec<String>,
     privacy_filter: &PrivacyFilter,
 ) -> HttpResponse {
+    let had_window = active_window.is_some();
     let active_window = active_window.and_then(|mut window| {
-        match privacy_filter.check_privacy_full(
+        match privacy_filter.check_privacy_with_private(
             &window.app_name,
             &window.window_title,
             window.browser_url.as_deref(),
+            window.is_private,
         ) {
             PrivacyAction::Skip => None,
             PrivacyAction::Anonymize => {
@@ -718,6 +753,7 @@ fn build_current_context_response(
             }
         }
     });
+    let suppressed = had_window && active_window.is_none();
     let (primary_app, window_title, browser_url) = match &active_window {
         Some(w) => (
             w.app_name.as_str(),
@@ -735,6 +771,7 @@ fn build_current_context_response(
             "browser_url": browser_url,
             "recent_apps": recent_apps,
             "is_live": active_window.is_some(),
+            "suppressed": suppressed,
         }),
     )
 }
@@ -775,19 +812,33 @@ fn build_capture_payload(
     }
 }
 
-/// 立即截取当前活动界面。强制仅表示绕过定时采集，不绕过用户的截图隐私开关。
+/// 立即截取当前活动界面。强制仅表示绕过定时采集，不绕过用户的截图开关与隐私规则。
 async fn handle_capture_screenshot(state: &Arc<Mutex<AppState>>) -> Result<HttpResponse> {
     let permit = acquire_api_capture_permit()?;
-    let active_window = crate::monitor::get_active_window_fast().ok();
+    let active_window = resolve_live_active_window(state);
     let (data_dir, screenshot_service) = {
         let guard = state.lock().map_err(|e| AppError::Unknown(e.to_string()))?;
         ensure_api_capture_enabled(guard.config.storage.screenshots_enabled)?;
+        if let Some(window) = active_window.as_ref() {
+            if guard.privacy_filter.check_privacy_with_private(
+                &window.app_name,
+                &window.window_title,
+                window.browser_url.as_deref(),
+                window.is_private,
+            ) != PrivacyAction::Record
+            {
+                return Err(AppError::Config(
+                    "当前前台窗口命中隐私规则（忽略/脱敏/排除域名），已拒绝即时截图".to_string(),
+                ));
+            }
+        }
         (guard.data_dir.clone(), guard.screenshot_service.clone())
     };
 
     let payload = tokio::task::spawn_blocking(move || -> Result<ScreenshotCapturePayload> {
         let _permit = permit;
-        let result = screenshot_service.capture_for_window(active_window.as_ref())?;
+        let result =
+            screenshot_service.capture_for_window_with_options(active_window.as_ref(), false)?;
         let encoded_result = screenshot_service.generate_full_image_base64(&result.path);
 
         if let Some(temp_path) = result
@@ -837,8 +888,10 @@ fn parse_generate_report_params(
 
     if date.trim().is_empty() {
         Err(AppError::Config("date 参数不能为空".to_string()))
+    } else if !commands::is_iso_date(&date) {
+        Err(AppError::Config("date 参数格式应为 YYYY-MM-DD".to_string()))
     } else {
-        Ok((date, force, locale))
+        Ok((date.trim().to_string(), force, locale))
     }
 }
 
@@ -858,8 +911,8 @@ async fn route_request(
     app: &AppHandle,
     state: &Arc<Mutex<AppState>>,
 ) -> HttpResponse {
-    match authorize_request(&request, state) {
-        Ok(()) => {}
+    let used_deprecated_query_token = match authorize_request(&request, state) {
+        Ok(used_query_token) => used_query_token,
         Err(err) => {
             let status = if matches!(err, AppError::Config(_)) {
                 401
@@ -868,7 +921,7 @@ async fn route_request(
             };
             return HttpResponse::error(status, err.to_string());
         }
-    }
+    };
 
     let result = match (request.method.as_str(), request.path.as_str()) {
         ("GET" | "POST", "/v1/reports/generate") => {
@@ -896,6 +949,8 @@ async fn route_request(
             let date = request.path.trim_start_matches("/v1/reports/").trim();
             if date.is_empty() {
                 Err(AppError::Config("日报日期不能为空".to_string()))
+            } else if !commands::is_iso_date(date) {
+                Err(AppError::Config("日报日期格式应为 YYYY-MM-DD".to_string()))
             } else {
                 commands::get_saved_report_inner(
                     date.to_string(),
@@ -939,6 +994,30 @@ async fn route_request(
             commands::get_overview_stats_inner(mode, date, date_from, date_to, state)
                 .map(|stats| HttpResponse::json(200, &stats))
         }
+        ("GET", "/v1/stats/focus") => {
+            let mode = request.query.get("mode").cloned();
+            let date = request.query.get("date").cloned();
+            let date_from = request.query.get("date_from").cloned();
+            let date_to = request.query.get("date_to").cloned();
+            commands::get_focus_metrics_inner(mode, date, date_from, date_to, state)
+                .map(|metrics| HttpResponse::json(200, &metrics))
+        }
+        ("GET", "/v1/stats/projects") => {
+            let date_from = request.query.get("date_from").cloned();
+            let date_to = request.query.get("date_to").cloned();
+            commands::get_project_stats_inner(date_from, date_to, state).map(
+                |(from, to, projects)| {
+                    HttpResponse::json(
+                        200,
+                        &serde_json::json!({
+                            "dateFrom": from,
+                            "dateTo": to,
+                            "projects": projects,
+                        }),
+                    )
+                },
+            )
+        }
         _ if request.method == "GET" && request.path.starts_with("/v1/stats/daily/") => {
             let date = request.path.trim_start_matches("/v1/stats/daily/").trim();
             if date.is_empty() {
@@ -974,9 +1053,27 @@ async fn route_request(
                 .trim();
             if date.is_empty() {
                 Err(AppError::Config("日期不能为空".to_string()))
+            } else if !commands::is_iso_date(date) {
+                Err(AppError::Config("日期格式应为 YYYY-MM-DD".to_string()))
             } else {
-                commands::get_hourly_summaries_inner(date, state)
-                    .map(|summaries| HttpResponse::json(200, &summaries))
+                let include_ocr = state
+                    .lock()
+                    .map(|g| g.config.localhost_api_include_ocr && wants_ocr(&request.query))
+                    .unwrap_or(false);
+                commands::get_hourly_summaries_inner(date, state).map(|mut summaries| {
+                    if !include_ocr {
+                        for item in &mut summaries {
+                            if let Some(summary) = item
+                                .get("summary")
+                                .and_then(|v| v.as_str())
+                                .map(strip_hourly_ocr_suffix)
+                            {
+                                item["summary"] = serde_json::Value::String(summary);
+                            }
+                        }
+                    }
+                    HttpResponse::json(200, &summaries)
+                })
             }
         }
         ("GET", "/v1/storage/stats") => {
@@ -992,14 +1089,61 @@ async fn route_request(
             commands::generate_weekly_review_inner(date_from, date_to, limit, state)
                 .map(|result| HttpResponse::json(200, &result))
         }
+        ("GET", "/v1/period-review") => {
+            let period_type = request
+                .query
+                .get("type")
+                .map(|v| v.trim())
+                .filter(|v| !v.is_empty())
+                .unwrap_or("month")
+                .to_string();
+            let period_key = request
+                .query
+                .get("key")
+                .map(|v| v.trim().to_string())
+                .unwrap_or_default();
+            if period_key.is_empty() {
+                Err(AppError::Config(
+                    "缺少 key 参数（例如 2026-11 或 2026-W47）".to_string(),
+                ))
+            } else {
+                let locale = request.query.get("locale").cloned();
+                let force = request
+                    .query
+                    .get("force")
+                    .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "true" | "1"))
+                    .unwrap_or(false);
+                let state_arc = state.clone();
+                tokio::task::spawn_blocking(move || {
+                    commands::get_or_generate_period_review_inner(
+                        &state_arc,
+                        &period_type,
+                        &period_key,
+                        locale.as_deref(),
+                        force,
+                    )
+                })
+                .await
+                .map_err(|e| AppError::Unknown(format!("周期复盘查询任务异常: {e}")))
+                .and_then(|res| res)
+                .map(|payload| HttpResponse::json(200, &payload))
+            }
+        }
         _ if request.method == "GET" && request.path.starts_with("/v1/timeline/") => {
             let date = request.path.trim_start_matches("/v1/timeline/").trim();
             if date.is_empty() {
                 Err(AppError::Config("时间线日期不能为空".to_string()))
+            } else if !commands::is_iso_date(date) {
+                Err(AppError::Config(
+                    "时间线日期格式应为 YYYY-MM-DD".to_string(),
+                ))
             } else {
-                let limit = request.query.get("limit").and_then(|v| v.parse().ok());
+                let limit = Some(external_activity_limit(&request.query));
                 let offset = request.query.get("offset").and_then(|v| v.parse().ok());
                 commands::get_timeline_inner(date.to_string(), limit, offset, state)
+                    .and_then(|activities| {
+                        sanitize_for_external_response(activities, &request.query, state)
+                    })
                     .map(|activities| HttpResponse::json(200, &activities))
             }
         }
@@ -1029,21 +1173,21 @@ async fn route_request(
             match validate_activity_date(date) {
                 Err(error) => Err(error),
                 Ok(()) => {
-                    let limit: usize = request
-                        .query
-                        .get("limit")
-                        .and_then(|v| v.parse().ok())
-                        .unwrap_or(10000);
-                    match state.lock() {
+                    let limit = external_activity_limit(&request.query) as usize;
+                    let loaded = match state.lock() {
                         Ok(s) => commands::load_filtered_activities_in_range(
                             &s,
                             Some(date),
                             Some(date),
                             limit,
-                        )
-                        .map(|result| HttpResponse::json(200, &result)),
+                        ),
                         Err(e) => Err(AppError::Unknown(e.to_string())),
-                    }
+                    };
+                    loaded
+                        .and_then(|activities| {
+                            sanitize_for_external_response(activities, &request.query, state)
+                        })
+                        .map(|result| HttpResponse::json(200, &result))
                 }
             }
         }
@@ -1079,6 +1223,7 @@ async fn route_request(
                 &body_str,
                 &config,
                 &data_dir,
+                state,
             )
             .await;
             Ok(HttpResponse {
@@ -1086,6 +1231,7 @@ async fn route_request(
                 reason: reason_phrase(resp.status),
                 content_type: "application/json; charset=utf-8",
                 body: resp.body.into_bytes(),
+                deprecation_warning: None,
             })
         }
         ("GET", "/wecom/callback") => {
@@ -1110,6 +1256,7 @@ async fn route_request(
                 reason: reason_phrase(resp.status),
                 content_type,
                 body: resp.body.into_bytes(),
+                deprecation_warning: None,
             })
         }
         ("POST", "/wecom/callback") => {
@@ -1129,6 +1276,7 @@ async fn route_request(
                 &body_str,
                 &config,
                 &data_dir,
+                state,
             )
             .await;
             let content_type: &'static str = if resp.content_type.contains("xml") {
@@ -1141,6 +1289,7 @@ async fn route_request(
                 reason: reason_phrase(resp.status),
                 content_type,
                 body: resp.body.into_bytes(),
+                deprecation_warning: None,
             })
         }
         ("POST", "/dingtalk/callback") => {
@@ -1160,6 +1309,7 @@ async fn route_request(
                 &body_str,
                 &config,
                 &data_dir,
+                state,
             )
             .await;
             Ok(HttpResponse {
@@ -1167,24 +1317,68 @@ async fn route_request(
                 reason: reason_phrase(resp.status),
                 content_type: "application/json; charset=utf-8",
                 body: resp.body.into_bytes(),
+                deprecation_warning: None,
             })
         }
         _ => Ok(HttpResponse::error(404, "未找到本地 API 路径")),
     };
 
-    result.unwrap_or_else(|error| {
+    let mut response = result.unwrap_or_else(|error| {
         let status = if matches!(error, AppError::Config(_)) {
             400
         } else {
             500
         };
         HttpResponse::error(status, error.to_string())
-    })
+    });
+    if used_deprecated_query_token {
+        response.deprecation_warning = Some(
+            "Query parameter ?token= authentication is deprecated and will be removed in the next release; use Authorization: Bearer header instead.",
+        );
+    }
+    response
 }
 
 fn parse_json_body<T: for<'de> Deserialize<'de>>(request: &ParsedRequest) -> Result<T> {
     serde_json::from_slice(&request.body)
         .map_err(|e| AppError::Config(format!("本地 API JSON 请求体非法: {e}")))
+}
+
+/// 活动类接口单次返回上限：未指定时 500 条，最多 2000 条。
+const EXTERNAL_ACTIVITY_DEFAULT_LIMIT: u32 = 500;
+const EXTERNAL_ACTIVITY_MAX_LIMIT: u32 = 2000;
+
+fn external_activity_limit(query: &HashMap<String, String>) -> u32 {
+    query
+        .get("limit")
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(EXTERNAL_ACTIVITY_DEFAULT_LIMIT)
+        .clamp(1, EXTERNAL_ACTIVITY_MAX_LIMIT)
+}
+
+/// `?include_ocr=true|1` 时才返回 OCR 原文；默认不返回。
+fn wants_ocr(query: &HashMap<String, String>) -> bool {
+    query
+        .get("include_ocr")
+        .map(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "true" | "1"))
+        .unwrap_or(false)
+}
+
+/// 活动列表出站前按当前脱敏规则处理（脱敏应用清空标题/URL/OCR）。
+/// OCR 原文需同时满足：用户在本机开启 `localhost_api_include_ocr`，且请求带 `?include_ocr=true`；
+/// 仅凭调用方参数不能取得 OCR（与 MCP 的 `mcp_include_ocr` 同一原则）。
+fn sanitize_for_external_response(
+    activities: Vec<work_review_core::database::Activity>,
+    query: &HashMap<String, String>,
+    state: &Arc<Mutex<AppState>>,
+) -> Result<Vec<work_review_core::database::Activity>> {
+    let guard = state.lock().map_err(|e| AppError::Unknown(e.to_string()))?;
+    let include_ocr = guard.config.localhost_api_include_ocr && wants_ocr(query);
+    Ok(commands::sanitize_activities_for_external(
+        activities,
+        &guard.privacy_filter,
+        include_ocr,
+    ))
 }
 
 fn validate_activity_date(date: &str) -> Result<()> {
@@ -1213,9 +1407,75 @@ fn request_auth_mode(method: &str, path: &str) -> RequestAuthMode {
     RequestAuthMode::LocalApiToken
 }
 
-fn authorize_request(request: &ParsedRequest, state: &Arc<Mutex<AppState>>) -> Result<()> {
-    match request_auth_mode(&request.method, &request.path) {
-        RequestAuthMode::None => return Ok(()),
+/// 去除旧版小时摘要中可能附带的 OCR 关键词尾段（`，涉及: ...`）。
+fn strip_hourly_ocr_suffix(text: &str) -> String {
+    if let Some((prefix, _)) = text.split_once("，涉及:") {
+        prefix.trim().to_string()
+    } else if let Some((prefix, _)) = text.split_once(", involving:") {
+        prefix.trim().to_string()
+    } else {
+        text.to_string()
+    }
+}
+
+/// 校验 HTTP Host 头防止浏览器 DNS Rebinding 访问 `/health` 等免鉴权接口。
+/// 允许 `127.0.0.1` / `localhost` / `[::1]`，以及用户显式配置的监听主机（当配置为 `0.0.0.0`/`::` 或 webhook 经过反向代理时，Webhook 路由仍按自身签名校验）。
+fn is_allowed_host_header(host_header: &str, configured_host: Option<&str>) -> bool {
+    let trimmed = host_header.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let host = if let Some(rest) = trimmed.strip_prefix('[') {
+        rest.split(']').next().unwrap_or("")
+    } else {
+        trimmed.split(':').next().unwrap_or("")
+    }
+    .trim_end_matches('.')
+    .to_ascii_lowercase();
+
+    if matches!(host.as_str(), "127.0.0.1" | "localhost" | "::1") {
+        return true;
+    }
+    if let Some(configured) = configured_host
+        .map(str::trim)
+        .filter(|h| !h.is_empty())
+        .map(str::to_ascii_lowercase)
+    {
+        if configured == "0.0.0.0" || configured == "::" {
+            // 显式监听全网段时允许任意局域网 IP / 本机名访问（Webhook 与跨设备场景）
+            return !host.is_empty();
+        }
+        return host == configured.trim_matches(|c| c == '[' || c == ']');
+    }
+    false
+}
+
+/// 鉴权校验；返回值表示是否使用了已弃用的 `?token=` 查询参数鉴权（保留 1 个版本过渡并告警）。
+fn authorize_request(request: &ParsedRequest, state: &Arc<Mutex<AppState>>) -> Result<bool> {
+    let auth_mode = request_auth_mode(&request.method, &request.path);
+    // 浏览器发起的请求一定带 Host 头；仅校验本地端点，Bot Webhook 经隧道/反代使用公网域名且自带签名验签。
+    let is_webhook_path = matches!(
+        request.path.as_str(),
+        "/feishu/event" | "/wecom/callback" | "/dingtalk/callback"
+    );
+    if !is_webhook_path {
+        if let Some(host_header) = request.headers.get("host") {
+            let configured_host = state
+                .lock()
+                .map_err(|e| AppError::Unknown(e.to_string()))?
+                .config
+                .localhost_api_host
+                .clone();
+            if !is_allowed_host_header(host_header, configured_host.as_deref()) {
+                return Err(AppError::Config(
+                    "非法的 Host 请求头，已拒绝访问".to_string(),
+                ));
+            }
+        }
+    }
+
+    match auth_mode {
+        RequestAuthMode::None => return Ok(false),
         RequestAuthMode::LocalApiToken => {}
     }
 
@@ -1232,6 +1492,7 @@ fn authorize_request(request: &ParsedRequest, state: &Arc<Mutex<AppState>>) -> R
         .get("authorization")
         .and_then(|value| extract_bearer_token(value));
     let from_query = request.query.get("token").map(|s| s.as_str());
+    let used_query_token = from_header.is_none() && from_query.is_some();
 
     let provided = from_header.or(from_query);
 
@@ -1241,7 +1502,13 @@ fn authorize_request(request: &ParsedRequest, state: &Arc<Mutex<AppState>>) -> R
         .map(|p| bool::from(p.as_bytes().ct_eq(expected_token.as_bytes())))
         .unwrap_or(false);
     if matched {
-        Ok(())
+        if used_query_token {
+            log::warn!(
+                "本地 API 请求 {} 使用了已弃用的 ?token= 查询参数鉴权（将在下个版本移除），请改用 Authorization: Bearer 请求头",
+                request.path
+            );
+        }
+        Ok(used_query_token)
     } else {
         Err(AppError::Config("缺少或无效的本地 API token".to_string()))
     }
@@ -1251,9 +1518,9 @@ fn authorize_request(request: &ParsedRequest, state: &Arc<Mutex<AppState>>) -> R
 mod tests {
     use super::{
         acquire_api_capture_permit, build_capture_payload, build_current_context_response,
-        effective_api_host, ensure_api_capture_enabled, extract_bearer_token,
-        mask_localhost_api_token, parse_generate_report_params, request_auth_mode,
-        validate_activity_date, ParsedRequest, RequestAuthMode,
+        effective_api_host, ensure_api_capture_enabled, external_activity_limit,
+        extract_bearer_token, mask_localhost_api_token, parse_generate_report_params,
+        request_auth_mode, validate_activity_date, wants_ocr, ParsedRequest, RequestAuthMode,
     };
     use crate::monitor::ActiveWindow;
     use crate::screenshot::ScreenshotResult;
@@ -1261,6 +1528,34 @@ mod tests {
     use std::path::{Path, PathBuf};
     use work_review_core::config::{AppPrivacyRule, PrivacyConfig, PrivacyLevel};
     use work_review_core::privacy::PrivacyFilter;
+
+    fn query_of(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn 活动接口返回条数应有默认值与上限() {
+        assert_eq!(external_activity_limit(&query_of(&[])), 500);
+        assert_eq!(external_activity_limit(&query_of(&[("limit", "20")])), 20);
+        assert_eq!(
+            external_activity_limit(&query_of(&[("limit", "999999")])),
+            2000
+        );
+        assert_eq!(external_activity_limit(&query_of(&[("limit", "0")])), 1);
+        assert_eq!(external_activity_limit(&query_of(&[("limit", "abc")])), 500);
+    }
+
+    #[test]
+    fn 活动接口默认不返回ocr且仅显式开启时返回() {
+        assert!(!wants_ocr(&query_of(&[])));
+        assert!(!wants_ocr(&query_of(&[("include_ocr", "false")])));
+        assert!(wants_ocr(&query_of(&[("include_ocr", "true")])));
+        assert!(wants_ocr(&query_of(&[("include_ocr", "1")])));
+        assert!(wants_ocr(&query_of(&[("include_ocr", " TRUE ")])));
+    }
 
     #[test]
     fn 实时上下文响应应尊重忽略脱敏域名与敏感文本规则() {
@@ -1286,6 +1581,7 @@ mod tests {
             executable_path: None,
             window_bounds: None,
             is_minimized: false,
+            is_private: false,
         };
         let response = |window| {
             let response = build_current_context_response(window, vec!["Editor".into()], &filter);
@@ -1351,6 +1647,7 @@ mod tests {
                 timestamp: 1_786_334_400,
                 width: 1440,
                 height: 900,
+                image_hash: None,
             },
             "encoded-jpeg".to_string(),
         );
@@ -1375,6 +1672,7 @@ mod tests {
                 timestamp: 1_786_334_400,
                 width: 1440,
                 height: 900,
+                image_hash: None,
             },
             "encoded-jpeg".to_string(),
         );
@@ -1573,5 +1871,17 @@ mod tests {
             request_auth_mode("GET", "/dingtalk/callback"),
             RequestAuthMode::LocalApiToken
         );
+    }
+
+    #[test]
+    fn 弃用查询参数鉴权响应应附带deprecation响应头() {
+        let mut resp = super::HttpResponse::json(200, &serde_json::json!({ "ok": true }));
+        let normal = String::from_utf8(resp.to_bytes()).unwrap();
+        assert!(!normal.contains("Deprecation: true"));
+
+        resp.deprecation_warning = Some("Query parameter ?token= is deprecated");
+        let deprecated = String::from_utf8(resp.to_bytes()).unwrap();
+        assert!(deprecated.contains("Deprecation: true\r\n"));
+        assert!(deprecated.contains("Warning: 299 - \"Query parameter ?token= is deprecated\"\r\n"));
     }
 }

@@ -33,15 +33,19 @@ test('stats.rs 应注册 4 个删除命令并经 remove_screenshot_files 连带�
   assert.match(src, /remove_screenshot_files/);
 });
 
-test('main.rs 应在 invoke_handler 注册 4 个删除命令', async () => {
-  const src = await readFile(new URL('../src-tauri/src/main.rs', import.meta.url), 'utf8');
+test('commands::handler 应在 invoke_handler 注册 4 个删除命令', async () => {
+  const [mainSrc, handlerSrc] = await Promise.all([
+    readFile(new URL('../src-tauri/src/main.rs', import.meta.url), 'utf8'),
+    readFile(new URL('../src-tauri/src/commands/mod.rs', import.meta.url), 'utf8'),
+  ]);
+  assert.match(mainSrc, /\.invoke_handler\(commands::handler\(\)\)/);
   for (const cmd of [
     'delete_activity',
     'delete_activities_by_date',
     'delete_activities_by_range',
     'delete_activities_by_app',
   ]) {
-    assert.match(src, new RegExp(`commands::${cmd}\\b`), `未注册 ${cmd}`);
+    assert.match(handlerSrc, new RegExp(`\\b${cmd}\\b`), `未注册 ${cmd}`);
   }
 });
 

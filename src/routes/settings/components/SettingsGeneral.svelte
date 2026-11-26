@@ -491,19 +491,21 @@
 
         {#if autoStartEnabled}
           <div class="ml-3 pl-3 border-l-2 border-primary-200/60 dark:border-primary-800/40">
-            <span class="settings-label">{t('settingsGeneral.autoStartLaunchMode')}</span>
-            <div class="mt-2 flex gap-2">
+            <span id="settings-general-autostart-mode-label" class="settings-label">{t('settingsGeneral.autoStartLaunchMode')}</span>
+            <div class="mt-2 ui-seg-group" role="group" aria-labelledby="settings-general-autostart-mode-label">
               <button
                 type="button"
+                aria-pressed={!config.auto_start_silent}
                 on:click={() => updateAutoStartLaunchMode(false)}
-                class="segment-btn {config.auto_start_silent ? 'settings-segment-base' : 'settings-segment-active'}"
+                class="ui-seg-item {config.auto_start_silent ? '' : 'ui-seg-item-active'}"
               >
                 {t('settingsGeneral.autoStartLaunchShow')}
               </button>
               <button
                 type="button"
+                aria-pressed={Boolean(config.auto_start_silent)}
                 on:click={() => updateAutoStartLaunchMode(true)}
-                class="segment-btn {config.auto_start_silent ? 'settings-segment-active' : 'settings-segment-base'}"
+                class="ui-seg-item {config.auto_start_silent ? 'ui-seg-item-active' : ''}"
               >
                 {t('settingsGeneral.autoStartLaunchSilent')}
               </button>

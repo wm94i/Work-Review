@@ -49,27 +49,88 @@ fn apply_website_semantic_rules_to_stats(
     stats
 }
 
+/// 从 `AppState` 短暂加锁提取的统计查询上下文，允许在释放全局锁后并发执行 SQLite 只读查询与聚合。
+#[derive(Clone)]
+struct OverviewQueryContext {
+    database: work_review_core::database::Database,
+    segments: Vec<work_review_core::config::WorkTimeSegment>,
+    ignored_apps: Vec<String>,
+    excluded_domains: Vec<String>,
+    privacy_config: work_review_core::config::PrivacyConfig,
+    work_time_enabled: bool,
+    standard_work_hours: f64,
+    website_semantic_rules: Vec<WebsiteSemanticRule>,
+    projects: Vec<work_review_core::project::ProjectDefinition>,
+}
+
+impl OverviewQueryContext {
+    fn from_state(state: &AppState) -> Self {
+        let (ignored_apps, excluded_domains) = collect_privacy_filters(state);
+        Self {
+            database: state.database.clone(),
+            segments: state.config.effective_work_segments(),
+            ignored_apps,
+            excluded_domains,
+            privacy_config: state.config.privacy.clone(),
+            work_time_enabled: state.config.work_time_enabled,
+            standard_work_hours: state.config.standard_work_hours,
+            website_semantic_rules: state.config.website_semantic_rules.clone(),
+            projects: state.config.projects.clone(),
+        }
+    }
+
+    fn snapshot(state: &Arc<Mutex<AppState>>) -> Result<Self, AppError> {
+        let guard = state.lock().map_err(|e| AppError::Unknown(e.to_string()))?;
+        Ok(Self::from_state(&guard))
+    }
+
+    fn finalize_day_stats(&self, mut stats: DailyStats) -> DailyStats {
+        apply_flex_overtime_correction(
+            &mut stats,
+            self.work_time_enabled,
+            self.standard_work_hours,
+        );
+        apply_website_semantic_rules_to_stats(stats, &self.website_semantic_rules)
+    }
+
+    fn load_single_day(&self, date: &str) -> Result<DailyStats, AppError> {
+        let stats = self.database.get_daily_stats_with_projects_filtered(
+            date,
+            &self.segments,
+            &self.ignored_apps,
+            &self.excluded_domains,
+            &self.projects,
+            Some(&self.privacy_config),
+        )?;
+        Ok(self.finalize_day_stats(stats))
+    }
+
+    fn load_date_range(
+        &self,
+        start: chrono::NaiveDate,
+        end: chrono::NaiveDate,
+    ) -> Result<Vec<(String, DailyStats)>, AppError> {
+        let per_day = self.database.get_daily_stats_range_with_projects_filtered(
+            start,
+            end,
+            &self.segments,
+            &self.ignored_apps,
+            &self.excluded_domains,
+            &self.projects,
+            Some(&self.privacy_config),
+        )?;
+        Ok(per_day
+            .into_iter()
+            .map(|(date, stats)| (date, self.finalize_day_stats(stats)))
+            .collect())
+    }
+}
+
 pub(crate) fn load_daily_stats_for_overview(
     state: &AppState,
     date: &str,
 ) -> Result<DailyStats, AppError> {
-    let segments = state.config.effective_work_segments();
-    let (ignored_apps, excluded_domains) = collect_privacy_filters(state);
-    let mut stats = state.database.get_daily_stats_with_segments_filtered(
-        date,
-        &segments,
-        &ignored_apps,
-        &excluded_domains,
-    )?;
-
-    apply_flex_overtime_correction(
-        &mut stats,
-        state.config.work_time_enabled,
-        state.config.standard_work_hours,
-    );
-    let stats = apply_website_semantic_rules_to_stats(stats, &state.config.website_semantic_rules);
-
-    Ok(stats)
+    OverviewQueryContext::from_state(state).load_single_day(date)
 }
 
 fn overview_week_bounds_for_date(anchor: chrono::NaiveDate) -> (String, String) {
@@ -401,6 +462,8 @@ fn sum_daily_stats(days: Vec<DailyStats>) -> DailyStats {
     let mut url_usage_map: HashMap<String, UrlUsage> = HashMap::new();
     let mut domain_usage_map: HashMap<String, DomainAggregate> = HashMap::new();
     let mut browser_usage_map: HashMap<String, BrowserAggregate> = HashMap::new();
+    let mut project_usage_map: HashMap<String, work_review_core::project::ProjectUsage> =
+        HashMap::new();
     let mut hourly_activity_distribution: Vec<HourlyActivityBucket> = (0..24)
         .map(|hour| HourlyActivityBucket { hour, duration: 0 })
         .collect();
@@ -461,6 +524,20 @@ fn sum_daily_stats(days: Vec<DailyStats>) -> DailyStats {
             if (0..24).contains(&bucket.hour) {
                 hourly_activity_distribution[bucket.hour as usize].duration += bucket.duration;
             }
+        }
+
+        for project in day.project_usage {
+            let entry = project_usage_map
+                .entry(project.key.clone())
+                .or_insert_with(|| work_review_core::project::ProjectUsage {
+                    key: project.key.clone(),
+                    name: project.name.clone(),
+                    color: project.color.clone(),
+                    duration: 0,
+                    activity_count: 0,
+                });
+            entry.duration += project.duration;
+            entry.activity_count += project.activity_count;
         }
     }
 
@@ -525,6 +602,10 @@ fn sum_daily_stats(days: Vec<DailyStats>) -> DailyStats {
             .then_with(|| left.browser_name.cmp(&right.browser_name))
     });
 
+    let mut project_usage: Vec<work_review_core::project::ProjectUsage> =
+        project_usage_map.into_values().collect();
+    work_review_core::project::sort_project_usage(&mut project_usage);
+
     DailyStats {
         total_duration,
         screenshot_count,
@@ -538,6 +619,7 @@ fn sum_daily_stats(days: Vec<DailyStats>) -> DailyStats {
         work_time_duration,
         overtime_duration,
         hourly_activity_distribution,
+        project_usage,
     }
 }
 
@@ -581,14 +663,13 @@ fn resolve_overview_date_span(
     })
 }
 
-/// 获取今日统计 —— 内部复用版（供 Tauri 命令与 localhost API 共用）
+/// 获取今日统计 —— 内部复用版（供 Tauri 命令与 localhost API 共用，释放全局锁后查询）
 pub(crate) fn get_today_stats_inner(state: &Arc<Mutex<AppState>>) -> Result<DailyStats, AppError> {
-    let state = state.lock().map_err(|e| AppError::Unknown(e.to_string()))?;
+    let ctx = OverviewQueryContext::snapshot(state)?;
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-    let stats = load_daily_stats_for_overview(&state, &today)?;
-    let (ignored_apps, excluded_domains) = collect_privacy_filters(&state);
-    let stats = apply_ignored_apps_to_stats(stats, &ignored_apps);
-    let mut stats = apply_excluded_domains_to_stats(stats, &excluded_domains);
+    let stats = ctx.load_single_day(&today)?;
+    let stats = apply_ignored_apps_to_stats(stats, &ctx.ignored_apps);
+    let mut stats = apply_excluded_domains_to_stats(stats, &ctx.excluded_domains);
     stats.domain_total_count = stats.domain_usage.len();
     Ok(stats)
 }
@@ -598,19 +679,22 @@ pub(crate) fn get_today_stats_inner(state: &Arc<Mutex<AppState>>) -> Result<Dail
 pub async fn get_today_stats(
     state: State<'_, Arc<Mutex<AppState>>>,
 ) -> Result<DailyStats, AppError> {
-    get_today_stats_inner(state.inner())
+    let state_arc = state.inner().clone();
+    tokio::task::spawn_blocking(move || get_today_stats_inner(&state_arc))
+        .await
+        .map_err(|e| AppError::Unknown(format!("统计查询任务异常: {e}")))?
 }
 
 /// 加载未做首页裁剪的完整概览统计，供首页、完整域名列表与单域名详情复用。
-fn load_full_overview_stats(
+/// 多日与周模式使用一次范围查询在 Rust 中按日切分，消除逐天循环 SQL 开销。
+fn load_full_overview_stats_with_context(
     mode: &str,
     date: Option<&str>,
     date_from: Option<&str>,
     date_to: Option<&str>,
-    state: &AppState,
+    ctx: &OverviewQueryContext,
 ) -> Result<DailyStats, AppError> {
     let normalized_mode = mode.trim().to_lowercase();
-    let (ignored_apps, excluded_domains) = collect_privacy_filters(state);
 
     let stats = match normalized_mode.as_str() {
         "date" => {
@@ -618,17 +702,13 @@ fn load_full_overview_stats(
 
             if start == end {
                 let date_value = start.format("%Y-%m-%d").to_string();
-                load_daily_stats_for_overview(state, &date_value)?
+                ctx.load_single_day(&date_value)?
             } else {
-                let mut daily_stats = Vec::new();
-                let mut current = start;
-                while current <= end {
-                    let current_date = current.format("%Y-%m-%d").to_string();
-                    daily_stats.push(load_daily_stats_for_overview(state, &current_date)?);
-                    current = current
-                        .succ_opt()
-                        .ok_or_else(|| AppError::Config("计算概览日期范围失败".to_string()))?;
-                }
+                let daily_stats = ctx
+                    .load_date_range(start, end)?
+                    .into_iter()
+                    .map(|(_, stats)| stats)
+                    .collect();
                 sum_daily_stats(daily_stats)
             }
         }
@@ -640,25 +720,21 @@ fn load_full_overview_stats(
             let end = chrono::NaiveDate::parse_from_str(&date_to, "%Y-%m-%d")
                 .map_err(|e| AppError::Config(format!("解析周概览结束日期失败: {e}")))?;
 
-            let mut daily_stats = Vec::new();
-            let mut current = start;
-            while current <= end {
-                let current_date = current.format("%Y-%m-%d").to_string();
-                daily_stats.push(load_daily_stats_for_overview(state, &current_date)?);
-                current = current
-                    .succ_opt()
-                    .ok_or_else(|| AppError::Config("计算周概览日期范围失败".to_string()))?;
-            }
+            let daily_stats = ctx
+                .load_date_range(start, end)?
+                .into_iter()
+                .map(|(_, stats)| stats)
+                .collect();
             sum_daily_stats(daily_stats)
         }
         _ => {
             let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-            load_daily_stats_for_overview(state, &today)?
+            ctx.load_single_day(&today)?
         }
     };
 
-    let stats = apply_ignored_apps_to_stats(stats, &ignored_apps);
-    let mut stats = apply_excluded_domains_to_stats(stats, &excluded_domains);
+    let stats = apply_ignored_apps_to_stats(stats, &ctx.ignored_apps);
+    let mut stats = apply_excluded_domains_to_stats(stats, &ctx.excluded_domains);
     stats.domain_total_count = stats.domain_usage.len();
     Ok(stats)
 }
@@ -671,13 +747,13 @@ pub(crate) fn get_overview_stats_inner(
     date_to: Option<String>,
     state: &Arc<Mutex<AppState>>,
 ) -> Result<DailyStats, AppError> {
-    let state = state.lock().map_err(|e| AppError::Unknown(e.to_string()))?;
-    let stats = load_full_overview_stats(
+    let ctx = OverviewQueryContext::snapshot(state)?;
+    let stats = load_full_overview_stats_with_context(
         &mode,
         date.as_deref(),
         date_from.as_deref(),
         date_to.as_deref(),
-        &state,
+        &ctx,
     )?;
     Ok(project_overview_homepage(stats))
 }
@@ -691,7 +767,12 @@ pub async fn get_overview_stats(
     date_to: Option<String>,
     state: State<'_, Arc<Mutex<AppState>>>,
 ) -> Result<DailyStats, AppError> {
-    get_overview_stats_inner(mode, date, date_from, date_to, state.inner())
+    let state_arc = state.inner().clone();
+    tokio::task::spawn_blocking(move || {
+        get_overview_stats_inner(mode, date, date_from, date_to, &state_arc)
+    })
+    .await
+    .map_err(|e| AppError::Unknown(format!("概览统计任务异常: {e}")))?
 }
 
 /// 获取当前概览范围内的完整域名摘要，不包含 URL 明细。
@@ -703,15 +784,19 @@ pub async fn get_overview_domains(
     date_to: Option<String>,
     state: State<'_, Arc<Mutex<AppState>>>,
 ) -> Result<OverviewDomainCollection, AppError> {
-    let state = state.lock().map_err(|e| AppError::Unknown(e.to_string()))?;
-    let stats = load_full_overview_stats(
-        &mode,
-        date.as_deref(),
-        date_from.as_deref(),
-        date_to.as_deref(),
-        &state,
-    )?;
-    Ok(build_overview_domain_collection(&stats))
+    let ctx = OverviewQueryContext::snapshot(state.inner())?;
+    tokio::task::spawn_blocking(move || {
+        let stats = load_full_overview_stats_with_context(
+            &mode,
+            date.as_deref(),
+            date_from.as_deref(),
+            date_to.as_deref(),
+            &ctx,
+        )?;
+        Ok(build_overview_domain_collection(&stats))
+    })
+    .await
+    .map_err(|e| AppError::Unknown(format!("域名摘要任务异常: {e}")))?
 }
 
 /// 获取当前概览范围内单个域名的完整 URL 与跨浏览器来源。
@@ -724,15 +809,19 @@ pub async fn get_overview_domain_detail(
     date_to: Option<String>,
     state: State<'_, Arc<Mutex<AppState>>>,
 ) -> Result<Option<OverviewDomainDetail>, AppError> {
-    let state = state.lock().map_err(|e| AppError::Unknown(e.to_string()))?;
-    let stats = load_full_overview_stats(
-        &mode,
-        date.as_deref(),
-        date_from.as_deref(),
-        date_to.as_deref(),
-        &state,
-    )?;
-    Ok(build_overview_domain_detail(&stats, &domain))
+    let ctx = OverviewQueryContext::snapshot(state.inner())?;
+    tokio::task::spawn_blocking(move || {
+        let stats = load_full_overview_stats_with_context(
+            &mode,
+            date.as_deref(),
+            date_from.as_deref(),
+            date_to.as_deref(),
+            &ctx,
+        )?;
+        Ok(build_overview_domain_detail(&stats, &domain))
+    })
+    .await
+    .map_err(|e| AppError::Unknown(format!("域名详情任务异常: {e}")))?
 }
 
 /// 获取指定日期的统计 —— 内部复用版
@@ -740,22 +829,8 @@ pub(crate) fn get_daily_stats_inner(
     date: &str,
     state: &Arc<Mutex<AppState>>,
 ) -> Result<DailyStats, AppError> {
-    let s = state.lock().map_err(|e| AppError::Unknown(e.to_string()))?;
-    let segments = s.config.effective_work_segments();
-    let (ignored_apps, excluded_domains) = collect_privacy_filters(&s);
-    let mut stats = s.database.get_daily_stats_with_segments_filtered(
-        date,
-        &segments,
-        &ignored_apps,
-        &excluded_domains,
-    )?;
-    apply_flex_overtime_correction(
-        &mut stats,
-        s.config.work_time_enabled,
-        s.config.standard_work_hours,
-    );
-    let stats = apply_website_semantic_rules_to_stats(stats, &s.config.website_semantic_rules);
-    Ok(stats)
+    let ctx = OverviewQueryContext::snapshot(state)?;
+    ctx.load_single_day(date)
 }
 
 /// 获取指定日期的统计
@@ -764,7 +839,35 @@ pub async fn get_daily_stats(
     date: String,
     state: State<'_, Arc<Mutex<AppState>>>,
 ) -> Result<DailyStats, AppError> {
-    get_daily_stats_inner(&date, state.inner())
+    let state_arc = state.inner().clone();
+    tokio::task::spawn_blocking(move || get_daily_stats_inner(&date, &state_arc))
+        .await
+        .map_err(|e| AppError::Unknown(format!("日统计任务异常: {e}")))?
+}
+
+fn resolve_overview_date_bounds(
+    mode: &str,
+    date: Option<&str>,
+    date_from: Option<&str>,
+    date_to: Option<&str>,
+) -> Result<(String, String), AppError> {
+    match mode.trim().to_lowercase().as_str() {
+        "week" => {
+            let anchor = resolve_overview_anchor_date(date)?;
+            Ok(overview_week_bounds_for_date(anchor))
+        }
+        "today" => {
+            let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+            Ok((today.clone(), today))
+        }
+        _ => {
+            let (start, end) = resolve_overview_date_span(date, date_from, date_to)?;
+            Ok((
+                start.format("%Y-%m-%d").to_string(),
+                end.format("%Y-%m-%d").to_string(),
+            ))
+        }
+    }
 }
 
 pub(crate) fn get_hourly_app_breakdown_inner(
@@ -774,37 +877,67 @@ pub(crate) fn get_hourly_app_breakdown_inner(
     mode: Option<String>,
     state: &Arc<Mutex<AppState>>,
 ) -> Result<Vec<HourlyAppBucket>, AppError> {
-    let state = state.lock().map_err(|e| AppError::Unknown(e.to_string()))?;
+    let ctx = OverviewQueryContext::snapshot(state)?;
     let normalized_mode = mode.unwrap_or_else(|| "date".to_string());
-    let (date_from, date_to) = match normalized_mode.trim().to_lowercase().as_str() {
-        "week" => {
-            let anchor = resolve_overview_anchor_date(date.as_deref())?;
-            overview_week_bounds_for_date(anchor)
-        }
-        "today" => {
-            let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-            (today.clone(), today)
-        }
-        _ => {
-            let (start, end) = resolve_overview_date_span(
-                date.as_deref(),
-                date_from.as_deref(),
-                date_to.as_deref(),
-            )?;
-            (
-                start.format("%Y-%m-%d").to_string(),
-                end.format("%Y-%m-%d").to_string(),
-            )
-        }
-    };
+    let (date_from, date_to) = resolve_overview_date_bounds(
+        &normalized_mode,
+        date.as_deref(),
+        date_from.as_deref(),
+        date_to.as_deref(),
+    )?;
 
-    let (ignored_apps, excluded_domains) = collect_privacy_filters(&state);
-    state.database.get_hourly_app_breakdown_range_filtered(
+    ctx.database.get_hourly_app_breakdown_range_filtered(
         &date_from,
         &date_to,
-        &ignored_apps,
-        &excluded_domains,
+        &ctx.ignored_apps,
+        &ctx.excluded_domains,
     )
+}
+
+/// 获取专注度与上下文切换指标 —— 内部复用版（供 Tauri 命令与 localhost API 共用）
+pub(crate) fn get_focus_metrics_inner(
+    mode: Option<String>,
+    date: Option<String>,
+    date_from: Option<String>,
+    date_to: Option<String>,
+    state: &Arc<Mutex<AppState>>,
+) -> Result<work_review_core::work_intelligence::FocusMetrics, AppError> {
+    let ctx = OverviewQueryContext::snapshot(state)?;
+    let normalized_mode = mode.unwrap_or_else(|| "today".to_string());
+    let (start_date, end_date) = resolve_overview_date_bounds(
+        &normalized_mode,
+        date.as_deref(),
+        date_from.as_deref(),
+        date_to.as_deref(),
+    )?;
+    let raw_activities =
+        ctx.database
+            .get_activities_in_range(Some(&start_date), Some(&end_date), 10_000)?;
+    let activities = super::shared::filter_activities_by_privacy(
+        raw_activities,
+        &ctx.ignored_apps,
+        &ctx.excluded_domains,
+    );
+    Ok(work_review_core::work_intelligence::compute_focus_metrics(
+        &activities,
+    ))
+}
+
+/// 获取专注度与上下文切换/打断指标
+#[tauri::command]
+pub async fn get_focus_metrics(
+    mode: Option<String>,
+    date: Option<String>,
+    date_from: Option<String>,
+    date_to: Option<String>,
+    state: State<'_, Arc<Mutex<AppState>>>,
+) -> Result<work_review_core::work_intelligence::FocusMetrics, AppError> {
+    let state_arc = state.inner().clone();
+    tokio::task::spawn_blocking(move || {
+        get_focus_metrics_inner(mode, date, date_from, date_to, &state_arc)
+    })
+    .await
+    .map_err(|e| AppError::Unknown(format!("专注度指标任务异常: {e}")))?
 }
 
 /// 获取每小时×应用的时长分布
@@ -816,21 +949,52 @@ pub async fn get_hourly_app_breakdown(
     mode: Option<String>,
     state: State<'_, Arc<Mutex<AppState>>>,
 ) -> Result<Vec<HourlyAppBucket>, AppError> {
-    get_hourly_app_breakdown_inner(date, date_from, date_to, mode, state.inner())
+    let state_arc = state.inner().clone();
+    tokio::task::spawn_blocking(move || {
+        get_hourly_app_breakdown_inner(date, date_from, date_to, mode, &state_arc)
+    })
+    .await
+    .map_err(|e| AppError::Unknown(format!("小时明细任务异常: {e}")))?
 }
 
 /// 获取历史应用列表 —— 内部复用版
 pub(crate) fn get_recent_apps_inner(state: &Arc<Mutex<AppState>>) -> Result<Vec<String>, AppError> {
-    let state = state.lock().map_err(|e| AppError::Unknown(e.to_string()))?;
-    state.database.get_recent_apps(50)
+    let database = {
+        let state = state.lock().map_err(|e| AppError::Unknown(e.to_string()))?;
+        state.database.clone()
+    };
+    database.get_recent_apps(50)
 }
 
-/// 历史应用详情 —— 内部复用版，供 localhost API 返回截图 URL
+/// 历史应用详情 —— 内部复用版，供 localhost API 返回（过滤忽略应用并脱敏敏感应用路径/截图 URL）
 pub(crate) fn get_recent_app_usage_inner(
     state: &Arc<Mutex<AppState>>,
 ) -> Result<Vec<AppUsage>, AppError> {
-    let state = state.lock().map_err(|e| AppError::Unknown(e.to_string()))?;
-    state.database.get_recent_app_usage(50)
+    let (database, ignored_apps, privacy_config) = {
+        let state = state.lock().map_err(|e| AppError::Unknown(e.to_string()))?;
+        let (ignored_apps, _) = collect_privacy_filters(&state);
+        (
+            state.database.clone(),
+            ignored_apps,
+            state.config.privacy.clone(),
+        )
+    };
+    let items = database.get_recent_app_usage(50)?;
+    Ok(items
+        .into_iter()
+        .filter(|item| {
+            !work_review_core::privacy::matches_ignored_app(&item.app_name, &ignored_apps)
+        })
+        .map(|mut item| {
+            if privacy_config.get_app_privacy_level(&item.app_name)
+                != work_review_core::config::PrivacyLevel::Full
+            {
+                item.executable_path = None;
+                item.screenshot_url = None;
+            }
+            item
+        })
+        .collect())
 }
 
 /// 获取历史应用列表（从数据库）
@@ -838,13 +1002,18 @@ pub(crate) fn get_recent_app_usage_inner(
 pub async fn get_recent_apps(
     state: State<'_, Arc<Mutex<AppState>>>,
 ) -> Result<Vec<String>, AppError> {
-    get_recent_apps_inner(state.inner())
+    let state_arc = state.inner().clone();
+    tokio::task::spawn_blocking(move || get_recent_apps_inner(&state_arc))
+        .await
+        .map_err(|e| AppError::Unknown(format!("历史应用查询任务异常: {e}")))?
 }
 
 /// 获取当前运行的应用列表
 #[tauri::command]
 pub async fn get_running_apps() -> Result<Vec<String>, AppError> {
-    get_running_apps_impl()
+    tokio::task::spawn_blocking(get_running_apps_impl)
+        .await
+        .map_err(|e| AppError::Unknown(format!("运行中应用查询任务异常: {e}")))?
 }
 
 /// macOS 实现
@@ -972,9 +1141,12 @@ fn get_running_apps_impl() -> Result<Vec<String>, AppError> {
 pub(crate) fn get_storage_stats_inner(
     state: &Arc<Mutex<AppState>>,
 ) -> Result<serde_json::Value, AppError> {
-    let s = state.lock().map_err(|e| AppError::Unknown(e.to_string()))?;
-    let stats = s
-        .storage_manager
+    let (data_dir, storage_config) = {
+        let s = state.lock().map_err(|e| AppError::Unknown(e.to_string()))?;
+        (s.data_dir.clone(), s.config.storage.clone())
+    };
+    let manager = crate::storage::StorageManager::new(&data_dir, storage_config);
+    let stats = manager
         .get_stats()
         .map_err(|e| AppError::Unknown(e.to_string()))?;
 
@@ -991,7 +1163,10 @@ pub(crate) fn get_storage_stats_inner(
 pub async fn get_storage_stats(
     state: State<'_, Arc<Mutex<AppState>>>,
 ) -> Result<serde_json::Value, AppError> {
-    get_storage_stats_inner(state.inner())
+    let state_arc = state.inner().clone();
+    tokio::task::spawn_blocking(move || get_storage_stats_inner(&state_arc))
+        .await
+        .map_err(|e| AppError::Unknown(format!("存储统计任务异常: {e}")))?
 }
 
 /// 获取指定日期的小时摘要 —— 内部复用版。
@@ -1007,17 +1182,18 @@ pub(crate) fn get_hourly_summaries_inner(
     use chrono::Timelike;
 
     let app_state = state.clone();
-
-    let saved_created_at: HashMap<i32, i64> = {
+    let database = {
         let s = app_state
             .lock()
             .map_err(|e| AppError::Unknown(e.to_string()))?;
-        s.database
-            .get_hourly_summaries(date)?
-            .iter()
-            .map(|summary| (summary.hour, summary.created_at))
-            .collect()
+        s.database.clone()
     };
+
+    let saved_created_at: HashMap<i32, i64> = database
+        .get_hourly_summaries(date)?
+        .iter()
+        .map(|summary| (summary.hour, summary.created_at))
+        .collect();
 
     let now = chrono::Local::now();
     let today = now.format("%Y-%m-%d").to_string();
@@ -1031,22 +1207,32 @@ pub(crate) fn get_hourly_summaries_inner(
         24
     };
 
-    for hour in 0..end_hour {
-        let fresh = matches!(
-            (saved_created_at.get(&hour), local_hour_end_timestamp(date, hour)),
-            (Some(&created_at), Some(end_ts)) if created_at >= end_ts
-        );
-        if !fresh {
-            crate::generate_and_save_summary(&app_state, date, hour);
+    let stale_hours: Vec<i32> = (0..end_hour)
+        .filter(|hour| {
+            !matches!(
+                (saved_created_at.get(hour), local_hour_end_timestamp(date, *hour)),
+                (Some(&created_at), Some(end_ts)) if created_at >= end_ts
+            )
+        })
+        .collect();
+
+    if stale_hours.len() > 1 {
+        // 需要补齐多个小时时用 1 次整日查询替代多次独立 SQL
+        if let Ok(mut all_buckets) = database.get_all_hourly_activities_for_date(date) {
+            for hour in stale_hours {
+                if let Some(slot) = all_buckets.get_mut(hour as usize) {
+                    let activities = std::mem::take(slot);
+                    crate::save_hourly_summary_from_activities(
+                        &app_state, &database, date, hour, activities,
+                    );
+                }
+            }
         }
+    } else if let Some(&hour) = stale_hours.first() {
+        crate::generate_and_save_summary(&app_state, date, hour);
     }
 
-    let mut summaries = {
-        let s = app_state
-            .lock()
-            .map_err(|e| AppError::Unknown(e.to_string()))?;
-        s.database.get_hourly_summaries(date)?
-    };
+    let mut summaries = database.get_hourly_summaries(date)?;
 
     // 今天的当前小时：内存计算,不写库(旧版本可能残留过半截摘要,一并以内存结果覆盖展示)
     if date == today {
@@ -1077,7 +1263,10 @@ pub async fn get_hourly_summaries(
     date: String,
     state: State<'_, Arc<Mutex<AppState>>>,
 ) -> Result<Vec<serde_json::Value>, AppError> {
-    get_hourly_summaries_inner(&date, state.inner())
+    let state_arc = state.inner().clone();
+    tokio::task::spawn_blocking(move || get_hourly_summaries_inner(&date, &state_arc))
+        .await
+        .map_err(|e| AppError::Unknown(format!("小时摘要查询任务异常: {e}")))?
 }
 
 #[derive(Debug, Default)]
@@ -1257,7 +1446,7 @@ pub async fn clear_old_activities(
     }))
 }
 
-/// 按相对 data_dir 的路径删除截图文件，返回成功删除的文件数（单文件失败只 log，不中断）
+/// 按相对 data_dir 的路径删除截图文件（连带同目录 `.thumb.jpg` 缓存），返回成功删除的原图文件数
 fn remove_screenshot_files(data_dir: &std::path::Path, paths: Vec<String>) -> usize {
     let mut removed = 0usize;
     for p in paths {
@@ -1270,6 +1459,10 @@ fn remove_screenshot_files(data_dir: &std::path::Path, paths: Vec<String>) -> us
                 Ok(_) => removed += 1,
                 Err(e) => log::warn!("删除截图文件失败 {}: {e}", path.display()),
             }
+        }
+        let thumb_path = crate::screenshot::ScreenshotService::thumbnail_cache_path(&path);
+        if thumb_path != path && thumb_path.exists() {
+            let _ = std::fs::remove_file(&thumb_path);
         }
     }
     removed
@@ -1614,6 +1807,7 @@ mod tests {
             work_time_duration: 100,
             overtime_duration: 0,
             hourly_activity_distribution: vec![hourly(9, 60), hourly(10, 60)],
+            project_usage: vec![],
         };
         let day_two = DailyStats {
             total_duration: 180,
@@ -1706,6 +1900,7 @@ mod tests {
             work_time_duration: 160,
             overtime_duration: 0,
             hourly_activity_distribution: vec![hourly(9, 30), hourly(10, 90), hourly(11, 60)],
+            project_usage: vec![],
         };
 
         let merged = sum_daily_stats(vec![day_one, day_two]);
@@ -1867,7 +2062,7 @@ mod tests {
 
 /// 获取区间内逐日投入合计（概览「按天投入」卡）。
 /// 区间按自然日展开，最多 31 天，超出部分从起点截断；
-/// 逐日复用 load_daily_stats_for_overview（与概览统计同口径，含工作时段与隐私过滤），
+/// 使用一次范围查询在 Rust 中按日聚合（与概览统计同口径，含工作时段与隐私过滤），
 /// 返回 [{ date, total_duration, work_time_duration }]。
 #[tauri::command]
 pub async fn get_range_daily_totals(
@@ -1875,24 +2070,24 @@ pub async fn get_range_daily_totals(
     date_to: String,
     state: State<'_, Arc<Mutex<AppState>>>,
 ) -> Result<Vec<serde_json::Value>, AppError> {
-    let state = state.lock().map_err(|e| AppError::Unknown(e.to_string()))?;
-    let (start, end) =
-        resolve_overview_date_span(None, Some(date_from.as_str()), Some(date_to.as_str()))?;
-
-    let mut totals = Vec::new();
-    let mut current = start;
-    while current <= end && totals.len() < 31 {
-        let current_date = current.format("%Y-%m-%d").to_string();
-        let stats = load_daily_stats_for_overview(&state, &current_date)?;
-        totals.push(serde_json::json!({
-            "date": current_date,
-            "total_duration": stats.total_duration,
-            "work_time_duration": stats.work_time_duration,
-        }));
-        current = current
-            .succ_opt()
-            .ok_or_else(|| AppError::Config("计算按天投入日期范围失败".to_string()))?;
-    }
-
-    Ok(totals)
+    let ctx = OverviewQueryContext::snapshot(state.inner())?;
+    tokio::task::spawn_blocking(move || {
+        let (start, end) =
+            resolve_overview_date_span(None, Some(date_from.as_str()), Some(date_to.as_str()))?;
+        let max_end = start + chrono::Duration::days(30);
+        let bounded_end = end.min(max_end);
+        let per_day = ctx.load_date_range(start, bounded_end)?;
+        Ok(per_day
+            .into_iter()
+            .map(|(date, stats)| {
+                serde_json::json!({
+                    "date": date,
+                    "total_duration": stats.total_duration,
+                    "work_time_duration": stats.work_time_duration,
+                })
+            })
+            .collect())
+    })
+    .await
+    .map_err(|e| AppError::Unknown(format!("按天投入查询任务异常: {e}")))?
 }

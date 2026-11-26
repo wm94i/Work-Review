@@ -1819,7 +1819,16 @@ pub(crate) async fn generate_text_answer_with_model(
             } else {
                 format!("{endpoint}/chat/completions")
             };
-            let mut request = client.post(&url).json(&serde_json::json!({
+            let reasoning_params =
+                work_review_core::generation_params::uses_openai_reasoning_chat_params(
+                    model_config.provider,
+                    &model_config.model,
+                );
+            let token_limit_field = work_review_core::generation_params::openai_max_tokens_field(
+                model_config.provider,
+                &model_config.model,
+            );
+            let mut body = serde_json::json!({
                 "model": model_config.model,
                 "messages": [
                     {
@@ -1831,9 +1840,15 @@ pub(crate) async fn generate_text_answer_with_model(
                         "content": prompt
                     }
                 ],
-                "max_tokens": 1600,
-                "temperature": 0.2
-            }));
+            });
+            if reasoning_params {
+                body[token_limit_field] = serde_json::json!(4096);
+                body["reasoning_effort"] = serde_json::json!("low");
+            } else {
+                body[token_limit_field] = serde_json::json!(1600);
+                body["temperature"] = serde_json::json!(0.2);
+            }
+            let mut request = client.post(&url).json(&body);
 
             if let Some(api_key) = &model_config.api_key {
                 if !api_key.is_empty() {
@@ -1989,12 +2004,27 @@ fn build_confirm_bridge() -> crate::agent::ConfirmBridge {
 /// 注入 system prompt，并作为 get_current_context 工具的数据源。
 fn build_realtime_context_text(state_arc: &Arc<Mutex<AppState>>) -> String {
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-    let active_window = crate::monitor::get_active_window_fast().ok();
+    let mut active_window = crate::monitor::get_active_window_fast().ok();
+    // 浏览器窗口在 fast 路径不取 URL；优先补齐 URL 再走隐私规则，避免排除域名失效。
+    if let Some(w) = active_window.as_mut() {
+        if w.browser_url.is_none() && work_review_core::categorize::is_browser_app(&w.app_name) {
+            let cached_url = state_arc.lock().ok().and_then(|s| {
+                s.cached_active_window.as_ref().and_then(|(_, cached)| {
+                    (cached.app_name == w.app_name && cached.window_title == w.window_title)
+                        .then(|| cached.browser_url.clone())
+                        .flatten()
+                })
+            });
+            w.browser_url = cached_url.or_else(|| {
+                crate::monitor::resolve_browser_url_for_window(&w.app_name, &w.window_title)
+            });
+        }
+    }
 
     let mut parts: Vec<String> = Vec::new();
 
     if let Ok(s) = state_arc.lock() {
-        // 前台窗口（尊重隐私规则：Skip 不注入，Anonymize 脱敏标题并去 URL）
+        // 前台窗口（尊重隐私规则：Skip 不注入，Anonymize 脱敏标题并去 URL，Record 过滤敏感文本）
         if let Some(w) = active_window.as_ref() {
             match s.privacy_filter.check_privacy_full(
                 &w.app_name,
@@ -2006,7 +2036,8 @@ fn build_realtime_context_text(state_arc: &Arc<Mutex<AppState>>) -> String {
                     parts.push(format!("当前前台应用: {} — [内容已脱敏]", w.app_name));
                 }
                 work_review_core::privacy::PrivacyAction::Record => {
-                    let title: String = w.window_title.chars().take(80).collect();
+                    let filtered = s.privacy_filter.filter_text(&w.window_title);
+                    let title: String = filtered.chars().take(80).collect();
                     parts.push(format!("当前前台应用: {} — {}", w.app_name, title));
                 }
             }
@@ -2080,25 +2111,82 @@ async fn execute_assistant_action(
     match action {
         AssistantAction::CreateTodo { text } => {
             let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-            let next_config = {
-                let s = state_arc.lock().map_err(|e| e.to_string())?;
-                let mut next = s.config.clone();
-                next.avatar_followups
-                    .push(work_review_core::config::AvatarFollowupItem {
-                        id: uuid::Uuid::new_v4().to_string(),
-                        title: text.clone(),
-                        date: today,
-                        source_app: "工作助手".to_string(),
-                        source_title: "助手对话".to_string(),
-                        project_key: String::new(),
-                        created_at: chrono::Utc::now().timestamp(),
-                        status: "open".to_string(),
-                    });
-                next
-            };
-            super::persist_app_config(next_config, app, &state_arc)
-                .map_err(|e| format!("保存待办失败: {e}"))?;
+            let text_clone = text.clone();
+            super::update_app_config_with_source(
+                app,
+                &state_arc,
+                super::ConfigWriteSource::Local,
+                move |previous| {
+                    let mut config = previous.clone();
+                    config
+                        .avatar_followups
+                        .push(work_review_core::config::AvatarFollowupItem {
+                            id: uuid::Uuid::new_v4().to_string(),
+                            title: text_clone.clone(),
+                            date: today.clone(),
+                            source_app: "工作助手".to_string(),
+                            source_title: "助手对话".to_string(),
+                            project_key: String::new(),
+                            created_at: chrono::Utc::now().timestamp(),
+                            status: "open".to_string(),
+                        });
+                    Ok(config)
+                },
+            )
+            .map_err(|e| format!("保存待办失败: {e}"))?;
             Ok(format!("已创建待办：{text}"))
+        }
+
+        AssistantAction::CompleteTodo { id } => {
+            let target_id = id.trim().to_string();
+            let mut matched_title = String::new();
+            super::update_app_config_with_source(
+                app,
+                &state_arc,
+                super::ConfigWriteSource::Local,
+                |previous| {
+                    let mut config = previous.clone();
+                    let Some(item) = config
+                        .avatar_followups
+                        .iter_mut()
+                        .find(|item| item.id == target_id)
+                    else {
+                        return Err(AppError::Config(format!("未找到 ID 为 {target_id} 的待办")));
+                    };
+                    item.status = "done".to_string();
+                    matched_title = item.title.clone();
+                    Ok(config)
+                },
+            )
+            .map_err(|e| format!("完成待办失败: {e}"))?;
+            Ok(format!("已将待办标记为完成：{matched_title}"))
+        }
+
+        AssistantAction::UpdateTodo { id, text } => {
+            let target_id = id.trim().to_string();
+            let next_text = text.trim().to_string();
+            if next_text.is_empty() {
+                return Err("待办内容不能为空".to_string());
+            }
+            super::update_app_config_with_source(
+                app,
+                &state_arc,
+                super::ConfigWriteSource::Local,
+                |previous| {
+                    let mut config = previous.clone();
+                    let Some(item) = config
+                        .avatar_followups
+                        .iter_mut()
+                        .find(|item| item.id == target_id)
+                    else {
+                        return Err(AppError::Config(format!("未找到 ID 为 {target_id} 的待办")));
+                    };
+                    item.title = next_text.clone();
+                    Ok(config)
+                },
+            )
+            .map_err(|e| format!("更新待办失败: {e}"))?;
+            Ok(format!("已更新待办：{next_text}"))
         }
 
         AssistantAction::SetAppCategory { app_name, category } => {
@@ -2451,8 +2539,20 @@ pub async fn chat_work_assistant(
     };
     let runtime = if work_review_mode {
         let context_state = state_arc.clone();
+        let (privacy_filter, projects) = {
+            let guard = state_arc
+                .lock()
+                .map_err(|e| AppError::Unknown(format!("读取隐私规则失败: {e}")))?;
+            (
+                Some(std::sync::Arc::new(
+                    work_review_core::privacy::PrivacyFilter::from_config(&guard.config.privacy),
+                )),
+                guard.config.projects.clone(),
+            )
+        };
         crate::agent::AssistantRuntime {
             avatar_followups,
+            projects,
             actions: Some(build_action_bridge(
                 app.clone(),
                 state_arc.clone(),
@@ -2465,6 +2565,7 @@ pub async fn chat_work_assistant(
             })),
             semantic_search,
             cancel: cancel_rx,
+            privacy_filter,
         }
     } else {
         crate::agent::AssistantRuntime {

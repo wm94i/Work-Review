@@ -20,9 +20,11 @@ test('语义记忆不再有独立页面与侧栏入口（查询统一走助手�
 test('索引管理收进设置页语义记忆区块', () => {
   const settings = read('./routes/settings/components/SettingsAI.svelte');
 
-  assert.match(settings, /invoke<SemanticIndexProgress>\('index_semantic_memory'\)/);
+  assert.match(settings, /invoke<SemanticIndexProgress>\('index_semantic_memory'/);
   assert.match(settings, /invoke<SemanticMemoryState>\('semantic_memory_status'\)/);
   assert.match(settings, /memory_semantic_enabled/);
+  assert.match(settings, /semantic_auto_index/);
+  assert.match(settings, /forceRebuild/);
   // 组件销毁后索引循环必须停止
   assert.match(settings, /semanticDestroyed/);
   // 引导用户"直接问助手"
@@ -43,14 +45,19 @@ test('语义索引使用稳定指纹、持久化重建状态和 fail-closed 查�
   assert.match(semantic, /SemanticMemoryIndexState/);
   assert.match(semantic, /get_semantic_memory_state/);
   assert.match(semantic, /rebuild_required/);
+  const vectorHelper = semantic.slice(
+    semantic.indexOf('pub(crate) fn is_vector_query_allowed'),
+    semantic.indexOf('fn build_token')
+  );
+  assert.match(vectorHelper, /!index_state\.rebuild_required/);
+  assert.match(vectorHelper, /embedded_chunks\s*>\s*0/);
+  assert.match(vectorHelper, /embedding_fingerprint\s*\.starts_with\(config_prefix\)/);
+  assert.match(vectorHelper, /privacy_fingerprint\s*==\s*current_privacy_fingerprint/);
   const vectorGate = semantic.slice(
     semantic.indexOf('let vector_query_allowed'),
     semantic.indexOf('let semantic_hits')
   );
-  assert.match(vectorGate, /index_state\.status\s*==\s*"ready"/);
-  assert.match(vectorGate, /!index_state\.rebuild_required/);
-  assert.match(vectorGate, /embedding_fingerprint\s*\.starts_with\(&config_prefix\)/);
-  assert.match(vectorGate, /privacy_fingerprint\s*==\s*current_privacy_fingerprint/);
+  assert.match(vectorGate, /is_vector_query_allowed\(/);
 });
 
 test('语义索引和召回都只允许 PrivacyAction::Record', () => {

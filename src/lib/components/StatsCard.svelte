@@ -36,8 +36,8 @@
     ? `flex h-10 w-10 items-center justify-center rounded-lg ${iconBgs[color]} ${iconColors[color]} shrink-0`
     : `flex h-11 w-11 items-center justify-center rounded-lg border border-white/80 shadow-sm dark:shadow-none dark:border-[#30363d]/80 ${iconBgs[color]} ${iconColors[color]} shrink-0`;
   $: valueClass = embedded
-    ? 'mt-4 whitespace-nowrap text-[1.9rem] font-semibold leading-none text-slate-900 dark:text-[#e6edf3]'
-    : 'mt-6 whitespace-nowrap text-[2.15rem] font-semibold leading-none text-slate-900 dark:text-[#e6edf3]';
+    ? 'mt-4 whitespace-nowrap text-[1.9rem] font-semibold leading-none tabular-nums text-slate-900 dark:text-[#e6edf3]'
+    : 'mt-6 whitespace-nowrap text-[2.15rem] font-semibold leading-none tabular-nums text-slate-900 dark:text-[#e6edf3]';
   $: interactiveClass = embedded
     ? 'transition-all duration-200 hover:bg-slate-100/90 hover:-translate-y-0.5 dark:hover:bg-slate-900/50'
     : 'transition-all duration-200 hover:shadow-md dark:shadow-[0_4px_12px_rgba(0,0,0,0.4)] hover:-translate-y-0.5 cursor-pointer group';
@@ -51,10 +51,10 @@
   >
     <div class="flex h-full items-center justify-between gap-4">
       <div class="min-w-0 flex-1">
-        <span class="text-[13px] font-medium text-slate-500 dark:text-[#7d8590] leading-none">{title}</span>
+        <span class="text-[13px] font-medium text-slate-500 dark:text-[#9c9ca6] leading-none">{title}</span>
         <p class={valueClass}>{value}</p>
         {#if subtitle}
-          <p class="mt-1.5 text-xs font-medium leading-none text-slate-500 dark:text-[#7d8590]">{subtitle}</p>
+          <p class="mt-1.5 text-xs font-medium leading-none tabular-nums text-slate-500 dark:text-[#9c9ca6]">{subtitle}</p>
         {/if}
       </div>
       <div class={iconClass}>
@@ -87,10 +87,10 @@
   <div class={cardClass} data-kpi-card={dataKpiCard ? '' : undefined}>
     <div class="flex h-full items-center justify-between gap-4">
       <div class="min-w-0 flex-1">
-        <span class="text-[13px] font-medium text-slate-500 dark:text-[#7d8590] leading-none">{title}</span>
+        <span class="text-[13px] font-medium text-slate-500 dark:text-[#9c9ca6] leading-none">{title}</span>
         <p class={valueClass}>{value}</p>
         {#if subtitle}
-          <p class="mt-1.5 text-xs font-medium leading-none text-slate-500 dark:text-[#7d8590]">{subtitle}</p>
+          <p class="mt-1.5 text-xs font-medium leading-none tabular-nums text-slate-500 dark:text-[#9c9ca6]">{subtitle}</p>
         {/if}
       </div>
       <div class={iconClass}>

@@ -864,24 +864,65 @@ pub async fn chat_with_tools_streaming(
 }
 
 /// 行缓冲：把任意切分的字节块拼成完整行，残行留在缓冲区等下一个 chunk。
+///
+/// 按**字节**缓冲、遇到 `\n` 才解码：网络分块可能把一个多字节 UTF-8 字符（中文 3 字节）
+/// 切在两个 chunk 之间，逐块 `from_utf8_lossy` 会把它变成 "�"，还可能破坏 JSON 行。
+/// 流式单行缓冲上限（4 MiB），防止异常服务端持续输出不含换行符的数据导致内存无限增长。
+const MAX_STREAM_LINE_BYTES: usize = 4 * 1024 * 1024;
+
 struct LineBuffer {
-    buf: String,
+    buf: Vec<u8>,
+    seen_first_line: bool,
 }
 
 impl LineBuffer {
     fn new() -> Self {
-        Self { buf: String::new() }
+        Self {
+            buf: Vec::new(),
+            seen_first_line: false,
+        }
+    }
+
+    fn take_decoded_line(&mut self) -> String {
+        let raw = std::mem::take(&mut self.buf);
+        let text = String::from_utf8_lossy(&raw);
+        let mut line = text.trim_end_matches(['\n', '\r']);
+        if !self.seen_first_line {
+            self.seen_first_line = true;
+            line = line.strip_prefix('\u{FEFF}').unwrap_or(line);
+        }
+        line.to_string()
     }
 
     /// 喂入一个 chunk，返回其中所有完整行（去掉行尾 \r\n）。
-    fn push(&mut self, chunk: &str) -> Vec<String> {
-        self.buf.push_str(chunk);
+    fn push(&mut self, chunk: &[u8]) -> Result<Vec<String>, AppError> {
         let mut lines = Vec::new();
-        while let Some(pos) = self.buf.find('\n') {
-            let line: String = self.buf.drain(..=pos).collect();
-            lines.push(line.trim_end_matches(['\n', '\r']).to_string());
+        let mut start = 0usize;
+        while let Some(rel) = chunk[start..].iter().position(|byte| *byte == b'\n') {
+            let end = start + rel;
+            if self.buf.len().saturating_add(end - start) > MAX_STREAM_LINE_BYTES {
+                self.buf.clear();
+                return Err(AppError::Analysis("流式响应单行超过大小限制".to_string()));
+            }
+            self.buf.extend_from_slice(&chunk[start..end]);
+            lines.push(self.take_decoded_line());
+            start = end + 1;
         }
-        lines
+        let remainder = &chunk[start..];
+        if self.buf.len().saturating_add(remainder.len()) > MAX_STREAM_LINE_BYTES {
+            self.buf.clear();
+            return Err(AppError::Analysis("流式响应单行超过大小限制".to_string()));
+        }
+        self.buf.extend_from_slice(remainder);
+        Ok(lines)
+    }
+
+    /// 流正常 EOF 时冲刷最后一条未以 `\n` 结尾的残行。
+    fn finish(&mut self) -> Option<String> {
+        if self.buf.is_empty() {
+            return None;
+        }
+        Some(self.take_decoded_line())
     }
 }
 
@@ -915,10 +956,14 @@ async fn drive_stream(
             .map_err(|e| AppError::Analysis(format!("流式读取失败: {e}")))?;
 
         let Some(bytes) = chunk else {
+            if let Some(line) = line_buf.finish() {
+                if !line.is_empty() {
+                    let _ = on_line(&line);
+                }
+            }
             return Ok(()); // 流正常结束
         };
-        let text = String::from_utf8_lossy(&bytes);
-        for line in line_buf.push(&text) {
+        for line in line_buf.push(&bytes)? {
             if line.is_empty() {
                 continue;
             }
@@ -1876,12 +1921,42 @@ mod tests {
     fn 行缓冲应正确处理跨chunk切分的行() {
         let mut buf = LineBuffer::new();
         // 一行被切成两个 chunk
-        assert!(buf.push("data: {\"a\"").is_empty());
-        let lines = buf.push(":1}\ndata: [DONE]\n");
+        assert!(buf.push(b"data: {\"a\"").unwrap().is_empty());
+        let lines = buf.push(b":1}\ndata: [DONE]\n").unwrap();
         assert_eq!(lines, vec!["data: {\"a\":1}", "data: [DONE]"]);
         // \r\n 行尾应被剥掉
-        let lines = buf.push("hello\r\n");
+        let lines = buf.push(b"hello\r\n").unwrap();
         assert_eq!(lines, vec!["hello"]);
+    }
+
+    #[test]
+    fn 行缓冲不应破坏跨chunk切分的多字节字符() {
+        let mut buf = LineBuffer::new();
+        let line = "data: {\"content\":\"你好世界\"}\n".as_bytes();
+        // 在"你"的 3 个字节中间切开
+        let split = line.iter().position(|byte| *byte == 0xE4).unwrap() + 1;
+        assert!(buf.push(&line[..split]).unwrap().is_empty());
+        let lines = buf.push(&line[split..]).unwrap();
+        assert_eq!(lines, vec!["data: {\"content\":\"你好世界\"}"]);
+        assert!(!lines[0].contains('\u{FFFD}'));
+    }
+
+    #[test]
+    fn 行缓冲应剥离首行bom并冲刷无换行尾行且拦截超长行() {
+        let mut buf = LineBuffer::new();
+        let lines = buf
+            .push("\u{FEFF}data: {\"content\":\"首行\"}\ndata: {\"content\":\"尾行\"}".as_bytes())
+            .unwrap();
+        assert_eq!(lines, vec!["data: {\"content\":\"首行\"}"]);
+        assert_eq!(
+            buf.finish().as_deref(),
+            Some("data: {\"content\":\"尾行\"}")
+        );
+        assert!(buf.finish().is_none());
+
+        let mut limited = LineBuffer::new();
+        let oversized = vec![b'a'; MAX_STREAM_LINE_BYTES + 1];
+        assert!(limited.push(&oversized).is_err());
     }
 
     #[test]

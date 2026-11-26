@@ -12,7 +12,7 @@ async function readCommandsSource() {
 
 test('网站语义规则命中后应同步基础分类，保障工休统计可用', async () => {
   const commandsSource = await readCommandsSource();
-  const mainSource = await readFile(new URL('../src-tauri/src/main.rs', import.meta.url), 'utf8');
+  const recordingSource = await readFile(new URL('../src-tauri/src/recording/mod.rs', import.meta.url), 'utf8');
   const coreSource = await readFile(
     new URL('../crates/core/src/categorize.rs', import.meta.url),
     'utf8',
@@ -25,7 +25,7 @@ test('网站语义规则命中后应同步基础分类，保障工休统计可�
   );
   assert.match(commandsSource, /update_activity_classification\([\s\S]*next_base_category/);
   assert.match(
-    mainSource,
+    recordingSource,
     /classification\.base_category\s*=\s*work_review_core::categorize::semantic_category_to_base_category/,
   );
   assert.match(coreSource, /pub fn semantic_category_to_base_category/);
@@ -33,7 +33,7 @@ test('网站语义规则命中后应同步基础分类，保障工休统计可�
 });
 
 test('桌面采集侧迁移到核心分类模块后应继续使用兼容口径', async () => {
-  const mainSource = await readFile(new URL('../src-tauri/src/main.rs', import.meta.url), 'utf8');
+  const recordingSource = await readFile(new URL('../src-tauri/src/recording/mod.rs', import.meta.url), 'utf8');
   const avatarSource = await readFile(
     new URL('../src-tauri/src/avatar_engine.rs', import.meta.url),
     'utf8',
@@ -44,7 +44,7 @@ test('桌面采集侧迁移到核心分类模块后应继续使用兼容口径',
   );
 
   assert.match(
-    mainSource,
+    recordingSource,
     /work_review_core::categorize::categorize_collected_app_with_rules/,
   );
   assert.match(

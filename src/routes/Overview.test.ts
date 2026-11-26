@@ -219,9 +219,13 @@ test('概览改版应提供可选择的分类构成条、分类摘要与按天�
 });
 
 test('按天投入命令应注册为 get_range_daily_totals', async () => {
-  const source = await readFile(new URL('../../src-tauri/src/main.rs', import.meta.url), 'utf8');
+  const [mainSource, handlerSource] = await Promise.all([
+    readFile(new URL('../../src-tauri/src/main.rs', import.meta.url), 'utf8'),
+    readFile(new URL('../../src-tauri/src/commands/mod.rs', import.meta.url), 'utf8'),
+  ]);
 
-  assert.match(source, /commands::get_range_daily_totals/);
+  assert.match(mainSource, /\.invoke_handler\(commands::handler\(\)\)/);
+  assert.match(handlerSource, /\bget_range_daily_totals\b/);
 });
 
 test('概览页面在不可见时应暂停时钟与定时刷新', async () => {
@@ -385,7 +389,11 @@ test('概览页未识别页面域名标题应走 i18n 文案而不是直接渲�
 });
 
 test('概览统计命令应注册为 get_overview_stats', async () => {
-  const source = await readFile(new URL('../../src-tauri/src/main.rs', import.meta.url), 'utf8');
+  const [mainSource, handlerSource] = await Promise.all([
+    readFile(new URL('../../src-tauri/src/main.rs', import.meta.url), 'utf8'),
+    readFile(new URL('../../src-tauri/src/commands/mod.rs', import.meta.url), 'utf8'),
+  ]);
 
-  assert.match(source, /commands::get_overview_stats/);
+  assert.match(mainSource, /\.invoke_handler\(commands::handler\(\)\)/);
+  assert.match(handlerSource, /\bget_overview_stats\b/);
 });

@@ -423,6 +423,7 @@ test('设置页顶部权限区仅在 macOS 显示，并提供 mac 权限跳转',
   const commandsSource = readCommandsSource();
   const screenshotSource = readFileSync(new URL('../../../../src-tauri/src/screenshot.rs', import.meta.url), 'utf8');
   const mainSource = readFileSync(new URL('../../../../src-tauri/src/main.rs', import.meta.url), 'utf8');
+  const handlerSource = readFileSync(new URL('../../../../src-tauri/src/commands/mod.rs', import.meta.url), 'utf8');
 
   assert.match(settingsSource, /\{#if settingsRuntimePlatform === 'macos'\}/);
   assert.match(settingsSource, /<SettingsSystem \/>/);
@@ -452,7 +453,8 @@ test('设置页顶部权限区仅在 macOS 显示，并提供 mac 权限跳转',
   assert.match(commandsSource, /Privacy_ScreenCapture/);
   assert.match(commandsSource, /Privacy_Accessibility/);
   assert.match(commandsSource, /Privacy_ListenEvent/);
-  assert.match(mainSource, /commands::open_permission_settings/);
+  assert.match(mainSource, /\.invoke_handler\(commands::handler\(\)\)/);
+  assert.match(handlerSource, /\bopen_permission_settings\b/);
   assert.match(screenshotSource, /CGPreflightListenEventAccess/);
   assert.match(screenshotSource, /CGRequestListenEventAccess/);
   assert.match(i18nSource, /permissionsTitle:\s*'权限设置'/);
@@ -469,11 +471,13 @@ test('关闭桌面助手前应主动持久化当前位置，避免重新显示�
   const appearanceSource = readFileSync(new URL('../../../routes/settings/components/SettingsAppearance.svelte', import.meta.url), 'utf8');
   const commandsSource = readCommandsSource();
   const mainSource = readFileSync(new URL('../../../../src-tauri/src/main.rs', import.meta.url), 'utf8');
+  const handlerSource = readFileSync(new URL('../../../../src-tauri/src/commands/mod.rs', import.meta.url), 'utf8');
 
   assert.match(appearanceSource, /invoke(?:<[^>]+>)?\('persist_avatar_position'\)/);
   assert.match(commandsSource, /pub async fn persist_avatar_position/);
   assert.match(commandsSource, /AVATAR_WINDOW_LABEL/);
-  assert.match(mainSource, /commands::persist_avatar_position/);
+  assert.match(mainSource, /\.invoke_handler\(commands::handler\(\)\)/);
+  assert.match(handlerSource, /\bpersist_avatar_position\b/);
 });
 
 test('外观设置页应提供三种桌宠互动风格切换，并持久化 avatar_persona', () => {
@@ -501,6 +505,8 @@ test('桌宠窗口应监听接上次继续事件，并提供继续任务、开�
   const cardSource = readFileSync(new URL('./AvatarFollowupCard.svelte', import.meta.url), 'utf8');
   const commandSource = readCommandsSource();
   const mainSource = readFileSync(new URL('../../../../src-tauri/src/main.rs', import.meta.url), 'utf8');
+  const handlerSource = readFileSync(new URL('../../../../src-tauri/src/commands/mod.rs', import.meta.url), 'utf8');
+  const avatarTaskSource = readFileSync(new URL('../../../../src-tauri/src/tasks/avatar.rs', import.meta.url), 'utf8');
   const followupSource = readFileSync(new URL('../../../../src-tauri/src/avatar_followup.rs', import.meta.url), 'utf8');
   const i18nSource = readFileSync(new URL('../../../lib/i18n/locales/zh-CN.ts', import.meta.url), 'utf8');
   const appSource = readFileSync(new URL('../../../App.svelte', import.meta.url), 'utf8');
@@ -539,8 +545,9 @@ test('桌宠窗口应监听接上次继续事件，并提供继续任务、开�
   assert.match(followupSource, /AvatarFollowupAction::Focus/);
   assert.match(followupSource, /FOCUS_COOLDOWN_MS/);
   assert.match(mainSource, /mod avatar_followup/);
-  assert.match(mainSource, /commands::handle_avatar_followup_action/);
-  assert.match(mainSource, /find_followup_suggestion/);
+  assert.match(mainSource, /\.invoke_handler\(commands::handler\(\)\)/);
+  assert.match(handlerSource, /\bhandle_avatar_followup_action\b/);
+  assert.match(avatarTaskSource, /find_followup_suggestion/);
   assert.match(appSource, /avatar-open-timeline/);
   assert.match(appSource, /push\('\/timeline'\)/);
   assert.match(appSource, /timeline-focus-date/);
@@ -854,6 +861,7 @@ test('桌宠窗口应在继续提醒卡片出现/消失时动态扩展原生窗�
   const windowSource = readFileSync(new URL('../../../routes/avatar/AvatarWindow.svelte', import.meta.url), 'utf8');
   const commandsSource = readCommandsSource();
   const mainSource = readFileSync(new URL('../../../../src-tauri/src/main.rs', import.meta.url), 'utf8');
+  const handlerSource = readFileSync(new URL('../../../../src-tauri/src/commands/mod.rs', import.meta.url), 'utf8');
   const engineSource = readFileSync(new URL('../../../../src-tauri/src/avatar_engine.rs', import.meta.url), 'utf8');
 
   assert.match(windowSource, /set_avatar_window_expanded/);
@@ -863,7 +871,8 @@ test('桌宠窗口应在继续提醒卡片出现/消失时动态扩展原生窗�
   assert.match(windowSource, /avatarExpanded = previous/);
   assert.match(commandsSource, /pub async fn set_avatar_window_expanded/);
   assert.match(commandsSource, /apply_avatar_window_expansion/);
-  assert.match(mainSource, /commands::set_avatar_window_expanded/);
+  assert.match(mainSource, /\.invoke_handler\(commands::handler\(\)\)/);
+  assert.match(handlerSource, /\bset_avatar_window_expanded\b/);
   assert.match(engineSource, /pub fn apply_avatar_window_expansion/);
   assert.match(engineSource, /clamp_window_within_current_monitor/);
   assert.match(engineSource, /AVATAR_WINDOW_EXPANDED_BASE_WIDTH/);
@@ -905,6 +914,7 @@ test('隐藏桌宠时仅实际通知区域应阻止鼠标穿透，透明区域�
   const followupSource = readFileSync(new URL('./AvatarFollowupCard.svelte', import.meta.url), 'utf8');
   const commandSource = readFileSync(new URL('../../../../src-tauri/src/commands/avatar.rs', import.meta.url), 'utf8');
   const mainSource = readFileSync(new URL('../../../../src-tauri/src/main.rs', import.meta.url), 'utf8');
+  const handlerSource = readFileSync(new URL('../../../../src-tauri/src/commands/mod.rs', import.meta.url), 'utf8');
 
   assert.match(popoverSource, /data-avatar-hit-region=\{bubble\?\.persistent \? 'bubble' : undefined\}/);
   assert.match(popoverSource, /class:pointer-events-auto=\{bubble\?\.persistent\}/);
@@ -922,7 +932,8 @@ test('隐藏桌宠时仅实际通知区域应阻止鼠标穿透，透明区域�
   assert.match(windowSource, /state\.avatarBodyHidden[\s\S]*startAvatarDrag\(e\)/);
   assert.match(windowSource, /class="h-full w-\[82%\] pointer-events-auto"/);
   assert.match(commandSource, /pub async fn set_avatar_interactive_regions/);
-  assert.match(mainSource, /commands::set_avatar_interactive_regions/);
+  assert.match(mainSource, /\.invoke_handler\(commands::handler\(\)\)/);
+  assert.match(handlerSource, /\bset_avatar_interactive_regions\b/);
 });
 
 test('桌宠气泡面板在非紧凑文案下应允许更长的英文文字换行，避免整段被裁断', () => {

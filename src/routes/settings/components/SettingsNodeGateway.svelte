@@ -39,6 +39,7 @@
     feishu_app_id: string;
     feishu_app_secret: string;
     feishu_verification_token: string;
+    feishu_encrypt_key: string;
     wecom_bot_enabled: boolean;
     wecom_bot_id: string;
     wecom_bot_secret: string;
@@ -47,6 +48,7 @@
     wecom_encoding_aes_key: string;
     dingtalk_bot_enabled: boolean;
     dingtalk_app_secret: string;
+    bot_natural_language_enabled?: boolean;
   }
 
   interface NodeGatewayStatus {
@@ -88,7 +90,7 @@
   export let dataDir: string;
 
   const dispatch = createEventDispatcher<{
-    change: NodeGatewayConfig;
+    change: NodeGatewayConfig | { autosaved: true };
     toast: ToastDetail;
   }>();
   $: currentLocale = $locale;
@@ -129,6 +131,9 @@
     ) {
       config.localhost_api_host = null;
     }
+    if (typeof config.bot_natural_language_enabled !== 'boolean') {
+      config.bot_natural_language_enabled = false;
+    }
   }
 
   function stopTelegramStatusPolling() {
@@ -138,14 +143,26 @@
     }
   }
 
+  let tgStatusRefreshing = false;
+  let lastPolledTelegramChatIds = '';
+
   async function refreshTelegramBotStatus() {
+    if (tgStatusRefreshing) return;
+    tgStatusRefreshing = true;
     try {
       tgBotStatus = await invoke<TelegramBotStatus>('get_telegram_bot_status');
       if (tgBotStatus?.allowedChatIds) {
-        config.telegram_bot_allowed_chat_ids = tgBotStatus.allowedChatIds;
+        const nextSnapshot = JSON.stringify(tgBotStatus.allowedChatIds);
+        // 仅当后端实际变化时同步，避免轮询覆盖表单中尚未保存的编辑内容
+        if (nextSnapshot !== lastPolledTelegramChatIds) {
+          lastPolledTelegramChatIds = nextSnapshot;
+          config.telegram_bot_allowed_chat_ids = tgBotStatus.allowedChatIds;
+        }
       }
     } catch (e) {
       /* ignore */
+    } finally {
+      tgStatusRefreshing = false;
     }
   }
 
@@ -223,7 +240,7 @@
     normalizeConfig();
     try {
       await invoke<void>('save_config', { config });
-      dispatch('change', config);
+      dispatch('change', { autosaved: true });
       // Reload status after save
       const [node, local, tg, wecom] = await Promise.all([
         invoke<NodeGatewayStatus>('get_node_gateway_status'),
@@ -307,6 +324,35 @@
       <!-- 分组 2：消息通知（默认收起） -->
       <CollapsibleSection title={t('nodeGatewayPage.groupNotifications')} storageKey="settings.node.bots">
         <div class="space-y-3">
+          <!-- Bot 自然语言只读问答开关（默认关闭，跨全平台生效） -->
+          <div class="rounded-lg border border-slate-200 px-3.5 py-3 dark:border-[#30363d]">
+            <label class="flex items-start justify-between gap-3 cursor-pointer">
+              <div class="min-w-0">
+                <span class="settings-text text-sm font-medium inline-flex items-center gap-2">
+                  {t('nodeGatewayPage.botNaturalLanguageTitle')}
+                  <span class="rounded-full px-1.5 py-0.5 text-[10px] font-medium {config.bot_natural_language_enabled ? 'bg-emerald-50 text-emerald-600 dark:bg-emerald-950/40 dark:text-emerald-400' : 'bg-slate-100 text-slate-400 dark:bg-[#21262d] dark:text-[#636c76]'}">
+                    {config.bot_natural_language_enabled ? t('settingsAI.statusEnabled') : t('settingsAI.statusDisabled')}
+                  </span>
+                </span>
+                <p class="settings-muted mt-1">{t('nodeGatewayPage.botNaturalLanguageHint')}</p>
+                <p class="settings-muted mt-0.5">{t('nodeGatewayPage.botNaturalLanguageWecomHint')}</p>
+              </div>
+              <button
+                type="button"
+                class="switch-track mt-0.5 shrink-0 {config.bot_natural_language_enabled ? 'bg-emerald-500' : 'bg-slate-300 dark:bg-[#484f58]'} disabled:opacity-50"
+                role="switch"
+                aria-label={t('nodeGatewayPage.botNaturalLanguageTitle')}
+                aria-checked={Boolean(config.bot_natural_language_enabled)}
+                disabled={saving}
+                on:click={() => {
+                  config.bot_natural_language_enabled = !config.bot_natural_language_enabled;
+                  handleSave();
+                }}
+              >
+                <span class="switch-thumb {config.bot_natural_language_enabled ? 'translate-x-5' : 'translate-x-0'}"></span>
+              </button>
+            </label>
+          </div>
           <TelegramBotPanel
             {config}
             {tgBotStatus}
@@ -320,6 +366,7 @@
             {config}
             {saving}
             enabledKey="feishu_bot_enabled"
+            bindingPlatform="feishu"
             titleKey="nodeGatewayPage.feishuBot"
             enabledLabelKey="nodeGatewayPage.feishuEnabled"
             hintKey="nodeGatewayPage.feishuBotHint"
@@ -329,6 +376,7 @@
               { key: 'feishu_app_id', labelKey: 'nodeGatewayPage.feishuAppId', placeholder: 'cli_xxx' },
               { key: 'feishu_app_secret', labelKey: 'nodeGatewayPage.feishuAppSecret', placeholder: 'Secret', secret: true },
               { key: 'feishu_verification_token', labelKey: 'nodeGatewayPage.feishuVerificationToken', placeholder: 'Verification Token' },
+              { key: 'feishu_encrypt_key', labelKey: 'nodeGatewayPage.feishuEncryptKey', placeholder: 'Encrypt Key', secret: true },
             ]}
             on:save={handleSave}
           />
@@ -343,6 +391,7 @@
             {config}
             {saving}
             enabledKey="dingtalk_bot_enabled"
+            bindingPlatform="dingtalk"
             titleKey="nodeGatewayPage.dingtalkBot"
             enabledLabelKey="nodeGatewayPage.dingtalkEnabled"
             hintKey="nodeGatewayPage.dingtalkBotHint"

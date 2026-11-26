@@ -8,7 +8,7 @@ const readSource = (path: string) =>
 test('Linux 发布构建不应编译仅供 macOS 或测试使用的符号', () => {
   const avatar = readSource('./src-tauri/src/commands/avatar.rs');
   const system = readSource('./src-tauri/src/commands/system.rs');
-  const main = readSource('./src-tauri/src/main.rs');
+  const bootstrap = readSource('./src-tauri/src/bootstrap.rs');
   const monitor = readSource('./src-tauri/src/monitor.rs');
   const screenshot = readSource('./src-tauri/src/screenshot.rs');
 
@@ -22,8 +22,8 @@ test('Linux 发布构建不应编译仅供 macOS 或测试使用的符号', () =
     /#\[cfg\(any\(target_os = "macos", target_os = "windows"\)\)\]\nuse std::path::Path;/,
   );
   assert.match(
-    main,
-    /#\[cfg\(any\(target_os = "macos", test\)\)\]\nfn should_request_screen_capture_permission/,
+    bootstrap,
+    /#\[cfg\(any\(target_os = "macos", test\)\)\]\npub\(crate\) fn should_request_screen_capture_permission/,
   );
   assert.match(
     monitor,

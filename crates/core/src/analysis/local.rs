@@ -130,6 +130,41 @@ impl LocalAnalyzer {
             .collect::<Vec<_>>();
 
         let timeline = generate_activity_timeline(activities, self.locale);
+        let focus_metrics = crate::work_intelligence::compute_focus_metrics(activities);
+        let focus_line =
+            crate::work_intelligence::format_focus_metrics_for_prompt(&focus_metrics, self.locale);
+        let projects_line = {
+            let named: Vec<String> = stats
+                .project_usage
+                .iter()
+                .filter(|p| p.key != crate::project::UNASSIGNED_PROJECT_KEY && p.duration > 0)
+                .take(5)
+                .map(|p| {
+                    format!(
+                        "{}: {}",
+                        p.name,
+                        format_duration_for_locale(p.duration, self.locale)
+                    )
+                })
+                .collect();
+            if named.is_empty() {
+                String::new()
+            } else {
+                let prefix = match self.locale {
+                    AppLocale::ZhCn => "项目分布：",
+                    AppLocale::ZhTw => "專案分布：",
+                    AppLocale::En => "Projects: ",
+                    AppLocale::Ar => "المشاريع: ",
+                };
+                format!("\n- {prefix}{}", join_list(self.locale, named))
+            }
+        };
+        let focus_bullet = match (focus_line.is_empty(), projects_line.is_empty()) {
+            (true, true) => String::new(),
+            (false, true) => format!("\n- {focus_line}"),
+            (true, false) => projects_line,
+            (false, false) => format!("\n- {focus_line}{projects_line}"),
+        };
 
         let base_prompt = match self.locale {
             AppLocale::ZhCn => format!(
@@ -140,7 +175,7 @@ impl LocalAnalyzer {
 - 总工作时长：{}
 - 使用的应用：{}
 - 访问的网站：{}
-- 从屏幕内容提取的关键词：{}
+- 从屏幕内容提取的关键词：{}{}
 
 ## 活动时间线
 {timeline}
@@ -174,6 +209,7 @@ impl LocalAnalyzer {
                 } else {
                     join_list(self.locale, keywords)
                 },
+                focus_bullet,
                 timeline = timeline,
             ),
             AppLocale::ZhTw => format!(
@@ -184,7 +220,7 @@ impl LocalAnalyzer {
 - 總工作時長：{}
 - 使用的應用：{}
 - 造訪的網站：{}
-- 從畫面內容提取的關鍵詞：{}
+- 從畫面內容提取的關鍵詞：{}{}
 
 ## 活動時間線
 {timeline}
@@ -218,6 +254,7 @@ impl LocalAnalyzer {
                 } else {
                     join_list(self.locale, keywords)
                 },
+                focus_bullet,
                 timeline = timeline,
             ),
             AppLocale::En => format!(
@@ -228,7 +265,7 @@ impl LocalAnalyzer {
 - Total work duration: {}
 - Apps used: {}
 - Websites visited: {}
-- Keywords extracted from screen content: {}
+- Keywords extracted from screen content: {}{}
 
 ## Activity Timeline
 {timeline}
@@ -262,6 +299,7 @@ Do not add any extra preface or explanation."#,
                 } else {
                     join_list(self.locale, keywords)
                 },
+                focus_bullet,
                 timeline = timeline,
             ),
             AppLocale::Ar => format!(
@@ -272,7 +310,7 @@ Do not add any extra preface or explanation."#,
 - إجمالي مدة العمل: {}
 - التطبيقات المستخدمة: {}
 - المواقع المزارة: {}
-- الكلمات الرئيسية المستخرجة من محتوى الشاشة: {}
+- الكلمات الرئيسية المستخرجة من محتوى الشاشة: {}{}
 
 ## الجدول الزمني للنشاط
 {timeline}
@@ -306,6 +344,7 @@ Do not add any extra preface or explanation."#,
                 } else {
                     join_list(self.locale, keywords)
                 },
+                focus_bullet,
                 timeline = timeline,
             ),
         };

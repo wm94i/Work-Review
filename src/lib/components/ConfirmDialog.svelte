@@ -21,17 +21,17 @@
     },
   };
 
-  $: dialogState = $confirmDialog;
-  $: tone = toneMap[dialogState?.tone ?? 'info'];
+  const dialogState = $derived($confirmDialog);
+  const tone = $derived(toneMap[dialogState?.tone ?? 'info']);
 
   function handleKeydown(event: KeyboardEvent): void {
-    if (event.key === 'Escape') {
+    if (event.key === 'Escape' && dialogState) {
       resolveConfirm(false);
     }
   }
 </script>
 
-<svelte:window on:keydown={handleKeydown} />
+<svelte:window onkeydown={handleKeydown} />
 
 {#if dialogState}
   <div class="fixed inset-0 z-[200] flex items-center justify-center px-4 py-6 bg-slate-950/48 backdrop-blur-md animate-fadeIn">
@@ -61,14 +61,14 @@
       <div class="mt-6 flex items-center justify-end gap-3">
         <button
           type="button"
-          on:click={() => resolveConfirm(false)}
+          onclick={() => resolveConfirm(false)}
           class="inline-flex min-h-11 items-center justify-center rounded-[var(--radius-md)] border border-slate-200 dark:border-[#30363d] bg-white dark:bg-[#21262d] px-5 text-sm font-medium text-slate-700 dark:text-[#adbac7] transition-colors hover:bg-slate-50 dark:hover:bg-[#30363d]"
         >
           {dialogState.cancelText}
         </button>
         <button
           type="button"
-          on:click={() => resolveConfirm(true)}
+          onclick={() => resolveConfirm(true)}
           class={`inline-flex min-h-11 items-center justify-center rounded-[var(--radius-md)] px-5 text-sm font-medium transition-colors ${tone.button}`}
         >
           {dialogState.confirmText}

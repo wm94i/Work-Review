@@ -7671,7 +7671,7 @@ dependencies = [
 
 [[package]]
 name = "work-review"
-version = "1.1.4-rc.2"
+version = "1.2.0-rc.1"
 dependencies = [
  "aes",
  "anyhow",
@@ -7689,6 +7689,7 @@ dependencies = [
  "futures-util",
  "hex",
  "hmac",
+ "hyper 0.14.32",
  "image 0.25.10",
  "log",
  "objc",

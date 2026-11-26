@@ -42,18 +42,22 @@ pub(crate) fn validate_model_endpoint(endpoint: &str) -> Result<(), AppError> {
     if lower.starts_with("https://") {
         return Ok(());
     }
-    let Some(rest) = lower.strip_prefix("http://") else {
+    if !lower.starts_with("http://") {
         return Ok(());
-    };
+    }
 
-    // 提取主机名：截到 path/query/fragment 之前，剥离端口；IPv6 形如 [::1]:11434
-    let host_port = rest.split(['/', '?', '#']).next().unwrap_or("");
-    let host = if let Some(inner) = host_port.strip_prefix('[') {
-        inner.split(']').next().unwrap_or("")
-    } else {
-        host_port.split(':').next().unwrap_or(host_port)
-    };
-
+    // 使用标准 URL 解析提取真实主机名，禁止 `http://localhost:80@evil.com` 类 userinfo 绕过
+    let parsed = reqwest::Url::parse(trimmed)
+        .map_err(|_| AppError::Config("远程模型端点格式非法".to_string()))?;
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(AppError::Config(
+            "模型端点不允许在 URL 中携带用户名或密码".to_string(),
+        ));
+    }
+    let host = parsed
+        .host_str()
+        .map(|h| h.trim_start_matches('[').trim_end_matches(']'))
+        .unwrap_or("");
     if is_private_or_local_host(host) {
         return Ok(());
     }
@@ -241,17 +245,28 @@ fn openai_compatible_chat_completion_urls(endpoint: &str) -> Vec<String> {
     urls
 }
 
+fn build_openai_connection_test_payload(provider: AiProvider, model: &str) -> serde_json::Value {
+    let mut payload = serde_json::json!({
+        "model": model,
+        "messages": [{"role": "user", "content": "Hello"}],
+    });
+    if work_review_core::generation_params::uses_openai_reasoning_chat_params(provider, model) {
+        // OpenAI 推理系模型将隐藏思考计入 max_completion_tokens；显式用 low + 足够预算避免空正文假阴性
+        payload["max_completion_tokens"] =
+            serde_json::json!(openai_connection_test_max_tokens().max(1024));
+        payload["reasoning_effort"] = serde_json::json!("low");
+    } else {
+        payload["max_tokens"] = serde_json::json!(openai_connection_test_max_tokens());
+    }
+    payload
+}
+
 async fn test_openai(
     client: &reqwest::Client,
     config: &AiProviderConfig,
 ) -> Result<String, String> {
     let api_key = config.api_key.as_ref().ok_or("未配置 API Key")?;
-
-    let payload = serde_json::json!({
-        "model": config.model,
-        "messages": [{"role": "user", "content": "Hello"}],
-        "max_tokens": openai_connection_test_max_tokens(),
-    });
+    let payload = build_openai_connection_test_payload(config.provider, &config.model);
 
     let mut last_error = None;
 
@@ -1126,5 +1141,22 @@ mod tests {
             Some(&embedding_show)
         ));
         assert!(!ollama_model_should_be_listed(&heuristic_only, None));
+    }
+
+    #[test]
+    fn openai连接测试载荷对推理模型使用max_completion_tokens与足够预算() {
+        let reasoning = build_openai_connection_test_payload(AiProvider::OpenAI, "gpt-6.2-sol");
+        assert!(reasoning.get("max_tokens").is_none());
+        assert!(reasoning["max_completion_tokens"].as_u64().unwrap() >= 1024);
+        assert_eq!(reasoning["reasoning_effort"], "low");
+
+        let legacy = build_openai_connection_test_payload(AiProvider::OpenAI, "gpt-4o-mini");
+        assert_eq!(legacy["max_tokens"], 256);
+        assert!(legacy.get("max_completion_tokens").is_none());
+        assert!(legacy.get("reasoning_effort").is_none());
+
+        let deepseek = build_openai_connection_test_payload(AiProvider::DeepSeek, "deepseek-flash");
+        assert_eq!(deepseek["max_tokens"], 256);
+        assert!(deepseek.get("max_completion_tokens").is_none());
     }
 }

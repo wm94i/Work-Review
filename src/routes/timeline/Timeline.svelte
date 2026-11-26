@@ -8,6 +8,7 @@
   import { recordingStore, isActiveRecording } from '../../lib/stores/recording.ts';
   import { showToast } from '../../lib/stores/toast.ts';
   import { portalToBody } from '$lib/actions/portal.ts';
+  import { resolveExternalHref } from '$lib/actions/externalLinks.ts';
   import {
     appIconStore,
     getIconCacheKey,
@@ -87,6 +88,23 @@
 
   interface CleanupResult {
     deleted?: number;
+  }
+
+  type ProjectRuleField = 'app' | 'title' | 'domain' | 'url_path' | 'executable_path';
+  type ProjectRuleOp = 'equals' | 'contains' | 'regex';
+
+  interface ProjectRule {
+    field: ProjectRuleField;
+    op: ProjectRuleOp;
+    value: string;
+  }
+
+  interface ProjectDefinition {
+    key: string;
+    name: string;
+    color: string;
+    archived: boolean;
+    rules: ProjectRule[];
   }
 
   const invokeAppIcon: AppIconInvoke = (command, args) =>
@@ -402,6 +420,142 @@
   let privacySaving = false;
   let pendingPrivacyRule: PendingPrivacyRule | null = null;
 
+  // 项目归属与快捷规则创建（M3-1）
+  let projects: ProjectDefinition[] = [];
+  let projectsLoadError = false;
+  let selectedActivityProject: ProjectDefinition | null = null;
+  let showProjectRuleCreator = false;
+  let projectRuleTargetKey = '__new__';
+  let projectRuleNewName = '';
+  let projectRuleField: ProjectRuleField = 'title';
+  let projectRuleValue = '';
+  let projectRuleSaving = false;
+
+  async function loadProjects(): Promise<void> {
+    try {
+      projects = await invoke<ProjectDefinition[]>('get_projects');
+      projectsLoadError = false;
+    } catch {
+      projects = [];
+      projectsLoadError = true;
+    }
+  }
+
+  function extractActivityDomain(url: string | null | undefined): string {
+    if (!url) return '';
+    try {
+      const normalized = /^https?:\/\//i.test(url) ? url : `https://${url}`;
+      return new URL(normalized).hostname.toLowerCase();
+    } catch {
+      return '';
+    }
+  }
+
+  async function refreshSelectedActivityProject(activityId: number | null | undefined): Promise<void> {
+    if (!activityId) {
+      selectedActivityProject = null;
+      return;
+    }
+    try {
+      const resolved = await invoke<ProjectDefinition | null>('resolve_activity_project', {
+        id: activityId,
+      });
+      if (selectedActivity?.id === activityId) {
+        selectedActivityProject = resolved;
+      }
+    } catch {
+      if (selectedActivity?.id === activityId) {
+        selectedActivityProject = null;
+      }
+    }
+  }
+
+  function openProjectRuleCreator(activity: TimelineActivity): void {
+    const activeProjects = projects.filter((p) => !p.archived);
+    const matchedActiveKey = selectedActivityProject && activeProjects.some((p) => p.key === selectedActivityProject?.key)
+      ? selectedActivityProject.key
+      : null;
+    projectRuleTargetKey = matchedActiveKey || activeProjects[0]?.key || '__new__';
+    if (projectsLoadError) {
+      void loadProjects();
+    }
+    projectRuleNewName = '';
+    const domain = extractActivityDomain(activity.browser_url);
+    if (domain) {
+      projectRuleField = 'domain';
+      projectRuleValue = domain;
+    } else if (activity.window_title?.trim()) {
+      projectRuleField = 'title';
+      projectRuleValue = getTimelineTitle(activity).slice(0, 48);
+    } else {
+      projectRuleField = 'app';
+      projectRuleValue = activity.app_name || '';
+    }
+    showProjectRuleCreator = true;
+  }
+
+  async function saveQuickProjectRule(): Promise<void> {
+    if (projectRuleSaving) return;
+    const value = projectRuleValue.trim();
+    if (!value) {
+      showToast(t('settingsProjects.ruleValueRequired'), 'error');
+      return;
+    }
+    const newRule: ProjectRule = {
+      field: projectRuleField,
+      op: 'contains',
+      value,
+    };
+
+    const isNewProject = projectRuleTargetKey === '__new__';
+    let targetName = '';
+    if (isNewProject) {
+      targetName = projectRuleNewName.trim();
+      if (!targetName) {
+        showToast(t('settingsProjects.nameRequired'), 'error');
+        return;
+      }
+    } else {
+      const existing = projects.find((p) => p.key === projectRuleTargetKey);
+      if (!existing) {
+        showToast(t('common.loadFailedRetry'), 'error');
+        void loadProjects();
+        return;
+      }
+      targetName = existing.name;
+    }
+
+    projectRuleSaving = true;
+    try {
+      const updated = isNewProject
+        ? await invoke<ProjectDefinition[]>('save_project', {
+            project: {
+              key: '',
+              name: targetName,
+              color: '#3B82F6',
+              archived: false,
+              rules: [newRule],
+            },
+          })
+        : await invoke<ProjectDefinition[]>('add_project_rule', {
+            projectKey: projectRuleTargetKey,
+            rule: newRule,
+          });
+      projects = updated;
+      showProjectRuleCreator = false;
+      cache.invalidate('overview');
+      await refreshSelectedActivityProject(selectedActivity?.id);
+      showToast(
+        t('timeline.detail.projectRuleSaved', { name: targetName }),
+        'success',
+      );
+    } catch (e) {
+      showToast(formatUserError(e, t('common.loadFailedRetry')), 'error');
+    } finally {
+      projectRuleSaving = false;
+    }
+  }
+
   function getCurrentPrivacyLevel(): PrivacyLevel {
     return selectedActivity?._privacyLevel || 'full';
   }
@@ -432,26 +586,11 @@
     pendingPrivacyRule = null;
     privacySaving = true;
     try {
-      const config = await invoke<TimelineConfig>('get_config');
-      if (!config.privacy) config.privacy = {};
-      if (!config.privacy.app_rules) config.privacy.app_rules = [];
-
-      if (level === 'full') {
-        config.privacy.app_rules = config.privacy.app_rules.filter(
-          r => r.app_name !== targetActivity.app_name
-        );
-      } else {
-        const idx = config.privacy.app_rules.findIndex(
-          r => r.app_name === targetActivity.app_name
-        );
-        if (idx >= 0) {
-          config.privacy.app_rules[idx].level = level;
-        } else {
-          config.privacy.app_rules.push({ app_name: targetActivity.app_name, level });
-        }
-      }
-
-      await invoke('save_config', { config });
+      // 服务端读-改-写单条规则，避免整份配置写回覆盖其它位置刚做的修改
+      await invoke('set_app_privacy_level', {
+        appName: targetActivity.app_name,
+        level,
+      });
 
       selectedActivity = { ...targetActivity, _privacyLevel: level };
       cache.invalidate('overview');
@@ -472,6 +611,8 @@
       if (level === 'ignored') {
         closeDetail();
         loadTimeline();
+      } else {
+        await refreshSelectedActivityProject(targetActivity.id);
       }
     } catch (e) {
       console.error('设置记录策略失败:', e);
@@ -489,7 +630,8 @@
     try {
       const config = await invoke<TimelineConfig>('get_config');
       const rules = config.privacy?.app_rules || [];
-      const rule = rules.find(r => r.app_name === activity.app_name);
+      const targetName = activity.app_name.trim().toLowerCase();
+      const rule = rules.find(r => r.app_name.trim().toLowerCase() === targetName);
       return rule ? rule.level : 'full';
     } catch {
       return 'full';
@@ -577,8 +719,11 @@
     return typeof base64 === 'string' && base64.length > 100;
   }
 
-  const getTimelineIconSrc: (activity: TimelineActivity) => string | null =
-    function getTimelineIconSrc(activity) {
+  // 响应式声明：模板里只写 getTimelineIconSrc(activity)，Svelte 4 不会追踪函数体内读取的
+  // appIcons / failedTimelineIconKeys。改为 $: 声明后，这两个状态变化会重建函数并触发模板重算，
+  // 异步加载完成的图标与加载失败后的回退才能显示出来。
+  let getTimelineIconSrc: (activity: TimelineActivity) => string | null;
+  $: getTimelineIconSrc = function getTimelineIconSrc(activity) {
       const preferredAppName = getPreferredTimelineAppName(activity);
       const iconKey = getIconCacheKey({
         appName: activity.app_name,
@@ -627,12 +772,14 @@
     return getPreferredTimelineAppName(activity);
   }
 
-  function getTimelineThumbnail(activity: TimelineActivity): string | null {
+  // 同上：thumbnailCache 在缩略图异步加载后才写入，需要 $: 声明让模板感知变化。
+  let getTimelineThumbnail: (activity: TimelineActivity) => string | null;
+  $: getTimelineThumbnail = function getTimelineThumbnail(activity) {
     if (!activity?.screenshot_path) {
       return null;
     }
     return thumbnailCache[activity.screenshot_path] || null;
-  }
+  };
 
   function normalizeAppMatchKey(appName: string | null | undefined): string {
     return (appName || '').trim().toLowerCase();
@@ -723,8 +870,10 @@
   async function preloadTimelineLeadThumbnails(
     items: readonly TimelineActivity[],
   ): Promise<void> {
+    // 仅预取精选卡片的缩略图，避免列表加载阶段无差别触发全部卡片的缩略图请求
+    const featuredIds = new Set(selectFeaturedActivityIds(items));
     const leadItems = items
-      .filter((activity) => activity?.screenshot_path)
+      .filter((activity) => activity?.id != null && featuredIds.has(activity.id) && activity.screenshot_path)
       .slice(0, 6);
 
     await Promise.all(
@@ -1018,6 +1167,8 @@
     showCreateCategory = false;
     showRenameCategory = false;
     showAppSettings = false;
+    showProjectRuleCreator = false;
+    selectedActivityProject = null;
     clearPendingChip();
     const requestId = ++viewActivityRequestId;
     const previewThumbnail = getTimelineThumbnail(activity);
@@ -1038,12 +1189,18 @@
     const fullImagePromise = activity.screenshot_path
       ? loadFullImage(activity.screenshot_path)
       : Promise.resolve(previewThumbnail);
+    const projectPromise = activity.id
+      ? invoke<ProjectDefinition | null>('resolve_activity_project', { id: activity.id }).catch(
+          () => null,
+        )
+      : Promise.resolve(null);
 
-    const [freshActivity, thumbnail, privacyLevel] = await Promise.all([freshActivityPromise, fullImagePromise, loadPrivacyLevel(activity)]);
+    const [freshActivity, thumbnail, privacyLevel, resolvedProject] = await Promise.all([freshActivityPromise, fullImagePromise, loadPrivacyLevel(activity), projectPromise]);
     if (requestId !== viewActivityRequestId) return;
 
     const resolvedActivity = freshActivity || activity;
 
+    selectedActivityProject = resolvedProject;
     selectedActivity = {
       ...resolvedActivity,
       thumbnail: thumbnail || previewThumbnail,
@@ -1052,14 +1209,14 @@
     };
   }
 
-  // 打开外部链接
+  // 打开外部链接（走统一协议白名单，拒绝非 http(s) / mailto 协议）
   async function openUrl(url: string | null | undefined): Promise<void> {
-    if (url) {
-      try {
-        await open(url);
-      } catch (e) {
-        console.error('打开链接失败:', e);
-      }
+    const safeUrl = resolveExternalHref(url);
+    if (!safeUrl) return;
+    try {
+      await open(safeUrl);
+    } catch (e) {
+      console.error('打开链接失败:', e);
     }
   }
 
@@ -1140,10 +1297,12 @@
   async function closeDetail(restoreFocus = true): Promise<void> {
     viewActivityRequestId += 1;
     selectedActivity = null;
+    selectedActivityProject = null;
     categorySaving = false;
     showCreateCategory = false;
     showRenameCategory = false;
     showAppSettings = false;
+    showProjectRuleCreator = false;
     clearPendingChip();
     pendingApplyCategory = null;
     pendingDeleteCategory = null;
@@ -1334,6 +1493,7 @@
     };
     window.addEventListener('timeline-focus-date', handleTimelineFocus);
     categoryStore.refresh();
+    void loadProjects();
 
     if (!document.hidden) {
       clockInterval = setInterval(() => {
@@ -1516,7 +1676,7 @@
       <!-- 时间线列表 -->
       <div class="timeline-editorial-shell">
         <div class="timeline-rail" aria-hidden="true"></div>
-        {#each activities as activity, i}
+        {#each activities as activity, i (activity.id ?? `${activity.timestamp}-${i}`)}
           {@const info = getCategoryMeta(activity.category)}
           {@const featured = activity.id !== null && featuredActivityIds.has(activity.id)}
           {@const timelineTitle = getTimelineTitle(activity)}
@@ -1679,6 +1839,7 @@
     on:click|self={handleDetailDismiss}
     on:keydown={handleDetailOverlayKeydown}
   >
+    <!-- svelte-ignore a11y_no_noninteractive_element_to_interactive_role -->
     <aside
       class="timeline-detail-drawer"
       use:trapFocus
@@ -1923,6 +2084,106 @@
           {/if}
         </section>
 
+        <section class="timeline-detail-settings" aria-label={t('timeline.detail.projectLabel')}>
+          <div class="flex flex-wrap items-center justify-between gap-2">
+            <div class="flex items-center gap-2 min-w-0">
+              <span class="text-xs font-medium text-slate-500 dark:text-[#7d8590]">
+                {t('timeline.detail.projectLabel')}
+              </span>
+              {#if selectedActivityProject}
+                <span class="inline-flex items-center gap-1.5 rounded-md border border-slate-200/80 bg-white/90 px-2 py-0.5 text-xs font-medium text-slate-700 dark:border-[#30363d] dark:bg-[#21262d] dark:text-[#c9d1d9]">
+                  <span class="h-2 w-2 rounded-[var(--radius-xs)]" style={`background-color: ${selectedActivityProject.color};`}></span>
+                  {selectedActivityProject.name}
+                </span>
+              {:else}
+                <span class="text-xs text-slate-400 dark:text-[#636c76]">
+                  {t('timeline.detail.projectUnassigned')}
+                </span>
+              {/if}
+            </div>
+            <button
+              type="button"
+              class="text-xs font-medium text-primary-600 hover:text-primary-700 dark:text-primary-400 dark:hover:text-primary-300"
+              on:click={() => {
+                if (showProjectRuleCreator) {
+                  showProjectRuleCreator = false;
+                } else if (selectedActivity) {
+                  openProjectRuleCreator(selectedActivity);
+                }
+              }}
+            >
+              {showProjectRuleCreator ? t('timeline.cancel') : t('timeline.detail.projectAddRule')}
+            </button>
+          </div>
+
+          {#if showProjectRuleCreator}
+            <div class="space-y-2.5 rounded-lg border border-slate-200/80 bg-white/80 p-3 dark:border-[#30363d] dark:bg-[#161b22]/60">
+              <div class="grid grid-cols-1 gap-2 sm:grid-cols-2">
+                <label class="block text-xs text-slate-500 dark:text-[#7d8590]">
+                  <span>{t('timeline.detail.projectRuleTarget')}</span>
+                  <select
+                    bind:value={projectRuleTargetKey}
+                    class="mt-1 w-full rounded-md border border-slate-200 bg-white px-2 py-1.5 text-xs text-slate-800 dark:border-[#484f58] dark:bg-[#21262d] dark:text-[#e6edf3]"
+                  >
+                    {#each projects.filter((p) => !p.archived) as p (p.key)}
+                      <option value={p.key}>{p.name}</option>
+                    {/each}
+                    <option value="__new__">{t('timeline.detail.projectNewOption')}</option>
+                  </select>
+                </label>
+
+                <label class="block text-xs text-slate-500 dark:text-[#7d8590]">
+                  <span>{t('timeline.detail.projectRuleField')}</span>
+                  <select
+                    bind:value={projectRuleField}
+                    class="mt-1 w-full rounded-md border border-slate-200 bg-white px-2 py-1.5 text-xs text-slate-800 dark:border-[#484f58] dark:bg-[#21262d] dark:text-[#e6edf3]"
+                  >
+                    <option value="title">{t('settingsProjects.fieldTitle')}</option>
+                    <option value="app">{t('settingsProjects.fieldApp')}</option>
+                    <option value="domain">{t('settingsProjects.fieldDomain')}</option>
+                    <option value="url_path">{t('settingsProjects.fieldUrlPath')}</option>
+                  </select>
+                </label>
+              </div>
+
+              {#if projectRuleTargetKey === '__new__'}
+                <input
+                  type="text"
+                  bind:value={projectRuleNewName}
+                  placeholder={t('timeline.detail.projectNewNamePlaceholder')}
+                  class="w-full rounded-md border border-slate-200 bg-white px-2.5 py-1.5 text-xs text-slate-900 dark:border-[#484f58] dark:bg-[#21262d] dark:text-[#e6edf3]"
+                />
+              {/if}
+
+              <input
+                type="text"
+                bind:value={projectRuleValue}
+                placeholder={t('timeline.detail.projectRuleValue')}
+                class="w-full rounded-md border border-slate-200 bg-white px-2.5 py-1.5 text-xs text-slate-900 dark:border-[#484f58] dark:bg-[#21262d] dark:text-[#e6edf3]"
+              />
+
+              <div class="flex justify-end gap-2">
+                <button
+                  type="button"
+                  on:click={() => (showProjectRuleCreator = false)}
+                  disabled={projectRuleSaving}
+                  class="rounded-md border border-slate-200 px-3 py-1 text-xs text-slate-600 hover:bg-slate-50 dark:border-[#30363d] dark:text-[#adbac7] dark:hover:bg-[#21262d]"
+                >
+                  {t('timeline.cancel')}
+                </button>
+                <button
+                  type="button"
+                  on:click={saveQuickProjectRule}
+                  disabled={projectRuleSaving}
+                  class="rounded-md bg-primary-600 px-3 py-1 text-xs font-medium text-white hover:bg-primary-700 disabled:opacity-50"
+                >
+                  {projectRuleSaving ? t('timeline.detail.saving') : t('timeline.detail.projectRuleSave')}
+                </button>
+              </div>
+            </div>
+          {/if}
+        </section>
+
         <section class="timeline-detail-settings">
           <button
             type="button"
@@ -2003,7 +2264,7 @@
     <div class="w-full max-w-lg rounded-[var(--radius-lg)] border border-slate-200 dark:border-[#30363d] bg-white dark:bg-[#161b22] shadow-2xl">
       <div class="flex items-center justify-between p-5 border-b border-slate-200 dark:border-[#30363d]">
         <h3 class="text-base font-semibold text-slate-900 dark:text-[#e6edf3]">{t('timeline.cleanupRecordsTitle')}</h3>
-        <button class="btn btn-ghost" on:click={() => (showCleanupPanel = false)} disabled={cleanupBusy}>
+        <button class="btn btn-ghost" aria-label={t('window.close')} on:click={() => (showCleanupPanel = false)} disabled={cleanupBusy}>
           <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
           </svg>
@@ -2377,8 +2638,7 @@
     gap: 0.8rem 1rem;
     align-items: center;
     padding: 1rem 1.05rem;
-    background: rgba(255, 255, 255, 0.62);
-    backdrop-filter: blur(8px);
+    background: rgba(255, 255, 255, 0.78);
   }
 
   .timeline-featured-media {
@@ -2854,7 +3114,7 @@
   .timeline-detail-url {
     padding: 0;
     border: 0;
-    color: #b45309;
+    color: var(--ui-accent);
     background: transparent;
     font-size: 0.78rem;
     font-weight: 500;
@@ -2949,14 +3209,14 @@
 
   .timeline-detail-privacy-seg-active,
   .timeline-detail-privacy-seg-active:hover:not(:disabled) {
-    border-color: #292524;
-    background: #292524;
-    color: #fafaf9;
+    border-color: #1e293b;
+    background: #1e293b;
+    color: #f8fafc;
     font-weight: 620;
   }
 
   .timeline-detail-privacy-seg:focus-visible {
-    outline: 2px solid rgba(87, 83, 78, 0.4);
+    outline: 2px solid var(--ui-accent-ring);
     outline-offset: 2px;
   }
 
@@ -2974,9 +3234,9 @@
 
   :global(.dark) .timeline-detail-privacy-seg-active,
   :global(.dark) .timeline-detail-privacy-seg-active:hover:not(:disabled) {
-    border-color: #8b949e;
-    background: #8b949e;
-    color: #161b22;
+    border-color: #e6edf3;
+    background: #e6edf3;
+    color: #0d1117;
   }
 
   .timeline-category-section {
@@ -3083,7 +3343,7 @@
   .timeline-detail-settings-toggle:focus-visible,
   .timeline-category-editor button:focus-visible,
   .timeline-category-editor input:focus-visible {
-    outline: 2px solid rgba(217, 119, 6, 0.55);
+    outline: 2px solid var(--ui-accent-ring);
     outline-offset: 2px;
   }
 
@@ -3211,21 +3471,21 @@
 
   .timeline-category-editor-actions .timeline-category-editor-primary {
     color: #fff;
-    border-color: #d97706;
-    background: #d97706;
+    border-color: var(--ui-accent);
+    background: var(--ui-accent);
   }
 
   :global(.dark) .timeline-summary-copy {
-    color: #94a3b8;
+    color: var(--ui-muted);
   }
 
   :global(.dark) .timeline-summary-divider {
-    color: #475569;
+    color: #484f58;
   }
 
   :global(.dark) .timeline-summary-action {
-    background: rgba(51, 65, 85, 0.72);
-    border-color: rgba(245, 158, 11, 0.16);
+    background: rgba(33, 38, 45, 0.84);
+    border-color: var(--surface-border-default);
   }
 
   :global(.dark) .timeline-editorial-board {
@@ -3270,20 +3530,20 @@
 
   :global(.dark) .timeline-entry:hover .timeline-entry-card,
   :global(.dark) .timeline-entry:focus-visible .timeline-entry-card {
-    border-color: rgba(251, 191, 36, 0.18);
-    box-shadow: 0 18px 42px rgba(2, 6, 23, 0.34);
+    border-color: var(--surface-border-emphasis);
+    box-shadow: 0 12px 30px rgba(0, 0, 0, 0.28);
   }
 
   :global(.dark) .timeline-entry-card-featured {
-    background: rgba(15, 23, 42, 0.66);
+    background: rgba(33, 38, 45, 0.62);
   }
 
   :global(.dark) .timeline-summary-strip {
-    border-bottom-color: rgba(71, 85, 105, 0.72);
+    border-bottom-color: var(--surface-border-subtle);
   }
 
   :global(.dark) .timeline-entry-card-compact {
-    background: rgba(15, 23, 42, 0.54);
+    background: rgba(33, 38, 45, 0.42);
   }
 
   :global(.dark) .timeline-featured-image {
@@ -3355,17 +3615,17 @@
   }
 
   :global(.dark) .timeline-load-more-btn {
-    color: #cbd5e1;
-    border-color: rgba(148, 163, 184, 0.24);
-    background: rgba(15, 23, 42, 0.48);
+    color: #c9d1d9;
+    border-color: var(--surface-border-default);
+    background: rgba(33, 38, 45, 0.6);
   }
 
   :global(.dark) .timeline-load-more-btn:hover:enabled {
-    background: rgba(15, 23, 42, 0.68);
+    background: rgba(48, 54, 61, 0.72);
   }
 
   :global(.dark) .timeline-load-more-end {
-    color: #64748b;
+    color: var(--ui-muted);
   }
 
   :global(.dark) .timeline-detail-drawer {
@@ -3431,7 +3691,7 @@
   }
 
   :global(.dark) .timeline-detail-url {
-    color: #d29922;
+    color: var(--ui-accent);
   }
 
   :global(.dark) .timeline-category-chip,
@@ -3472,9 +3732,26 @@
   }
 
   :global(.dark) .timeline-category-editor-actions .timeline-category-editor-primary {
-    color: #fff;
-    border-color: #9e6a03;
-    background: #9e6a03;
+    color: #0d1117;
+    border-color: var(--ui-accent);
+    background: var(--ui-accent);
+  }
+
+  @media (min-width: 1280px) {
+    .timeline-entry-card-featured {
+      grid-template-columns: minmax(16rem, 22rem) minmax(0, 1fr);
+    }
+
+    .timeline-entry-card-compact-grid {
+      grid-template-columns: minmax(14rem, 19rem) minmax(0, 1fr) auto;
+      grid-template-areas: 'app title meta';
+      align-items: center;
+      gap: 0.75rem 1.25rem;
+    }
+
+    .timeline-entry-tail-compact {
+      align-self: center;
+    }
   }
 
   @media (max-width: 860px) {

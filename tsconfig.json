@@ -25,6 +25,7 @@
     "src-tauri/**/*.test.ts",
     "scripts/**/*.ts",
     "vite.config.ts",
+    "vitest.config.ts",
     "tailwind.config.ts"
   ],
   "exclude": [

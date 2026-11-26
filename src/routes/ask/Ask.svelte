@@ -23,6 +23,7 @@
   import { reduceStreamEvent } from './streamEvent.ts';
   import { formatDurationLocalized, locale, t, tm, translateCategoryLabel } from '$lib/i18n/index.ts';
   import { formatUserError } from '$lib/utils/errorDisplay.ts';
+  import { interceptExternalLinks } from '$lib/actions/externalLinks.ts';
   import { cache } from '../../lib/stores/cache.ts';
   import { trapFocus } from '$lib/utils/focusTrap.ts';
 
@@ -46,7 +47,12 @@
   }
 
   interface AssistantConfig {
+    text_model?: ModelConfig;
     text_model_profiles?: ModelProfile[];
+    text_model_provider_cache?: Record<string, ModelConfig>;
+    task_model_routing?: {
+      assistant_provider?: string | null;
+    };
   }
 
   interface AssistantConversation {
@@ -200,10 +206,50 @@
       }
     });
 
-    // 加载模型档案
+    // 加载模型档案（兼容按场景分流配置的助手专用模型）
     try {
       const config = await invoke<AssistantConfig>('get_config');
-      modelProfiles = config.text_model_profiles || [];
+      const loadedProfiles = [...(config.text_model_profiles || [])];
+      const routedKey = config.task_model_routing?.assistant_provider?.trim() || '';
+      let routedProfileId: string | null = null;
+
+      if (routedKey) {
+        const directProfile = loadedProfiles.find((profile) => profile.id === routedKey);
+        if (directProfile) {
+          routedProfileId = directProfile.id;
+        } else {
+          const routedConfig =
+            config.text_model?.provider === routedKey
+              ? config.text_model
+              : config.text_model_provider_cache?.[routedKey];
+          const needsKey = !['ollama', 'lmstudio', 'custom'].includes(routedKey);
+          const isReady =
+            Boolean(routedConfig?.endpoint?.trim()) &&
+            Boolean(routedConfig?.model?.trim()) &&
+            (!needsKey || Boolean(routedConfig?.api_key?.trim()));
+          if (routedConfig && isReady) {
+            const existingSame = loadedProfiles.find(
+              (profile) =>
+                profile.model_config?.provider === routedConfig.provider &&
+                profile.model_config?.model === routedConfig.model &&
+                profile.model_config?.endpoint === routedConfig.endpoint
+            );
+            if (existingSame) {
+              routedProfileId = existingSame.id;
+            } else {
+              const syntheticId = `routed-assistant:${routedKey}`;
+              loadedProfiles.unshift({
+                id: syntheticId,
+                name: `${localizedProviderName(routedKey)} · ${routedConfig.model.trim()}`,
+                model_config: { ...routedConfig, provider: routedKey },
+              });
+              routedProfileId = syntheticId;
+            }
+          }
+        }
+      }
+
+      modelProfiles = loadedProfiles;
       if (
         selectedModelId !== BASIC_ASSISTANT_MODEL_ID &&
         !modelProfiles.some((profile) => profile.id === selectedModelId)
@@ -212,9 +258,11 @@
         assistantStore.setSelectedModelId(BASIC_ASSISTANT_MODEL_ID, { userInitiated: false });
       }
 
-      // 首次使用：用户从未手动选过模型，但有已配置的模型档案 → 自动选中第一个
-      // （解决"设置页配了模型，助手页却默认用基础模板"的困惑，issue #133）
-      if (
+      // 首次使用或未手动指定模型时：优先使用「工作助手」分流模型，否则回退首个已配置档案
+      if (!assistantState.hasUserSelectedModel && routedProfileId) {
+        selectedModelId = routedProfileId;
+        assistantStore.setSelectedModelId(routedProfileId, { userInitiated: false });
+      } else if (
         selectedModelId === BASIC_ASSISTANT_MODEL_ID &&
         !assistantState.hasUserSelectedModel &&
         modelProfiles.length > 0
@@ -245,6 +293,10 @@
 
   onDestroy(() => {
     destroyed = true;
+    if (pendingAutoScrollRaf !== null && typeof cancelAnimationFrame === 'function') {
+      cancelAnimationFrame(pendingAutoScrollRaf);
+      pendingAutoScrollRaf = null;
+    }
     // 注意：不在这里清 sending 状态——请求在后台继续跑（切页面不取消），
     // 全局 store 保留"生成中"标记,切回助手页能看到进行中的气泡;
     // submitQuestion 的 finally（120s 超时兜底）保证状态必然收尾,不会僵尸。
@@ -272,6 +324,17 @@
   // so we don't run marked.parse on every token.
   const STREAM_RENDER_INTERVAL_MS = 250;
   const streamRenderState = new Map<number, { html: string; at: number }>();
+  // 动态开场提示按 "日期|语言|模型" 缓存，避免每次切回助手页都重复调用大模型
+  const dynamicPromptCache = new Map<string, string[]>();
+  let pendingAutoScrollRaf: number | null = null;
+
+  function getLocalPromptCacheDate(): string {
+    const now = new Date();
+    const y = now.getFullYear();
+    const m = String(now.getMonth() + 1).padStart(2, '0');
+    const d = String(now.getDate()).padStart(2, '0');
+    return `${y}-${m}-${d}`;
+  }
 
   function normalizeAssistantContent(content: string | null | undefined): string {
     const text = (content || '').replace(/\r\n/g, '\n').trim();
@@ -358,7 +421,7 @@
     return result.join('\n');
   }
 
-  function renderMarkdown(content: string | null | undefined): string {
+  function renderMarkdown(content: string | null | undefined, cacheResult = true): string {
     const normalized = normalizeAssistantContent(content);
     if (!normalized) return '';
 
@@ -366,27 +429,34 @@
     if (cached) return cached;
 
     const parsed = marked.parse(normalized);
-    const html = typeof parsed === 'string' ? DOMPurify.sanitize(parsed) : '';
-    renderedMarkdownCache.set(normalized, html);
+    const html = typeof parsed === 'string'
+      ? DOMPurify.sanitize(parsed, {
+        FORBID_TAGS: ['form', 'input', 'button', 'textarea', 'select', 'area', 'map'],
+        FORBID_ATTR: ['xlink:href'],
+      })
+      : '';
+    if (cacheResult) {
+      renderedMarkdownCache.set(normalized, html);
 
-    // 控制缓存上限，避免长会话内存持续增长
-    if (renderedMarkdownCache.size > 120) {
-      const oldestKey = renderedMarkdownCache.keys().next().value;
-      if (oldestKey !== undefined) renderedMarkdownCache.delete(oldestKey);
+      // 控制缓存上限，避免长会话内存持续增长
+      if (renderedMarkdownCache.size > 120) {
+        const oldestKey = renderedMarkdownCache.keys().next().value;
+        if (oldestKey !== undefined) renderedMarkdownCache.delete(oldestKey);
+      }
     }
 
     return html;
   }
 
   // 流式渲染：节流，STREAM_RENDER_INTERVAL_MS 内复用上次 HTML，避免每个 token 都跑 marked.parse。
-  // key 用消息在数组中的下标，收尾时由 renderMarkdown 接管（命中缓存，无额外开销）。
+  // 流式中间文本不写入 renderedMarkdownCache，避免快速挤出已定稿消息的缓存。
   function renderStreamingMarkdown(content: string | null | undefined, key: number): string {
     const now = Date.now();
     const state = streamRenderState.get(key);
     if (state && now - state.at < STREAM_RENDER_INTERVAL_MS) {
       return state.html;
     }
-    const html = renderMarkdown(content);
+    const html = renderMarkdown(content, false);
     streamRenderState.set(key, { html, at: now });
     return html;
   }
@@ -878,6 +948,13 @@
       refreshStarterPrompts([]);
       return;
     }
+    const promptCacheKey = `${getLocalPromptCacheDate()}|${currentLocale}|${selectedModelId}`;
+    const cachedPrompts = dynamicPromptCache.get(promptCacheKey);
+    if (cachedPrompts) {
+      dynamicPrompts = cachedPrompts;
+      refreshStarterPrompts(dynamicPrompts);
+      return;
+    }
     try {
       const stats = await invoke<TodayStats>('get_today_stats');
       if (requestId !== starterPromptRequestId || destroyed) return;
@@ -904,6 +981,13 @@
       dynamicPrompts = Array.isArray(parsed)
         ? parsed.filter((prompt): prompt is string => typeof prompt === 'string' && Boolean(prompt.trim()))
         : [];
+      if (dynamicPrompts.length > 0) {
+        dynamicPromptCache.set(promptCacheKey, dynamicPrompts);
+        if (dynamicPromptCache.size > 16) {
+          const oldest = dynamicPromptCache.keys().next().value;
+          if (oldest !== undefined) dynamicPromptCache.delete(oldest);
+        }
+      }
       refreshStarterPrompts(dynamicPrompts);
     } catch (e) {
       if (requestId !== starterPromptRequestId || destroyed) return;
@@ -916,12 +1000,20 @@
   $: hasConversation = messages.length > 0;
   $: input, resizeComposer();
 
-  // afterUpdate：每次 DOM 更新后，如果用户在底部附近，直接同步滚到底
-  // 这是 Svelte 推荐的"保持滚到底部"方案，比 async scrollToBottom 可靠
+  // afterUpdate：按 requestAnimationFrame 节流滚到底，避免流式高频 DOM 更新造成强制同步布局抖动
   afterUpdate(() => {
-    if (stickToBottom && chatBody) {
+    if (!stickToBottom || !chatBody) return;
+    if (typeof requestAnimationFrame !== 'function') {
       chatBody.scrollTop = chatBody.scrollHeight;
+      return;
     }
+    if (pendingAutoScrollRaf !== null) return;
+    pendingAutoScrollRaf = requestAnimationFrame(() => {
+      pendingAutoScrollRaf = null;
+      if (!destroyed && stickToBottom && chatBody) {
+        chatBody.scrollTop = chatBody.scrollHeight;
+      }
+    });
   });
 </script>
 
@@ -1100,7 +1192,7 @@
                     </details>
                   {/if}
 
-                  <div class="markdown-body assistant-markdown min-w-0 max-w-none">
+                  <div class="markdown-body assistant-markdown min-w-0 max-w-none" use:interceptExternalLinks>
                     {#if message.streaming}
                       <div class="streaming-content">
                         {#if message.content}
@@ -1181,7 +1273,7 @@
           aria-label={t('ask.placeholder')}
           on:input={resizeComposer}
           on:keydown={handleComposerKeydown}
-        />
+        ></textarea>
 
         <div class="ask-composer-toolbar">
           <div class="ask-composer-controls">

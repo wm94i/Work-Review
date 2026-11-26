@@ -571,10 +571,37 @@ pub fn fast_answer(
         lines.push(format!("  - {app}: {}", fmt_dur(*dur)));
     }
 
-    // 如果有 FTS 关键词命中的结果，也附上
-    let fts_results = database
-        .search_memory(question, date_from.as_deref(), date_to.as_deref(), 3)
-        .unwrap_or_default();
+    // 如果有 FTS 关键词命中的结果，按隐私规则过滤后再附上（且不通过 OCR 文本命中）
+    let fts_results: Vec<_> = database
+        .search_memory_with_options(question, date_from.as_deref(), date_to.as_deref(), 8, false)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|r| {
+            if !ignored_apps.is_empty() {
+                if let Some(app) = &r.app_name {
+                    if work_review_core::privacy::matches_ignored_app(app, ignored_apps) {
+                        return false;
+                    }
+                }
+            }
+            if !excluded_domains.is_empty() {
+                if let Some(url) = r.browser_url.as_deref() {
+                    if work_review_core::privacy::matches_excluded_domain(url, excluded_domains) {
+                        return false;
+                    }
+                }
+                let title_lower = r.title.to_lowercase();
+                if excluded_domains
+                    .iter()
+                    .any(|ex| !ex.trim().is_empty() && title_lower.contains(&ex.to_lowercase()))
+                {
+                    return false;
+                }
+            }
+            true
+        })
+        .take(3)
+        .collect();
     if !fts_results.is_empty() {
         lines.push("".to_string());
         lines.push(format!("{lbl_related}："));

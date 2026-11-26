@@ -16,9 +16,9 @@
     info: 'bg-[rgba(59,130,246,0.12)] dark:bg-[rgba(59,130,246,0.18)] text-[#2563eb] dark:text-[#60a5fa]',
   };
 
-  $: toastState = $toast;
-  $: iconPath = iconMap[toastState?.type ?? 'info'];
-  $: toastClass = colorMap[toastState?.type ?? 'info'];
+  const toastState = $derived($toast);
+  const iconPath = $derived(iconMap[toastState?.type ?? 'info']);
+  const toastClass = $derived(colorMap[toastState?.type ?? 'info']);
 </script>
 
 {#if toastState}
@@ -29,7 +29,7 @@
   >
     <button
       type="button"
-      on:click={clearToast}
+      onclick={() => clearToast()}
       class={`toast-glass max-w-xl min-h-11 px-[18px] py-2.5 text-sm font-medium flex items-center gap-2 pointer-events-auto ${toastClass}`}
     >
       <svg class="w-4 h-4 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">

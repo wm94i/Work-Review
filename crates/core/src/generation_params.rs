@@ -83,9 +83,57 @@ pub fn resolved_max_tokens(config: &ModelConfig, default: u32) -> u32 {
         .unwrap_or(default)
 }
 
+fn matches_model_family(bare: &str, family: &str) -> bool {
+    match bare.strip_prefix(family) {
+        Some("") => true,
+        Some(rest) => matches!(rest.as_bytes()[0], b'-' | b'.'),
+        None => false,
+    }
+}
+
+/// 判断 OpenAI Chat Completions 模型是否需要改用 `max_completion_tokens` 且省略非默认采样参数
+/// （OpenAI GPT-5 / GPT-6 / o 系列在推理模式下拒绝旧版 `max_tokens` 与非默认 `temperature`）。
+/// 仅对 `AiProvider::OpenAI` 生效，避免向不支持该字段的第三方 OpenAI 兼容端点（含 `Custom`）发送不兼容参数；
+/// 注：若 Azure / 代理将 GPT-6 映射为完全自定义的部署名，此启发式无法仅凭名称识别。
+pub fn uses_openai_reasoning_chat_params(provider: AiProvider, model: &str) -> bool {
+    if provider != AiProvider::OpenAI {
+        return false;
+    }
+    let normalized = model.trim().to_ascii_lowercase();
+    let bare = normalized
+        .rsplit_once('/')
+        .map(|(_, tail)| tail)
+        .unwrap_or(&normalized);
+    matches_model_family(bare, "gpt-5")
+        || matches_model_family(bare, "gpt-6")
+        || matches_model_family(bare, "o1")
+        || matches_model_family(bare, "o3")
+        || matches_model_family(bare, "o4")
+}
+
+pub fn openai_max_tokens_field(provider: AiProvider, model: &str) -> &'static str {
+    if uses_openai_reasoning_chat_params(provider, model) {
+        "max_completion_tokens"
+    } else {
+        "max_tokens"
+    }
+}
+
 pub fn apply_openai_compatible(body: &mut Value, config: &ModelConfig, streaming: bool) {
     let cap = capabilities_for(config.provider);
-    body["max_tokens"] = json!(resolved_max_tokens(config, 8192));
+    let max_tokens = resolved_max_tokens(config, 8192);
+    if uses_openai_reasoning_chat_params(config.provider, &config.model) {
+        if let Some(object) = body.as_object_mut() {
+            object.remove("max_tokens");
+            // OpenAI 新一代推理系模型在默认推理状态下拒绝非默认采样参数，交由服务端使用默认值。
+            for field in ["temperature", "top_p"] {
+                object.remove(field);
+            }
+        }
+        body["max_completion_tokens"] = json!(max_tokens);
+    } else {
+        body["max_tokens"] = json!(max_tokens);
+    }
 
     match cap.thinking {
         ThinkingProtocol::DashScopeTopLevel => {
@@ -210,8 +258,81 @@ mod tests {
         let mut body = json!({ "model": "gpt" });
         apply_openai_compatible(&mut body, &model(AiProvider::OpenAI), true);
         assert_eq!(body["max_tokens"], 4096);
+        assert!(body.get("max_completion_tokens").is_none());
         assert!(body.get("chat_template_kwargs").is_none());
         assert!(body.get("enable_thinking").is_none());
+    }
+
+    #[test]
+    fn openai新一代推理模型应改用max_completion_tokens并移除temperature() {
+        for model_name in ["gpt-6.2-sol", "gpt-6-luna", "gpt-5.4", "o3", "o4-mini"] {
+            let mut cfg = model(AiProvider::OpenAI);
+            cfg.model = model_name.to_string();
+            let mut body = json!({ "model": model_name, "temperature": 0.2, "top_p": 0.9 });
+            apply_openai_compatible(&mut body, &cfg, true);
+            assert_eq!(
+                body["max_completion_tokens"], 4096,
+                "{model_name} 应写入 max_completion_tokens"
+            );
+            assert!(
+                body.get("max_tokens").is_none(),
+                "{model_name} 不应保留旧版 max_tokens"
+            );
+            assert!(
+                body.get("temperature").is_none(),
+                "{model_name} 不应发送非默认 temperature"
+            );
+            assert!(
+                body.get("top_p").is_none(),
+                "{model_name} 不应发送非默认 top_p"
+            );
+        }
+
+        // 第三方 OpenAI 兼容服务（如 OpenRouter / DeepSeek / Qwen / Custom）保持 max_tokens 与 temperature
+        let mut third_party = model(AiProvider::OpenRouter);
+        third_party.model = "openai/gpt-6.2-sol".to_string();
+        let mut body = json!({ "model": third_party.model, "temperature": 0.2 });
+        apply_openai_compatible(&mut body, &third_party, true);
+        assert_eq!(body["max_tokens"], 4096);
+        assert!(body.get("max_completion_tokens").is_none());
+        assert_eq!(body["temperature"], 0.2);
+    }
+
+    #[test]
+    fn openai推理参数匹配应覆盖边界前缀并拒绝非目标模型() {
+        for positive in [
+            "gpt-5",
+            "gpt-5.4",
+            "gpt-5-mini",
+            " gpt-6.2-sol ",
+            "openai/gpt-5",
+            "o1",
+            "o1-mini",
+            "o1-2024-12-17",
+            "o3-mini-high",
+            "o4-mini",
+        ] {
+            assert!(
+                uses_openai_reasoning_chat_params(AiProvider::OpenAI, positive),
+                "{positive} 应识别为 OpenAI 推理系参数模式"
+            );
+        }
+
+        for negative in ["gpt-4o", "gpt-4.1", "gpt-50", "gpt-600", "o2", "o10", ""] {
+            assert!(
+                !uses_openai_reasoning_chat_params(AiProvider::OpenAI, negative),
+                "{negative} 不应误判为 OpenAI 推理系参数模式"
+            );
+        }
+
+        assert!(!uses_openai_reasoning_chat_params(
+            AiProvider::Custom,
+            "gpt-5"
+        ));
+        assert!(!uses_openai_reasoning_chat_params(
+            AiProvider::OpenRouter,
+            "openai/gpt-6.2-sol"
+        ));
     }
 
     #[test]

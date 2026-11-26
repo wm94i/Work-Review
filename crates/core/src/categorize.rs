@@ -25,7 +25,6 @@ pub fn is_system_process(app_name: &str) -> bool {
             | "shellexperiencehost"
             | "startmenuexperiencehost"
             | "textinputhost"
-            | "applicationframehost"
             | "dwm"
             | "csrss"
             | "taskmgr"

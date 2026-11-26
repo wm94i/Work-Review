@@ -11,11 +11,11 @@ test('所有非系统分类均应独立提供管理入口，不经过分类选�
   assert.ok(html.children);
   const each = html.children[0];
   assert.ok(each.children);
-  const group = each.children.find((node) => node.type === 'Element');
+  const group = each.children.find((node: { type: string }) => node.type === 'Element');
   assert.ok(group?.children);
   assert.equal(group.name, 'span', '管理按钮不能嵌套在分类选择按钮内');
   assert.ok(!group.attributes.some((attr: { type: string }) => attr.type === 'EventHandler'));
-  const branches = group.children.filter((node) => node.type === 'IfBlock');
+  const branches = group.children.filter((node: { type: string }) => node.type === 'IfBlock');
   assert.equal(branches.length, 2, '当前分类展示与非系统分类管理必须为并列条件');
   assert.equal(branches[0].expression.operator, '===');
   assert.equal(branches[0].expression.right.name, 'currentCategoryKey');
@@ -24,9 +24,9 @@ test('所有非系统分类均应独立提供管理入口，不经过分类选�
   assert.equal(management.expression.argument.object.name, 'cat');
   assert.equal(management.expression.argument.property.name, 'is_system');
   assert.ok(management.children);
-  const actions = management.children.find((node) => node.type === 'Element');
+  const actions = management.children.find((node: { type: string }) => node.type === 'Element');
   assert.ok(actions?.children);
-  const buttons = actions.children.filter((node) => node.type === 'Element');
+  const buttons = actions.children.filter((node: { type: string }) => node.type === 'Element');
   assert.equal(buttons.length, 2);
   for (const button of buttons) {
     assert.equal(button.name, 'button');

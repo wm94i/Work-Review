@@ -228,7 +228,7 @@ Work Review 的核心始终是**本地记录**。AI 的作用是让记录更容�
 - 更新需下载便携 ZIP，退出后替换 EXE 并保留原 `Data`，不运行安装版更新器。便携模式不能切换到外部数据目录；退出并备份、移走 `Data` 后可恢复本机原有目录。
 - WebView2 缓存、自启动注册和用户选择的外部导出路径仍由系统管理；`Data` 可能含 API Key，请勿公开分享。
 
-**可通过 [v1.1.4-rc.2 测试版](https://github.com/wm94i/Work-Review/releases/tag/v1.1.4-rc.2) 试用；`v1.1.4-rc.1` 及更早版本不包含这项支持。**
+**可通过 [v1.2.0-rc.1 测试版](https://github.com/wm94i/Work-Review/releases/tag/v1.2.0-rc.1) 试用；`v1.1.4-rc.1` 及更早版本不包含这项支持。**
 
 > **Windows 11 智能应用控制**：若系统提示「智能应用控制阻止了程序启动」，是因为本应用使用自签名证书（非 EV 商业证书）。可在「Windows 安全中心 → 应用和浏览器控制 → 智能应用控制」中将其关闭后运行。详见 [#139](https://github.com/wm94i/Work-Review/issues/139)。
 
@@ -315,10 +315,11 @@ Authorization: Bearer <token>
 |------|------|------|
 | GET | `/health` | 健康检查（免鉴权） |
 | GET | `/v1/device` | 设备信息 |
-| GET | `/v1/timeline/{date}` | 时间线（`date` 格式 `YYYY-MM-DD`，支持 `?limit=&offset=`） |
-| GET | `/v1/activities/{date}` | 活动列表（支持 `?limit=&offset=&category=`） |
+| GET | `/v1/timeline/{date}` | 时间线（`date` 格式 `YYYY-MM-DD`，支持 `?limit=&offset=&include_ocr=`；默认 500 条、上限 2000 条；需在 config.json 开启 `localhost_api_include_ocr` 且请求带 `include_ocr=true` 才返回 OCR 文本） |
+| GET | `/v1/activities/{date}` | 活动列表（支持 `?limit=&include_ocr=`；条数上限与 OCR 规则同时间线） |
 | GET | `/v1/stats/today` | 今日统计 |
 | GET | `/v1/stats/overview` | 综合统计（`?mode=today|date|week|range`） |
+| GET | `/v1/stats/focus` | 专注度与上下文切换/打断指标（`?mode=today|date|week|range`） |
 | GET | `/v1/stats/daily/{date}` | 指定日期统计 |
 | GET | `/v1/reports` | 日报列表（`?limit=`） |
 | GET | `/v1/reports/{date}` | 指定日期日报（`?locale=`） |
@@ -353,7 +354,7 @@ curl -H "Authorization: Bearer $(cat ~/work-review/localhost_api_token.txt)" \
 <details>
 <summary>MCP Server</summary>
 
-通过 stdio 协议将工作记录接入 AI 编码工具（Claude Code / Cursor / VS Code Copilot 等）。
+通过 stdio 协议将工作记录接入 AI 编码工具（Claude Code / Cursor / VS Code Copilot 等）。MCP 默认不返回 OCR 原文与截图路径（需在 `config.json` 中显式设置 `mcp_include_ocr: true`）并按当前隐私规则脱敏；飞书 / 钉钉 / 企业微信 Bot 需先在「设置 → 接入管理」生成一次性绑定码并在对话中发送 `/bind 绑定码` 完成授权。
 
 ```bash
 cargo build --release -p work-review-mcp-server

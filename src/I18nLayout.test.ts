@@ -43,11 +43,15 @@ test('侧边栏底部应提供语言切换菜单，并按 ZH、EN、TW 顺序展
   assert.doesNotMatch(source, /sidebar-footer-version/);
 });
 
-test('后端语言切换命令应保持私有以避免 Tauri command 宏重导出冲突', async () => {
-  const source = await readFile(new URL('../src-tauri/src/main.rs', import.meta.url), 'utf8');
+test('后端语言切换命令应保持 crate 内可见以避免 Tauri command 宏重导出冲突', async () => {
+  const [traySource, handlerSource] = await Promise.all([
+    readFile(new URL('../src-tauri/src/tray.rs', import.meta.url), 'utf8'),
+    readFile(new URL('../src-tauri/src/commands/mod.rs', import.meta.url), 'utf8'),
+  ]);
 
-  assert.match(source, /#\[tauri::command\]\s*async fn set_app_locale\b/);
-  assert.doesNotMatch(source, /#\[tauri::command\]\s*pub async fn set_app_locale\b/);
+  assert.match(traySource, /#\[tauri::command\]\s*pub\(crate\) async fn set_app_locale\b/);
+  assert.doesNotMatch(traySource, /#\[tauri::command\]\s*pub async fn set_app_locale\b/);
+  assert.match(handlerSource, /crate::tray::set_app_locale/);
 });
 
 test('语言菜单应左对齐展开，并按“英文缩写 + 语言名称”展示避免裁切', async () => {

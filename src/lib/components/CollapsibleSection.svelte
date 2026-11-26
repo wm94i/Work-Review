@@ -9,9 +9,11 @@
     const saved = localStorage.getItem(storageKey);
     if (saved !== null) open = saved === '1';
   }
+  let everOpened = open;
 
   function toggle() {
     open = !open;
+    if (open) everOpened = true;
     if (storageKey && typeof localStorage !== 'undefined') {
       localStorage.setItem(storageKey, open ? '1' : '0');
     }
@@ -38,9 +40,13 @@
       <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7" />
     </svg>
   </button>
-  {#if open}
-    <div class="mt-3 settings-block">
-      <slot />
+  <div class="ui-fold {open ? 'ui-fold-open' : ''}" aria-hidden={!open} inert={!open ? true : undefined}>
+    <div class="ui-fold-inner">
+      {#if everOpened}
+        <div class="mt-3 settings-block">
+          <slot />
+        </div>
+      {/if}
     </div>
-  {/if}
+  </div>
 </div>

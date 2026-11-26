@@ -7,6 +7,82 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.0-rc.1] - 2026-11-26
+
+1.2.0 的第一个候选版本，汇总隐私与安全加固（M1）、正确性与性能优化（M2）、新功能扩展（M3）、工程化重构与前端栈现代化（M4）及效率洞察增强。仅供测试，不替换正式版 `1.1.3` 的 Latest。升级前请完整备份数据，尤其是在迁移目录、恢复备份或验证新的隐私规则前。架构决策见 [PROJECTWIKI 第 3 节 ADR-20261122-01～03 与 ADR-20261124-01～04](./PROJECTWIKI.md#3-架构决策记录adr)。
+
+### 工程化与重构（M4）
+- **前端测试体系现代化与安全不变量守卫（M4-1）**：引入 `vitest`、`@testing-library/svelte` 与 `jsdom`（`devDependencies`，均为 MIT），通过 `@tauri-apps/api/mocks` 的 `mockIPC` 为关键页面与组件（项目管理 CRUD/规则预览、Bot 发送者绑定、按场景模型分流、侧边栏路由高亮、历史路由重定向、Toast 与 ConfirmDialog）建立真实 DOM 行为测试（`npm run test:components` 并纳入 `npm run test:frontend`）；新增 `src/SecurityInvariants.test.ts`，通过 Svelte 编译器 AST 遍历与目录递归扫描集中守卫 CSP（含 `devCsp`）、全部 `{@html}` 必经 DOMPurify、全部 `capabilities/*.json` 最小权限与 Vite `envPrefix` 安全不变量。
+- **Rust 主入口模块化拆分（M4-2）**：将原 6,731 行 `src-tauri/src/main.rs` 按职责拆分为 `window.rs`、`tray.rs`、`bootstrap.rs`、`break_reminder.rs`、`crash.rs`、`recording/{mod,merge,browser_url}.rs` 与 `tasks/{mod,avatar,recording,hourly_summary,entity_classify,storage}.rs` 共 14 个子模块（生产主入口缩减至 ~790 行），并将 `tauri::generate_handler![...]` 收拢至 `commands::handler()`，`set_app_locale` / `get_platform` 收敛为 `pub(crate)`。
+- **四端 Bot 统一入站管线（M4-3）**：在 `bot_common.rs` 抽象共享 HTTP 连接池客户端 `shared_bot_http_client()`、防溢出秒/毫秒时间戳窗口校验 `timestamp_within_window_{secs,ms}` 与统一路由函数 `route_inbound_bot_message`（`InboundBotMessage` 使用私有授权状态与 `standard` / `pre_authorized` 受控构造器，按授权 → 去重 → 非文本/空文本 → NL 并发/配额 → 命令顺序分发），飞书、钉钉、企业微信回调/长连接与 Telegram 全部收敛接入，同时修复企微长连接 `out_rx` 关闭空转问题。
+- **Svelte 5 渐进迁移与 `marked` 大版本升级（M4-4）**：升级 `svelte@5.59.1`、`@sveltejs/vite-plugin-svelte@4.0.4`、`svelte-spa-router@5.1.1` 与 `marked@18.3.0`（保留 Vite 5，`npm audit --omit=dev` 0 漏洞）；入口迁至 Svelte 5 `mount()`；将 `Toast`、`ConfirmDialog`、`Sidebar`、`ModelRoutingPanel`、`BotSenderBindingPanel` 5 个组件迁移至 Svelte 5 runes（`$props` / `$state` / `$derived` / `$effect`），同步消除全部 Svelte 5 编译器与无障碍警告并显著缩小生产构建产物。
+
+### 新增
+- **项目 / 标签工时归集（M3-1）**：新增查询时项目归集引擎（`ProjectResolver`），支持按应用名、窗口标题、域名、URL 路径与可执行路径通过精确/包含/带体积上限的正则规则将活动归集到自定义项目（隐私忽略规则始终优先）；在「设置 → 项目」提供规则编辑器与近 7 天命中预览，概览新增「项目投入」分布，时间线详情展示归属项目并支持「按此活动快速创建规则」，日报模板、AI 上下文、本地 API `GET /v1/stats/projects` 与 Agent 工具 `project_stats` 同步接入。
+- **CSV / JSON 数据导出与一键目录备份恢复（M3-2）**：新增 `export_activities` / `export_daily_stats`（按当前隐私规则脱敏、RFC 4180 CSV 转义并防止 `= + - @` 公式注入）；新增目录级一键备份与恢复（`create_backup` / `restore_backup`），通过 `VACUUM INTO` 生成一致库快照与 SHA-256 `manifest.json`，默认不包含截图与密钥，恢复前校验哈希与数据库 `user_version` 并先备份现网数据、借助 `migration-stage` 原子替换与失败回滚；在「设置 → 存储」新增「导出与备份」卡片。
+- **无痕浏览器默认跳过与 URL 未知降级（M3-3）**：浏览器标题清洗前自动识别 Chrome / Edge / Firefox / Safari 等多语言无痕/隐私窗口标记，默认跳过记录（`skip_private_windows = true`）；新增 `unknown_url_fallback` 策略，配置了排除域名但暂时未能读到浏览器 URL 时默认按脱敏处理；隐私设置页提供对应开关。
+- **Agent 工具补齐（M3-4）**：新增只读工具 `list_todos`、`get_hourly_summaries`、`list_reports`、`get_reports_in_range`、`project_stats` 与需用户确认的写工具 `complete_todo`、`update_todo`，并收紧聚合类工具的 `limit` 上限。
+- **增量语义索引与可选后台自动索引（M3-5）**：SQLite Schema 升级至 `user_version = 3` 并新增 `memory_reindex_dates` 表；新活动写入不再触发全量清空重嵌，OCR 延迟补齐或删除操作仅按受影响日期局部重建，追加索引沿游标继续且滞后期间照常支持向量检索；新增默认关闭的 `semantic_auto_index` 后台定时任务（空闲每 30 分钟小批量推进），设置页提供滞后条数提示及「增量更新 / 全量重建」双入口。
+- **周报 / 月报周期复盘（M3-6）**：将周复盘泛化为支持四语（简中/繁中/英/阿文）的 `generate_period_review`（含每周投入趋势、环比上周/上月、Top 项目/应用/分类、深度工作段与亮点风险），结果缓存至 SQLite `period_reviews` 表（删除活动时自动失效对应区间）；日报页新增「日 / 周 / 月」视图切换、周期步进与 Markdown 导出，概览「周复盘」入口直达 `#/report?view=week`；新增本地 API `GET /v1/period-review` 并为 Agent `weekly_review` 扩展 `granularity` 参数。
+- **Bot 自然语言只读问答（M3-7）**：新增默认关闭的 `bot_natural_language_enabled` 开关（配置不参与同步），开启后已授权发送者在 Telegram / 飞书 / 钉钉 / 企业微信发送非命令自然语言提问时进入严格只读的 Agent 管线（零写工具、零联网工具、结果二次脱敏、末尾附数据范围提示、按发送者每分钟限 6 次且带并发上限与异步 ACK；企业微信 HTTP 回调在 3.5 秒超时前提示切换长连接模式）。
+- **专注度 / 上下文切换与打断指标**：新增 `compute_focus_metrics` 与 `get_focus_metrics` 命令及本地 API `GET /v1/stats/focus`，计算专注度评分（0–100）、最长连续专注段、深度专注段次数（≥ 25 分钟）、每小时应用切换频次与高频短时打断源（< 2 分钟切换）；在「概览」节奏卡顶部以紧凑指标条展示，并自动注入 AI 日报分析上下文。
+- **Git 提交产出自动关联**：在「设置 → 存储」新增本机 Git 仓库监听与作者过滤配置（支持「预览今日提交」）。生成日报时在本地以只读 `git log` 读取当日提交并按当前隐私规则脱敏，一方面作为事实上下文提供给 AI 摘要，另一方面在活动时间线前自动插入可管理的 `GIT_COMMITS` 提交清单区块；仓库路径仅保留本机，不参与配置同步。
+- **Obsidian / Markdown Vault 深度导出**：在「设置 → 存储 → 日报导出」新增 YAML Frontmatter 开关（写入日期、总工时、工作时长、专注分、常用应用与 Git 提交数）与「增量写入目标标题区块」选项（如 `## Work Review`），通过 `<!-- work-review:start/end -->` 锚点幂等更新已有每日笔记并保留用户手写内容与已有 frontmatter 属性；写入前拒绝符号链接目标。
+- **模型按场景分流**：在「设置 → AI → 模型配置」新增按任务分流面板，支持为「日报生成」「工作助手」「应用与网站分类」「桌宠主动提醒」分别指定已配置的模型服务商或模型档案（如后台分类走本地 Ollama、日报/助手走主力云端模型），未指定或目标未就绪时自动回退至主模型 `text_model`。
+
+### 性能与可靠性（M2）
+- **SQLite 查询与存储引擎优化**：所有时间区间重叠查询增加上界约束以稳定命中 `idx_activities_timestamp`，范围日统计与 24 小时明细合并为单次查询，统计投影仅对未解析浏览器行按需读取 `ocr_text`，非法日期直接返回错误；引入 WAL 只读连接并发服务统计/查询请求，Schema 升级至 `user_version = 2` 并启用 `auto_vacuum = INCREMENTAL`；FTS 更新触发器限定为 `app_name, window_title, ocr_text, browser_url`，报告/小时汇总/实体分类改为 `ON CONFLICT DO UPDATE`，`insert_activity` 改为 O(1) 计数器自增，删除路径统一使用 `IMMEDIATE` 事务与增量回收。
+- **全局锁瘦身与异步化**：统计、时间线、截图缩略图/原图读取、窗口查询、浏览器 URL 探测、桌宠查询与远程回填全部在锁内仅克隆句柄与必要配置后移入 `tokio::task::spawn_blocking`，消除长耗时 I/O 与图像解码阻塞主状态锁及异步运行时的问题。
+- **Windows OCR 与浏览器 UIA 降耗**：Windows OCR 改为常驻隐藏 STA WinRT worker 进程复用（移除 O(n²) `$boxes +=` 拼接），大幅减少周期性启动 PowerShell 的开销；浏览器地址栏 UIA 专用线程复用 `UIAutomation` 实例与按 HWND 缓存地址栏元素，标题未变时延长缓存 TTL，并移除注定超时的 PowerShell URL 兜底。
+- **截图与缩略图管线优化**：采集时直接按所有权接管 RGBA 缓冲并在内存中以 9×8 Triangle 计算 dHash，缩放改为 `FilterType::Triangle`，仅在确实需要 OCR 时写出临时 PNG；归档保存时同步写出 400px `.thumb.jpg` 磁盘缓存（删除活动/截图时连带清理）；合并路径改为内存 dHash 先判重，不再产生并删除临时归档 JPEG；键鼠空闲期间自动放宽截图采样间隔（3 倍且不低于 90 秒）。
+- **计时完整性与后台监督**：暂停、锁屏、采样中断、窗口查询失败及系统/瞬态窗口切段前统一经 `flush_observed_tail_and_reset` 回补已观察尾段，应用退出时自动落盘进行中的会话；Windows UWP 应用通过 `ApplicationFrameHost` 的 `CoreWindow` 子窗口解析真实进程名与路径；空闲阈值修改实时生效；7 个后台常驻循环统一接入 `spawn_supervised_task` 指数退避重启并在录制异常时刷新尾段与托盘状态。
+- **自动日报调度与启动优化**：每日自动日报与工作记忆洞察定时调度迁入 Rust 后台任务（按指数退避重试，关闭主窗口的轻量模式下同样执行），前端仅监听 `auto-report-generated` 事件刷新缓存；提前注册单实例插件，数据库打开失败改为友好错误提示，升级后的 FTS 重建与首轮存储清理移至主窗口显示后异步执行。
+- **Linux / macOS 平台修复与缓存**：修复 Linux `run_screenshot_command_with_timeout` 丢失 `xrandr`/`gdbus` 标准输出的问题；锁屏 `pgrep` 回退仅匹配活跃锁屏前台进程（`i3lock`/`swaylock`/`hyprlock`）并补全 D-Bus `GetActive` 查询，不再误匹配常驻屏保守护进程；Linux X11 活动窗口改用原生 `x11::xlib` 协议直连（失败回退 `xdotool`）；Firefox `recovery.jsonlz4` 按路径/修改时间/体积缓存，macOS `osascript` URL 查询增加 3 秒 TTL 缓存。
+- **数据目录、远程上传与前端细节**：自定义数据目录暂不可用时明确报错并保留偏好文件、不再静默回退；`change_data_dir` 迁移窗口期暂停录制并在退出作用域时自动恢复；远程上传回填遇到缺失本地截图时自动清理无效路径防止阻塞队列；修复 S3 SigV4 `canonical_uri` 丢失自定义端点路径前缀的问题；助手页按「日期 + 语言 + 模型」缓存开场提示、流式渲染不污染 Markdown 缓存并以 `requestAnimationFrame` 节流自动滚动；时间线 `{#each}` 添加稳定 key 且仅预取精选卡片缩略图；局域网通配监听（`0.0.0.0` / `::`）下 Bot 与 MCP 本机自调用固定走 `127.0.0.1`；本地 API `?token=` 查询参数鉴权记录弃用告警并附带 `Deprecation` / `Warning` 响应头。
+
+### 安全
+- **WebDAV 配置同步不再上传密钥**：同步文件升级为 v2，只包含界面 / 分类 / 日报提示词 / 工作时段等白名单偏好与隐私规则；模型与嵌入密钥、Bot Token、S3 / WebDAV 密码、模型端点、Bot 与 MCP 开关、远程存储、存储清理策略一律不上传，也不会被远端覆盖。隐私规则改为「只增不减」：远端只能新增或收紧规则，不能删除或降级本机规则。检测到旧版含密钥的同步文件时，会自动改写为脱敏快照；同步写入不再重新打时间戳、不再回推，消除多设备来回覆盖。
+- **对外输出统一脱敏**：MCP 读取活动 / 会话默认脱敏（移除 OCR 原文、截图与可执行文件路径，活动类搜索结果的 OCR 摘要一并移除），需在配置中显式开启 `mcp_include_ocr` 才返回原文；脱敏应用的 OCR 与搜索摘要一并清空，单次返回条数设上限。本地 API、助手工具结果与 AI 日报上下文按**当前**脱敏规则处理（采集后才新增的规则也生效），忽略应用匹配与统计侧统一为归一化名称；MCP、本地 API 与助手共用同一套核心脱敏函数。
+- **OCR 密钥过滤**：新增 sk- / Bearer / GitHub / AWS / Slack / Google / JWT / PEM 私钥等格式过滤，并叠加与窗口标题相同的 `api_key / secret / token` 规则；正则改为预编译。
+- **截图隐私遮罩（Windows）**：截取整块显示器时，可见的「忽略 / 脱敏」应用窗口及标题命中敏感关键词的窗口区域会被涂黑后再保存、OCR 与上传；降级截图路径无法遮罩时直接跳过该次截图。macOS / Linux 暂未实现，仍按前台应用判断。验收见 [docs/testing/windows-screenshot-mask.md](docs/testing/windows-screenshot-mask.md)。
+- **助手联网加固**：SSRF 防护改为解析后判断（拦截十进制 / 十六进制 / 短写 IPv4、IPv4 映射 IPv6、CGNAT 与保留地址），联网请求只连接解析为公网的地址（含每一跳重定向）；外部网页与本机记录分别包裹数据边界并防伪造。工作复盘模式下读取过本机数据后，`fetch_url` 访问外部链接需要用户确认。
+- **飞书 / 钉钉 / 企业微信 Bot 发送者授权**：只响应已绑定的发送者，未绑定者需在「设置 → 接入管理」生成一次性绑定码后发送 `/bind 绑定码`（10 分钟有效，错误 5 次作废）；按消息 ID 去重，平台超时重推不再重复执行。飞书设置页新增 Encrypt Key 输入项以启用签名校验与防重放。Telegram 无过期时间的旧绑定码视为过期。
+- **前端权限收敛**：移除前端未使用的全部文件系统权限、Shell 执行与 JS 侧更新安装权限（更新只走带 SHA-256 校验的 Rust 命令）；助手回复与日报中的链接只允许 http(s) / mailto 交由系统浏览器打开，WebView 禁止导航到外部地址；构建时只暴露 `TAURI_ENV_*` 环境变量。
+- **导出与日期校验**：区间 Markdown 与时间线 JSON 导出校验扩展名并拒绝隐藏 / 敏感目录与 `..`；本地 API 与 Bot 的日报日期统一校验 `YYYY-MM-DD`，「最近 N 天」天数设上限避免崩溃。
+- **安全复核补强**：
+  - **MCP 与对外出站**：修复 MCP `sanitize_value` 未按 camelCase `sourceType` 剥离活动 OCR 摘要的问题；MCP 支持 `config.json` 变更热重载并校验 `mcp_server_enabled`；活动类搜索命中脱敏/忽略规则直接剔除（消除搜索预言机），关闭 `mcp_include_ocr` 时 FTS 检索不再索引 `ocr_text`；本地 API `/v1/hourly-summaries/{date}`、`/v1/apps/*`、`/v1/screenshots/capture`、小时汇总、时间线 JSON 导出与记忆合成均补齐隐私过滤；非 webhook 本地端点增加 `Host` 头校验防 DNS rebinding；修改隐私规则时自动清空旧小时汇总缓存。
+  - **隐私规则与密钥脱敏**：修复纯后缀（如 `.exe`）归一化为空串导致全应用匹配、遗留 `excluded_apps` 被 `Anonymized` 降级与同应用别名遮蔽的问题；统一应用名归一化与隐私脱敏正则（支持多行 PEM、JSON 引号密码及 CJK 边界，先匹配银行卡/身份证再匹配手机号）；WebDAV 推送串行化，首次开启配置同步时先拉取远端避免用默认值覆盖，远端拉取增加 2 MiB 体积上限。
+  - **Bot 与加密**：补齐飞书 `Encrypt Key` AES-256-CBC 事件解密与 `message_id` 路径校验；修复企业微信加密侧 32 字节 PKCS#7 填充、XML CDATA 字段注入与 `verify` 校验 `receiving_id`；钉钉 `sessionWebhook` 拒绝普通自定义机器人路径；Telegram 仅响应私聊并补齐 5 次绑定失败作废与 32-bit 绑定码；统一防重放时间戳差值溢出与授权前/后分桶去重。
+  - **助手 SSRF 与工具隔离**：收紧 IPv6 为全球单播 `2000::/3` 白名单（拦截 NAT64 / SIIT / 6to4 / Teredo / 文档段 / 站点本地），拒绝带认证信息（`userinfo@`）与单标签内网主机名；禁用自动重定向并改为逐跳预解析 + 禁止 HTTPS→HTTP 降级；搜索 API 响应与流式单行缓冲设体积上限并修复流式 EOF 残行丢失与 UTF-8 BOM。
+  - **Windows 截图遮罩与 WebView 防护**：遮罩排除本应用透明桌宠、`WDA_EXCLUDEFROMCAPTURE` 窗口与非矩形裁剪区窗口，支持 UWP（`ApplicationFrameHost`）子进程名解析及受保护进程标题分段匹配，跳过本进程 `GetWindowTextW` 防死锁；导航守卫按平台与端口收敛，主窗口与桌宠均拒绝 `on_new_window` 弹窗，CSP 增加 `form-action 'none'; base-uri 'self'; object-src 'none'`，移除未使用的 `tauri_plugin_fs`，前端链接拦截扩展至 `auxclick` / `<area>` / SPA 路由 / 表单提交并加固 DOMPurify 与时间线/更新外链校验。
+
+### 修复
+- **默认模型与 OpenAI 推理模型兼容**：默认模型更新为 OpenAI `gpt-6.2-sol`、Gemini `gemini-4-hydrogen`、DeepSeek `deepseek-flash`、Qwen `qwen3.8-flash`、Kimi `kimi-k3` 与 MiniMax `MiniMax-M3.1-Flash`；OpenAI 推理模型统一使用 `max_completion_tokens` 并省略不支持的采样参数，按连接测试、分类、截图分析与报告任务设置输出预算及推理强度。空白 AI 响应不再被当作生成成功，日报会回退到基础模板并说明原因。
+- **Obsidian 增量导出保留原笔记**：读取已有笔记失败时立即中止导出，仅文件不存在时新建；写入复用独占临时文件与原子替换，避免编码不兼容或写入失败损坏手写内容。
+- **隐私规则变更后周报 / 月报缓存失效**：本地设置与 WebDAV 同步统一原子清空小时摘要及所有语言的周期复盘缓存；清理失败时中止配置保存，生成期间规则变化时拒绝写回旧结果。
+- **助手流式回复中文乱码**：按字节缓冲后再解码，多字节字符跨网络分块时不再出现 "�"。
+- **企业微信回调加解密失败**：加解密两侧均按企业微信 32 字节块规范处理 PKCS#7 填充。
+- **夏令时导致小时摘要任务退出与日期偏差**：休眠时长改为按秒计算，跨零点与春季跳过小时的目标时间改用安全日期算术。
+- **时间线图标与缩略图不刷新**：异步加载完成后即时显示，加载失败时正确回退；时间线隐私策略回显改为忽略大小写匹配。
+- **活动轮询间隔设置易不生效（#191）**：将「设置 → 存储」中的轮询间隔滑块下限由 10 秒对齐至 5 秒并支持整数四舍五入，调整轮询间隔后通过 `patch_config` 局部自动保存，避免切页或未点顶部保存时静默丢失；同步修正四种语言的最小值提示文案。
+- **页面旧配置整份写回**：日报提示词 / 预设、主题、记忆合成日期、轮询间隔改为局部更新（新增 `patch_config`），时间线隐私规则改为服务端单条更新（新增 `set_app_privacy_level`），均在同一把状态锁内完成读-改-写，不再覆盖托盘、段落偏好等刚做的修改；设置页整份保存时保留后端维护的 Bot 发送者绑定与 Telegram 绑定码；接入管理与存储页自动保存不再误留脏状态。
+
+### 变更与兼容
+- **需要重新绑定**：飞书 / 钉钉 / 企业微信 Bot 升级后会拒绝所有未绑定成员的查询，请在设置页生成绑定码重新授权。
+- **本地 API**：`/v1/timeline/{date}`、`/v1/activities/{date}` 默认不再返回 OCR 文本（需本机 `localhost_api_include_ocr: true` 且请求带 `?include_ocr=true`），默认 500 条、上限 2000 条；时间线、活动与日报接口的非法日期返回错误。`/v1/weekly-review` 不再引用 OCR 与脱敏应用标题。
+- **MCP**：默认不再返回 OCR 原文、活动搜索的 OCR 摘要与截图路径，会话 / 意图不再基于 OCR 提取关键词；窗口标题不再截断。`mcp_include_ocr` 与 `localhost_api_include_ocr` 暂无设置页开关，需在 `config.json` 中手动开启。
+- **导出**：区间 Markdown 与时间线 JSON 导出成功后返回规范化后的绝对路径（Windows 下去掉 `\\?\` 前缀后展示）。
+- **配置同步**：旧版本客户端会拒绝新的 v2 同步文件；请在所有设备升级后再开启同步。旧版客户端仍会上传含密钥的整份配置，新版拉取时会将其改写为脱敏快照。
+- **依赖**：`src-tauri` 显式声明已在依赖树中的 `hyper 0.14`（`client` + `tcp`，仅用于自定义 DNS 解析器的类型），不引入新代码。
+- **数据库与默认开关（M3）**：SQLite Schema 升级至 `user_version = 3`（向后兼容增量建表 `memory_reindex_dates` 与 `period_reviews`）；新备份不支持直接恢复到旧版本客户端；隐私优先默认值包括 `skip_private_windows = true`、`semantic_auto_index = false`、`bot_natural_language_enabled = false`，且后台自动索引与 Bot 自然语言问答开关均不参与 WebDAV 配置同步。
+
+### 已知边界
+- 截图遮罩仅 Windows；macOS / Linux 仍按前台应用判断。使用 DirectComposition 的透明浮层仍计为遮挡物（Chrome、Windows Terminal 等常规窗口同样使用该技术，按透明处理会大面积误遮），其下方敏感窗口可能不被遮罩。
+- Bot 在群聊中的回复对全群可见（与此前一致）；企业微信回调与智能机器人共用一份绑定名单；任何成员可用 5 次错误绑定码使当前绑定码作废（需重新生成）。
+- 助手 `web_search` 的查询词仍会发送到所配置的搜索服务；配置系统代理时，重定向目标只做字面量地址检查。
+- 本地 Windows 前端类型检查、795 项 Node 测试、20 项组件测试与生产构建通过；Rust workspace 905 项测试通过、2 项忽略，格式与 Clippy 零警告检查通过。发布产物仍须通过本次标签触发的五平台构建、签名及附件完整性门禁。
+- 自动检查与构建不等于真实桌面验收；安装升级、跨电脑便携启动、长时间 OCR / 采集运行、Windows 待机及 macOS / Linux 真机交互仍需验证。macOS 保留 ad-hoc 签名，更新后可能需要重新授权。
+
 ## [1.1.4-rc.2] - 2026-11-11
 
 1.1.4 的第二个候选版本，汇总 rc.1 后的 Windows 便携模式、桌宠透明恢复与数据迁移保护。仅供测试，不替换正式版 `1.1.3` 的 Latest，不改写已发布的 `v1.1.4-rc.1`。安装／迁移前请先完整备份数据。

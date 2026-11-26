@@ -17,9 +17,40 @@ use work_review_skills_engine::model::Permission as SkillPermission;
 struct AppState {
     db: Database,
     config: AppConfig,
+    config_path: std::path::PathBuf,
+    config_meta: Option<(std::time::SystemTime, u64)>,
     localhost_api_token_path: std::path::PathBuf,
     policy: PolicyEnforcer,
     skills: SkillEngine,
+}
+
+fn read_file_meta(path: &std::path::Path) -> Option<(std::time::SystemTime, u64)> {
+    let meta = std::fs::metadata(path).ok()?;
+    Some((meta.modified().ok()?, meta.len()))
+}
+
+impl AppState {
+    /// 按配置文件 mtime/len 热重载 `AppConfig` 与 `PolicyEnforcer`，确保长驻 MCP 会话
+    /// 及时生效新增隐私规则、关闭 `mcp_server_enabled` 或切换 `mcp_include_ocr`。
+    fn reload_config_if_changed(&mut self) {
+        let current_meta = read_file_meta(&self.config_path);
+        if current_meta.is_none() || current_meta == self.config_meta {
+            return;
+        }
+        match AppConfig::load(&self.config_path) {
+            Ok(cfg) => {
+                self.policy.update_from_config(&cfg);
+                self.config = cfg;
+                self.config_meta = current_meta;
+            }
+            Err(e) => {
+                log::warn!(
+                    "热重载配置文件 {} 失败，继续沿用当前配置: {e}",
+                    self.config_path.display()
+                );
+            }
+        }
+    }
 }
 
 fn main() {
@@ -100,10 +131,13 @@ fn main() {
         policy.register_skill_permissions(&pkg.id, perms);
     }
 
+    let config_meta = read_file_meta(&config_path);
     let state = Arc::new(Mutex::new(AppState {
         db,
         config,
         localhost_api_token_path: localhost_api_token_path(&config_path),
+        config_path,
+        config_meta,
         policy,
         skills,
     }));
@@ -277,6 +311,7 @@ fn read_localhost_api_token(token_path: &std::path::Path) -> Option<String> {
 
 /// 返回主应用 localhost API 的 base URL（如 "http://127.0.0.1:47831"）。
 /// 仅当 localhost_api_enabled = true 且端口有效时返回 Some。
+/// 当配置为通配监听地址（0.0.0.0 / ::）时，本机自调用固定走 127.0.0.1。
 fn localhost_api_base(config: &AppConfig) -> Option<String> {
     if !config.localhost_api_enabled {
         return None;
@@ -286,11 +321,21 @@ fn localhost_api_base(config: &AppConfig) -> Option<String> {
     } else {
         config.localhost_api_port
     };
-    let host = config
+    let raw_host = config
         .localhost_api_host
         .as_deref()
-        .filter(|h| !h.trim().is_empty())
-        .unwrap_or("127.0.0.1");
+        .map(str::trim)
+        .unwrap_or("");
+    let host = if raw_host.is_empty()
+        || raw_host == "0.0.0.0"
+        || raw_host == "::"
+        || raw_host == "[::]"
+        || raw_host.eq_ignore_ascii_case("localhost")
+    {
+        "127.0.0.1"
+    } else {
+        raw_host
+    };
     Some(format!("http://{host}:{port}"))
 }
 
@@ -484,6 +529,10 @@ where
     F: FnOnce(&mut AppState) -> Value,
 {
     let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
+    s.reload_config_if_changed();
+    if !s.config.mcp_server_enabled {
+        return tool_error("MCP Server 已在 Work Review 设置中关闭");
+    }
     let source = CallSource::McpTool {
         tool_name: tool_name.to_string(),
         client_id: None,
@@ -525,7 +574,21 @@ fn sanitize_result(result: &mut Value) {
     }
 }
 
-/// 递归脱敏 JSON Value：删除已知敏感字段，截断潜在敏感字段。
+/// 去除旧版小时摘要中可能附带的 OCR 关键词尾段（`，涉及: ...`）。
+fn strip_hourly_ocr_suffix(text: &str) -> String {
+    if let Some((prefix, _)) = text.split_once("，涉及:") {
+        prefix.trim().to_string()
+    } else if let Some((prefix, _)) = text.split_once(", involving:") {
+        prefix.trim().to_string()
+    } else {
+        text.to_string()
+    }
+}
+
+/// 递归脱敏 JSON Value：删除已知敏感字段。
+///
+/// 窗口标题不截断：采集时已经过敏感信息过滤与脱敏规则，且是 MCP 客户端理解上下文的主要依据；
+/// 高风险的是整屏 OCR 文本、截图与可执行文件路径，这些字段整体删除。
 fn sanitize_value(value: &mut Value) {
     match value {
         Value::Object(obj) => {
@@ -534,12 +597,20 @@ fn sanitize_value(value: &mut Value) {
             obj.remove("screenshot_url");
             obj.remove("executable_path");
             obj.remove("ocr_text");
-            // 截断：窗口标题常包含具体文件名/网页标题，截前 40 字符保留 app 上下文即可
-            if let Some(title) = obj.get_mut("window_title") {
-                if let Some(s) = title.as_str() {
-                    let head: String = s.chars().take(40).collect();
-                    let suffix = if s.chars().count() > 40 { "…" } else { "" };
-                    *title = Value::String(format!("{head}{suffix}"));
+            // 活动类搜索结果的摘要优先取自 OCR 原文（见 Database::search_memory），同样删除。
+            // 注意 MemorySearchItem 带 #[serde(rename_all = "camelCase")]，序列化键为 sourceType。
+            let source_type = obj
+                .get("sourceType")
+                .or_else(|| obj.get("source_type"))
+                .and_then(Value::as_str);
+            if source_type == Some("activity") {
+                obj.remove("excerpt");
+            } else if source_type == Some("hourly_summary") {
+                if let Some(excerpt) = obj.get("excerpt").and_then(Value::as_str) {
+                    obj.insert(
+                        "excerpt".to_string(),
+                        Value::String(strip_hourly_ocr_suffix(excerpt)),
+                    );
                 }
             }
             // 递归处理嵌套对象
@@ -593,9 +664,7 @@ fn load_daily_stats_for_mcp(
 
 fn filter_activities_by_privacy(activities: Vec<Activity>, config: &AppConfig) -> Vec<Activity> {
     let (ignored_apps, excluded_domains) = collect_privacy_filters(config);
-    use work_review_core::privacy::{PrivacyAction, PrivacyFilter};
-
-    let privacy = PrivacyFilter::from_config(&config.privacy);
+    let privacy = work_review_core::privacy::PrivacyFilter::from_config(&config.privacy);
 
     activities
         .into_iter()
@@ -608,20 +677,15 @@ fn filter_activities_by_privacy(activities: Vec<Activity>, config: &AppConfig) -
                     .map(|url| !matches_excluded_domain(url, &excluded_domains))
                     .unwrap_or(true)
         })
-        // 第二层：anonymized 级别 → 脱敏标题/URL（与主应用行为一致）
+        // 第二层：脱敏应用 / 标题命中敏感关键词 → 与主应用共用的对外脱敏。
+        // OCR 在这里按 mcp_include_ocr 直接清空：会话 / 意图等派生结果会从 OCR 提取关键词，
+        // 只在输出阶段删除 ocr_text 字段挡不住这些派生内容。
         .map(|mut activity| {
-            let action = privacy.check_privacy_full(
-                &activity.app_name,
-                &activity.window_title,
-                activity.browser_url.as_deref(),
+            work_review_core::privacy::sanitize_activity_for_external(
+                &privacy,
+                &mut activity,
+                config.mcp_include_ocr,
             );
-            if action == PrivacyAction::Anonymize {
-                activity.window_title = "[内容已脱敏]".to_string();
-                activity.browser_url = None;
-                // 可执行文件路径与远程截图 URL 同样可能暴露脱敏应用的信息，一并清空
-                activity.executable_path = None;
-                activity.screenshot_url = None;
-            }
             activity
         })
         .collect()
@@ -632,14 +696,13 @@ fn filter_memory_results_by_privacy(
     config: &AppConfig,
 ) -> Vec<MemorySearchItem> {
     let (ignored_apps, excluded_domains) = collect_privacy_filters(config);
-    use work_review_core::privacy::{PrivacyAction, PrivacyFilter};
-
-    let privacy = PrivacyFilter::from_config(&config.privacy);
+    let privacy = work_review_core::privacy::PrivacyFilter::from_config(&config.privacy);
 
     results
         .into_iter()
         .filter(|item| {
-            item.app_name
+            let not_ignored = item
+                .app_name
                 .as_deref()
                 .map(|app| !matches_ignored_app(app, &ignored_apps))
                 .unwrap_or(true)
@@ -647,14 +710,28 @@ fn filter_memory_results_by_privacy(
                     .browser_url
                     .as_deref()
                     .map(|url| !matches_excluded_domain(url, &excluded_domains))
-                    .unwrap_or(true)
+                    .unwrap_or(true);
+            if !not_ignored {
+                return false;
+            }
+            // 活动类搜索结果若命中脱敏/忽略规则直接剔除，避免通过 `[内容已脱敏]` 命中条数做关键词探测
+            if item.source_type == "activity" {
+                return privacy.check_privacy_full(
+                    item.app_name.as_deref().unwrap_or(""),
+                    &item.title,
+                    item.browser_url.as_deref(),
+                ) == work_review_core::privacy::PrivacyAction::Record;
+            }
+            true
         })
         .map(|mut item| {
-            let app = item.app_name.as_deref().unwrap_or("");
-            let action = privacy.check_privacy_full(app, &item.title, item.browser_url.as_deref());
-            if action == PrivacyAction::Anonymize {
-                item.title = "[内容已脱敏]".to_string();
-                item.browser_url = None;
+            work_review_core::privacy::sanitize_memory_item_for_external(&privacy, &mut item);
+            if !config.mcp_include_ocr {
+                if item.source_type == "activity" {
+                    item.excerpt.clear();
+                } else if item.source_type == "hourly_summary" {
+                    item.excerpt = strip_hourly_ocr_suffix(&item.excerpt);
+                }
             }
             item
         })
@@ -662,10 +739,18 @@ fn filter_memory_results_by_privacy(
 }
 
 fn handle_tool_call(name: &str, args: &Value, state: &Arc<Mutex<AppState>>) -> Value {
+    // 单次返回上限：避免外部客户端一次拉走整天/全库的原始记录
+    const MAX_TIMELINE_LIMIT: u64 = 500;
+    const MAX_SEARCH_LIMIT: u64 = 200;
     match name {
         "query_timeline" => with_policy_check(state, name, Permission::ReadActivities, |s| {
             let date = args["date"].as_str().unwrap_or("");
-            let limit = args["limit"].as_u64().map(|l| l as u32);
+            let limit = Some(
+                args["limit"]
+                    .as_u64()
+                    .unwrap_or(200)
+                    .clamp(1, MAX_TIMELINE_LIMIT) as u32,
+            );
             let offset = args["offset"].as_u64().map(|o| o as u32);
             match s.db.get_timeline(date, limit, offset) {
                 Ok(activities) => {
@@ -690,8 +775,17 @@ fn handle_tool_call(name: &str, args: &Value, state: &Arc<Mutex<AppState>>) -> V
             let query = args["query"].as_str().unwrap_or("");
             let date_from = args["date_from"].as_str();
             let date_to = args["date_to"].as_str();
-            let limit = args["limit"].as_u64().unwrap_or(50) as usize;
-            match s.db.search_memory(query, date_from, date_to, limit) {
+            let limit = args["limit"]
+                .as_u64()
+                .unwrap_or(50)
+                .clamp(1, MAX_SEARCH_LIMIT) as usize;
+            match s.db.search_memory_with_options(
+                query,
+                date_from,
+                date_to,
+                limit,
+                s.config.mcp_include_ocr,
+            ) {
                 Ok(results) => {
                     let results = filter_memory_results_by_privacy(results, &s.config);
                     json!({
@@ -802,6 +896,27 @@ fn handle_tool_call(name: &str, args: &Value, state: &Arc<Mutex<AppState>>) -> V
                     .get("is_live")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
+                let suppressed = ctx
+                    .get("suppressed")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                if suppressed {
+                    let context = json!({
+                        "primary_app": "",
+                        "window_title": "",
+                        "browser_url": Value::Null,
+                        "recent_apps": ctx.get("recent_apps"),
+                        "is_live": false,
+                        "suppressed": true,
+                        "hint": "当前前台窗口受隐私规则保护，已隐藏",
+                    });
+                    return json!({
+                        "content": [{
+                            "type": "text",
+                            "text": serde_json::to_string_pretty(&context).unwrap_or_default()
+                        }]
+                    });
+                }
                 if !primary_app.is_empty() {
                     let context = json!({
                         "primary_app": primary_app,
@@ -985,6 +1100,10 @@ fn resources_list() -> Vec<Value> {
 
 fn handle_resource_read(uri: &str, state: &Arc<Mutex<AppState>>) -> Value {
     let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
+    s.reload_config_if_changed();
+    if !s.config.mcp_server_enabled {
+        return resource_result(uri, "MCP Server 已在 Work Review 设置中关闭");
+    }
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
 
     // resources/read 必须与 tools/call 一样经过权限策略 + 脱敏。之前直接 get_timeline
@@ -1027,10 +1146,12 @@ fn handle_resource_read(uri: &str, state: &Arc<Mutex<AppState>>) -> Value {
         },
         "stats/weekly" => {
             let mut weekly = Vec::new();
-            for i in 0..7 {
-                let date = (chrono::Local::now() - chrono::Duration::days(i))
-                    .format("%Y-%m-%d")
-                    .to_string();
+            let today_naive = chrono::Local::now().date_naive();
+            for i in 0..7u64 {
+                let date = today_naive
+                    .checked_sub_days(chrono::Days::new(i))
+                    .map(|d| d.format("%Y-%m-%d").to_string())
+                    .unwrap_or_else(|| today.clone());
                 if let Ok(stats) = load_daily_stats_for_mcp(&s, &date) {
                     weekly.push(json!({ "date": date, "total_duration": stats.total_duration, "screenshot_count": stats.screenshot_count }));
                 }
@@ -1463,6 +1584,35 @@ mod tests {
     }
 
     #[test]
+    fn mcp默认在构建会话前清空ocr_仅显式开启才保留() {
+        let activity = Activity {
+            id: Some(1),
+            timestamp: 0,
+            app_name: "Code".to_string(),
+            window_title: "main.rs".to_string(),
+            screenshot_path: String::new(),
+            ocr_text: Some("账户 6222 屏幕内容".to_string()),
+            category: "development".to_string(),
+            duration: 60,
+            browser_url: None,
+            executable_path: None,
+            semantic_category: None,
+            semantic_confidence: None,
+            screenshot_url: None,
+        };
+        let mut config = AppConfig::default();
+        let filtered = filter_activities_by_privacy(vec![activity.clone()], &config);
+        assert!(
+            filtered[0].ocr_text.is_none(),
+            "默认不得把 OCR 交给会话 / 意图等派生计算"
+        );
+
+        config.mcp_include_ocr = true;
+        let filtered = filter_activities_by_privacy(vec![activity], &config);
+        assert!(filtered[0].ocr_text.is_some());
+    }
+
+    #[test]
     fn sanitize_value_应移除screenshot_path() {
         let mut v = json!({
             "id": 1,
@@ -1488,14 +1638,61 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_value_应截断过长的window_title() {
-        let long_title = "a".repeat(80);
-        let mut v = json!({ "window_title": long_title });
+    fn sanitize_value_应删除活动搜索结果的ocr摘要但保留日报摘要() {
+        // 使用真实的 MemorySearchItem 序列化结果（camelCase: sourceType），避免手写 snake_case 假阳性
+        let items = vec![
+            MemorySearchItem {
+                source_type: "activity".to_string(),
+                source_id: Some(1),
+                date: "2026-11-23".to_string(),
+                timestamp: 1_700_000_000,
+                title: "main.rs".to_string(),
+                excerpt: "OCR: password=123".to_string(),
+                app_name: Some("Code".to_string()),
+                browser_url: None,
+                duration: Some(60),
+                score: 200,
+            },
+            MemorySearchItem {
+                source_type: "hourly_summary".to_string(),
+                source_id: Some(2),
+                date: "2026-11-23".to_string(),
+                timestamp: 1_700_000_000,
+                title: "2026-11-23 10:00 小时摘要".to_string(),
+                excerpt: "主要使用 Code，涉及: secret_token_xyz".to_string(),
+                app_name: None,
+                browser_url: None,
+                duration: Some(1200),
+                score: 180,
+            },
+            MemorySearchItem {
+                source_type: "daily_report".to_string(),
+                source_id: None,
+                date: "2026-11-23".to_string(),
+                timestamp: 1_700_000_000,
+                title: "日报".to_string(),
+                excerpt: "今日完成了...".to_string(),
+                app_name: None,
+                browser_url: None,
+                duration: None,
+                score: 160,
+            },
+        ];
+        let mut v = serde_json::to_value(&items).unwrap();
+        assert_eq!(v[0]["sourceType"], json!("activity"));
         sanitize_value(&mut v);
-        let truncated = v["window_title"].as_str().unwrap();
-        assert!(truncated.ends_with('…'));
-        // 40 字 + 省略号
-        assert_eq!(truncated.chars().count(), 41);
+        assert!(v[0].get("excerpt").is_none());
+        assert_eq!(v[0]["title"], json!("main.rs"));
+        assert_eq!(v[1]["excerpt"], json!("主要使用 Code"));
+        assert_eq!(v[2]["excerpt"], json!("今日完成了..."));
+    }
+
+    #[test]
+    fn sanitize_value_应保留完整window_title() {
+        let long_title = "a".repeat(80);
+        let mut v = json!({ "window_title": long_title.clone() });
+        sanitize_value(&mut v);
+        assert_eq!(v["window_title"], json!(long_title));
     }
 
     #[test]
@@ -1550,5 +1747,24 @@ mod tests {
         });
         sanitize_result(&mut result);
         assert_eq!(result["content"][0]["text"].as_str().unwrap(), original);
+    }
+
+    #[test]
+    fn mcp局域网通配监听地址下自调用应固定走127() {
+        let mut config = AppConfig::default();
+        config.localhost_api_enabled = true;
+        config.localhost_api_port = 47831;
+
+        config.localhost_api_host = Some("0.0.0.0".to_string());
+        assert_eq!(
+            localhost_api_base(&config).as_deref(),
+            Some("http://127.0.0.1:47831")
+        );
+
+        config.localhost_api_host = Some("::".to_string());
+        assert_eq!(
+            localhost_api_base(&config).as_deref(),
+            Some("http://127.0.0.1:47831")
+        );
     }
 }

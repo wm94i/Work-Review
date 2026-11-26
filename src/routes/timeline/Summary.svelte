@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { replace, params } from 'svelte-spa-router';
+  import { replace, router } from 'svelte-spa-router';
   import { t } from '$lib/i18n/index.ts';
   import { isValidLocalDateString } from '$lib/utils/dateValidation.ts';
 
@@ -12,7 +12,10 @@
   onMount(() => {
     const hash = typeof window !== 'undefined' ? window.location.hash : '';
     const match = hash.match(/summary\/(\d{4}-\d{2}-\d{2})(?:[/?#]|$)/);
-    const routeDate = match?.[1] ?? $params?.date;
+    const routeParams = router.params;
+    const paramDate =
+      routeParams && !Array.isArray(routeParams) ? routeParams.date : undefined;
+    const routeDate = match?.[1] ?? paramDate;
     const date = isValidLocalDateString(routeDate) ? routeDate : getLocalDateString();
     const target = `/timeline?date=${date}&summary=1`;
     replace(target);

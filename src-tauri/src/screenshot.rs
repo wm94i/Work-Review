@@ -3,7 +3,7 @@ use crate::linux_session::{current_linux_desktop_environment, current_linux_desk
 #[cfg(any(target_os = "linux", test))]
 use crate::linux_session::{LinuxDesktopEnvironment, LinuxDesktopSession};
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
-#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux", test))]
 use image::DynamicImage;
 #[cfg(target_os = "macos")]
 use image::RgbaImage;
@@ -11,6 +11,8 @@ use image::{imageops::FilterType, ColorType};
 #[cfg(any(target_os = "linux", test))]
 use regex::Regex;
 use std::io::Cursor;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+use std::io::Read;
 use std::path::{Path, PathBuf};
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::process::{Command, Output, Stdio};
@@ -22,7 +24,9 @@ use std::{
     collections::hash_map::DefaultHasher,
     hash::{Hash, Hasher},
 };
-use work_review_core::config::{ScreenshotDisplayMode, ScreenshotWidthMode, StorageConfig};
+use work_review_core::config::{
+    PrivacyConfig, ScreenshotDisplayMode, ScreenshotWidthMode, StorageConfig,
+};
 use work_review_core::error::{AppError, Result};
 
 #[cfg(target_os = "linux")]
@@ -153,6 +157,17 @@ pub struct ScreenshotResult {
     pub timestamp: i64,
     pub width: u32,
     pub height: u32,
+    /// 采集时在内存中计算好的 64-bit dHash，供空闲判定与去重复用（避免二次磁盘解码）
+    pub image_hash: Option<u64>,
+}
+
+/// 合并路径轻量化截屏结果（不落盘归档 JPEG，仅在需要 OCR 且画面变化时写出临时 OCR PNG）
+#[derive(Debug, Clone)]
+pub struct MergeCaptureResult {
+    pub image_hash: u64,
+    pub ocr_source_path: Option<PathBuf>,
+    #[allow(dead_code)]
+    pub timestamp: i64,
 }
 
 /// 截屏服务配置
@@ -195,10 +210,27 @@ const SCREENSHOT_COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn run_screenshot_command_with_timeout(command: &mut Command, context: &str) -> Result<Output> {
-    command.stdout(Stdio::null()).stderr(Stdio::null());
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = command
         .spawn()
         .map_err(|error| AppError::Screenshot(format!("{context} 启动失败: {error}")))?;
+
+    // 在独立线程持续排空 stdout/stderr，既保留 xrandr / gdbus 等查询输出，又避免管道写满阻塞子进程。
+    let stdout_handle = child.stdout.take().map(|mut pipe| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = pipe.read_to_end(&mut buf);
+            buf
+        })
+    });
+    let stderr_handle = child.stderr.take().map(|mut pipe| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = pipe.read_to_end(&mut buf);
+            buf
+        })
+    });
+
     let started_at = std::time::Instant::now();
     let status = loop {
         match child.try_wait() {
@@ -222,10 +254,17 @@ fn run_screenshot_command_with_timeout(command: &mut Command, context: &str) -> 
         }
     };
 
+    let stdout = stdout_handle
+        .and_then(|handle| handle.join().ok())
+        .unwrap_or_default();
+    let stderr = stderr_handle
+        .and_then(|handle| handle.join().ok())
+        .unwrap_or_default();
+
     Ok(Output {
         status,
-        stdout: Vec::new(),
-        stderr: Vec::new(),
+        stdout,
+        stderr,
     })
 }
 
@@ -235,6 +274,9 @@ pub struct ScreenshotService {
     data_dir: PathBuf,
     config: ScreenshotConfig,
     capture_lock: Arc<Mutex<()>>,
+    /// 截图遮罩所用的隐私规则（随配置保存同步更新）。
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    privacy: PrivacyConfig,
 }
 
 impl ScreenshotService {
@@ -244,6 +286,7 @@ impl ScreenshotService {
             data_dir: data_dir.to_path_buf(),
             config: ScreenshotConfig::from(storage_config),
             capture_lock: Arc::new(Mutex::new(())),
+            privacy: PrivacyConfig::default(),
         }
     }
 
@@ -251,16 +294,46 @@ impl ScreenshotService {
         self.config = ScreenshotConfig::from(storage_config);
     }
 
+    /// 更新截图遮罩所用的隐私规则。
+    pub fn update_privacy(&mut self, privacy: &PrivacyConfig) {
+        self.privacy = privacy.clone();
+    }
+
     #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
     pub fn capture_for_window(
         &self,
         active_window: Option<&crate::monitor::ActiveWindow>,
     ) -> Result<ScreenshotResult> {
+        self.capture_for_window_with_options(active_window, true)
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+    pub fn capture_for_window_with_options(
+        &self,
+        active_window: Option<&crate::monitor::ActiveWindow>,
+        need_ocr_source: bool,
+    ) -> Result<ScreenshotResult> {
         let _capture_guard = self
             .capture_lock
             .lock()
             .map_err(|e| AppError::Screenshot(format!("截图任务锁异常: {e}")))?;
-        self.capture_impl(active_window)
+        self.capture_impl(active_window, need_ocr_source)
+    }
+
+    /// 合并路径专用采集：仅在内存计算 dHash 做空闲判定与画面去重，不编码/删除归档 JPEG，
+    /// 只有 `need_ocr == true` 且画面相似度 <= 90% 时才落盘临时 OCR PNG。
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+    pub fn capture_for_merge_ocr(
+        &self,
+        active_window: Option<&crate::monitor::ActiveWindow>,
+        last_hash: u64,
+        need_ocr: bool,
+    ) -> Result<MergeCaptureResult> {
+        let _capture_guard = self
+            .capture_lock
+            .lock()
+            .map_err(|e| AppError::Screenshot(format!("截图任务锁异常: {e}")))?;
+        self.capture_merge_impl(active_window, last_hash, need_ocr)
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
@@ -275,6 +348,26 @@ impl ScreenshotService {
         self.capture_impl()
     }
 
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+    pub fn capture_for_window_with_options(
+        &self,
+        _active_window: Option<&crate::monitor::ActiveWindow>,
+        _need_ocr_source: bool,
+    ) -> Result<ScreenshotResult> {
+        self.capture_for_window(None)
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+    pub fn capture_for_merge_ocr(
+        &self,
+        _active_window: Option<&crate::monitor::ActiveWindow>,
+        _last_hash: u64,
+        _need_ocr: bool,
+    ) -> Result<MergeCaptureResult> {
+        Err(AppError::Screenshot("当前平台不支持截屏".to_string()))
+    }
+
+    #[allow(dead_code)]
     pub fn capture(&self) -> Result<ScreenshotResult> {
         self.capture_for_window(None)
     }
@@ -286,6 +379,7 @@ impl ScreenshotService {
     fn capture_impl(
         &self,
         active_window: Option<&crate::monitor::ActiveWindow>,
+        need_ocr_source: bool,
     ) -> Result<ScreenshotResult> {
         // 生成文件路径
         let now = chrono::Local::now();
@@ -295,46 +389,64 @@ impl ScreenshotService {
         let screenshots_dir = self.data_dir.join("screenshots").join(&date_str);
         std::fs::create_dir_all(&screenshots_dir)?;
 
-        if should_capture_all_displays(&self.config) {
-            return match self.capture_with_gdi(None) {
-                Ok((pixels, width, height)) => self.persist_rgba_capture(
-                    &pixels,
-                    width,
-                    height,
-                    &screenshots_dir,
-                    &time_str,
-                    now.timestamp(),
-                ),
-                Err(e) => Err(AppError::Screenshot(format!("全屏幕截图失败: {e}"))),
-            };
-        }
+        // 截图前先记录一次敏感区域：截图期间窗口移动 / 置顶也不会漏遮（截图后再取一次并集）
+        let target_window = if should_capture_all_displays(&self.config) {
+            None
+        } else {
+            active_window
+        };
+        let pre_capture_regions = self.sensitive_regions(target_window)?;
 
         // 优先使用 GDI BitBlt（静默，无边框闪烁）
-        match self.capture_with_gdi(active_window) {
-            Ok((pixels, width, height)) => {
+        match self.capture_with_gdi(target_window) {
+            Ok((mut pixels, width, height, origin_x, origin_y)) => {
+                self.mask_sensitive_windows(
+                    &mut pixels,
+                    width,
+                    height,
+                    origin_x,
+                    origin_y,
+                    &pre_capture_regions,
+                )?;
                 return self.persist_rgba_capture(
-                    &pixels,
+                    pixels,
                     width,
                     height,
                     &screenshots_dir,
                     &time_str,
                     now.timestamp(),
+                    need_ocr_source,
                 );
+            }
+            Err(e) if target_window.is_none() && should_capture_all_displays(&self.config) => {
+                return Err(AppError::Screenshot(format!("全屏幕截图失败: {e}")));
             }
             Err(e) => {
                 log::warn!("GDI BitBlt 失败: {e}，降级到 Windows Graphics Capture");
             }
         }
 
+        // WGC 降级路径产出的是文件，不经过像素遮罩：截图前后任一时刻截图范围内有敏感窗口，
+        // 都放弃本次截图。
+        const WGC_SKIP_MESSAGE: &str =
+            "截图范围内存在隐私规则要求遮挡的窗口，降级截图路径无法遮罩，已跳过本次截图";
+        if !pre_capture_regions.is_empty() {
+            return Err(AppError::Screenshot(WGC_SKIP_MESSAGE.to_string()));
+        }
+
         // 降级使用 Windows Graphics Capture API（可能显示黄色边框）
         match self.capture_with_wgc(&screenshots_dir, &time_str, active_window) {
             Ok(result) => {
                 let _temp_guard = TemporaryCaptureFile::new(&result.0);
+                if !self.sensitive_regions(active_window)?.is_empty() {
+                    return Err(AppError::Screenshot(WGC_SKIP_MESSAGE.to_string()));
+                }
                 self.persist_existing_png_capture(
                     &result.0,
                     &screenshots_dir,
                     &time_str,
                     now.timestamp(),
+                    need_ocr_source,
                 )
             }
             Err(e) => {
@@ -344,6 +456,74 @@ impl ScreenshotService {
                 )))
             }
         }
+    }
+
+    #[cfg(target_os = "windows")]
+    fn capture_merge_impl(
+        &self,
+        active_window: Option<&crate::monitor::ActiveWindow>,
+        last_hash: u64,
+        need_ocr: bool,
+    ) -> Result<MergeCaptureResult> {
+        let now = chrono::Local::now();
+        let date_str = now.format("%Y-%m-%d").to_string();
+        let time_str = now.format("%H%M%S_%3f").to_string();
+        let screenshots_dir = self.data_dir.join("screenshots").join(&date_str);
+
+        let target_window = if should_capture_all_displays(&self.config) {
+            None
+        } else {
+            active_window
+        };
+        let pre_capture_regions = self.sensitive_regions(target_window)?;
+
+        if let Ok((mut pixels, width, height, origin_x, origin_y)) =
+            self.capture_with_gdi(target_window)
+        {
+            self.mask_sensitive_windows(
+                &mut pixels,
+                width,
+                height,
+                origin_x,
+                origin_y,
+                &pre_capture_regions,
+            )?;
+            let img = image::RgbaImage::from_raw(width, height, pixels)
+                .ok_or_else(|| AppError::Screenshot("创建图像失败".to_string()))?;
+            let dynamic_image = DynamicImage::ImageRgba8(img);
+            return self.finalize_merge_dynamic_image(
+                dynamic_image,
+                &screenshots_dir,
+                &time_str,
+                now.timestamp(),
+                last_hash,
+                need_ocr,
+            );
+        }
+
+        // GDI 失败时回退常规采集并在去重后删除临时归档图
+        let fallback = self.capture_impl(active_window, need_ocr)?;
+        let image_hash = fallback.image_hash.unwrap_or(0);
+        let keep_ocr =
+            need_ocr && (last_hash == 0 || Self::hash_similarity(last_hash, image_hash) <= 90);
+        let ocr_source_path = if keep_ocr {
+            fallback.ocr_source_path.clone()
+        } else {
+            if let Some(ref p) = fallback.ocr_source_path {
+                let _ = std::fs::remove_file(p);
+            }
+            None
+        };
+        let _ = std::fs::remove_file(&fallback.path);
+        let thumb = Self::thumbnail_cache_path(&fallback.path);
+        if thumb != fallback.path {
+            let _ = std::fs::remove_file(&thumb);
+        }
+        Ok(MergeCaptureResult {
+            image_hash,
+            ocr_source_path,
+            timestamp: fallback.timestamp,
+        })
     }
 
     /// 使用 Windows Graphics Capture API 截屏
@@ -527,39 +707,25 @@ impl ScreenshotService {
     fn capture_with_gdi(
         &self,
         active_window: Option<&crate::monitor::ActiveWindow>,
-    ) -> Result<(Vec<u8>, u32, u32)> {
+    ) -> Result<(Vec<u8>, u32, u32, i32, i32)> {
         use std::ptr::null_mut;
         use winapi::um::wingdi::{
             BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDIBits,
             SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, SRCCOPY,
         };
-        use winapi::um::winuser::{
-            GetDC, GetSystemMetrics, ReleaseDC, SM_CXSCREEN, SM_CXVIRTUALSCREEN, SM_CYSCREEN,
-            SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
-        };
+        use winapi::um::winuser::{GetDC, ReleaseDC};
+
+        // 与遮罩计算共用同一套截图范围，保证像素坐标与窗口坐标对齐
+        let (source_x, source_y, width, height) = self.capture_rect(active_window);
 
         unsafe {
-            let (source_x, source_y, width, height) = if should_capture_all_displays(&self.config) {
-                (
-                    GetSystemMetrics(SM_XVIRTUALSCREEN),
-                    GetSystemMetrics(SM_YVIRTUALSCREEN),
-                    GetSystemMetrics(SM_CXVIRTUALSCREEN) as u32,
-                    GetSystemMetrics(SM_CYVIRTUALSCREEN) as u32,
-                )
-            } else {
-                capture_target_monitor_rect(active_window).unwrap_or_else(|| {
-                    (
-                        0,
-                        0,
-                        GetSystemMetrics(SM_CXSCREEN) as u32,
-                        GetSystemMetrics(SM_CYSCREEN) as u32,
-                    )
-                })
-            };
-
             if width == 0 || height == 0 {
                 return Err(AppError::Screenshot("获取屏幕尺寸失败".to_string()));
             }
+            let pixel_bytes = (width as usize)
+                .checked_mul(height as usize)
+                .and_then(|px| px.checked_mul(4))
+                .ok_or_else(|| AppError::Screenshot("截图尺寸溢出".to_string()))?;
 
             // 获取屏幕 DC
             let screen_dc = GetDC(null_mut());
@@ -624,7 +790,7 @@ impl ScreenshotService {
                 bmiColors: [std::mem::zeroed(); 1],
             };
 
-            let mut pixels: Vec<u8> = vec![0; (width * height * 4) as usize];
+            let mut pixels: Vec<u8> = vec![0; pixel_bytes];
 
             let lines = GetDIBits(
                 mem_dc,
@@ -658,8 +824,91 @@ impl ScreenshotService {
                 source_x,
                 source_y
             );
-            Ok((pixels, width, height))
+            Ok((pixels, width, height, source_x, source_y))
         }
+    }
+
+    /// 计算当前截图范围（虚拟屏幕坐标）：全部显示器模式为整个虚拟屏幕，否则为目标显示器。
+    #[cfg(target_os = "windows")]
+    fn capture_rect(
+        &self,
+        active_window: Option<&crate::monitor::ActiveWindow>,
+    ) -> (i32, i32, u32, u32) {
+        use winapi::um::winuser::{
+            GetSystemMetrics, SM_CXSCREEN, SM_CXVIRTUALSCREEN, SM_CYSCREEN, SM_CYVIRTUALSCREEN,
+            SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+        };
+        unsafe {
+            if should_capture_all_displays(&self.config) {
+                (
+                    GetSystemMetrics(SM_XVIRTUALSCREEN),
+                    GetSystemMetrics(SM_YVIRTUALSCREEN),
+                    GetSystemMetrics(SM_CXVIRTUALSCREEN).max(0) as u32,
+                    GetSystemMetrics(SM_CYVIRTUALSCREEN).max(0) as u32,
+                )
+            } else {
+                capture_target_monitor_rect(active_window).unwrap_or_else(|| {
+                    (
+                        0,
+                        0,
+                        GetSystemMetrics(SM_CXSCREEN).max(0) as u32,
+                        GetSystemMetrics(SM_CYSCREEN).max(0) as u32,
+                    )
+                })
+            }
+        }
+    }
+
+    /// 把截图范围内可见的敏感窗口（隐私级别非"完整记录"或标题命中敏感关键词）涂黑。
+    /// 遮罩区域 = 截图前记录的区域 ∪ 截图后重新计算的区域，覆盖截图期间窗口移动 / 置顶。
+    #[cfg(target_os = "windows")]
+    fn mask_sensitive_windows(
+        &self,
+        pixels: &mut [u8],
+        width: u32,
+        height: u32,
+        origin_x: i32,
+        origin_y: i32,
+        pre_capture_regions: &[crate::screenshot_mask::MaskRect],
+    ) -> Result<()> {
+        let capture = crate::screenshot_mask::MaskRect::new(
+            origin_x,
+            origin_y,
+            origin_x.saturating_add(width as i32),
+            origin_y.saturating_add(height as i32),
+        );
+        let mut regions = crate::screenshot_mask::sensitive_regions_in(&self.privacy, &capture)
+            .ok_or_else(window_enumeration_truncated_error)?;
+        regions.extend_from_slice(pre_capture_regions);
+        if regions.is_empty() {
+            return Ok(());
+        }
+        let painted = crate::screenshot_mask::apply_mask_rgba(
+            pixels, width, height, origin_x, origin_y, &regions,
+        );
+        log::info!(
+            "截图隐私遮罩: 遮挡 {} 个区域，共 {} 像素",
+            regions.len(),
+            painted
+        );
+        Ok(())
+    }
+
+    /// 截图范围内需要遮罩的区域（窗口枚举被截断时返回错误，放弃本次截图）。
+    #[cfg(target_os = "windows")]
+    fn sensitive_regions(
+        &self,
+        active_window: Option<&crate::monitor::ActiveWindow>,
+    ) -> Result<Vec<crate::screenshot_mask::MaskRect>> {
+        let (x, y, width, height) = self.capture_rect(active_window);
+        let capture = crate::screenshot_mask::MaskRect::new(
+            x,
+            y,
+            x.saturating_add(width as i32),
+            y.saturating_add(height as i32),
+        );
+        crate::screenshot_mask::sensitive_regions_in(&self.privacy, &capture)
+            .ok_or_else(window_enumeration_truncated_error)
     }
 
     #[cfg(any(target_os = "windows", target_os = "linux"))]
@@ -669,17 +918,26 @@ impl ScreenshotService {
         screenshots_dir: &Path,
         time_str: &str,
         timestamp: i64,
+        need_ocr_source: bool,
     ) -> Result<ScreenshotResult> {
         let (archive_path, ocr_source_path) =
             capture_output_paths(&self.data_dir, screenshots_dir, time_str);
-        ensure_parent_dir(&ocr_source_path)?;
-        let persist_result = (|| -> Result<(u32, u32)> {
-            if temp_png != ocr_source_path {
-                move_or_copy_file(temp_png, &ocr_source_path)?;
-            }
+        if need_ocr_source {
+            ensure_parent_dir(&ocr_source_path)?;
+        }
+        let persist_result = (|| -> Result<(u32, u32, u64, Option<PathBuf>)> {
+            let source_for_decode = if need_ocr_source {
+                if temp_png != ocr_source_path {
+                    move_or_copy_file(temp_png, &ocr_source_path)?;
+                }
+                ocr_source_path.as_path()
+            } else {
+                temp_png
+            };
 
-            let image = image::open(&ocr_source_path)
+            let image = image::open(source_for_decode)
                 .map_err(|e| AppError::Screenshot(format!("读取截图失败: {e}")))?;
+            let image_hash = Self::compute_dhash_from_dynamic_image(&image);
             let archive_image = prepare_archive_image_with_config(image, &self.config);
             let width = archive_image.width();
             let height = archive_image.height();
@@ -689,9 +947,15 @@ impl ScreenshotService {
                 &archive_path,
                 self.config.jpeg_quality,
             )?;
-            Ok((width, height))
+            save_thumbnail_cache_from_image(&archive_image, &archive_path);
+            Ok((
+                width,
+                height,
+                image_hash,
+                need_ocr_source.then_some(ocr_source_path.clone()),
+            ))
         })();
-        let (width, height) = match persist_result {
+        let (width, height, image_hash, saved_ocr_path) = match persist_result {
             Ok(dimensions) => dimensions,
             Err(error) => {
                 cleanup_failed_capture_outputs(&archive_path, &ocr_source_path);
@@ -712,10 +976,11 @@ impl ScreenshotService {
 
         Ok(ScreenshotResult {
             path: archive_path,
-            ocr_source_path: Some(ocr_source_path),
+            ocr_source_path: saved_ocr_path,
             timestamp,
             width,
             height,
+            image_hash: Some(image_hash),
         })
     }
 
@@ -726,14 +991,23 @@ impl ScreenshotService {
         screenshots_dir: &Path,
         time_str: &str,
         timestamp: i64,
+        need_ocr_source: bool,
     ) -> Result<ScreenshotResult> {
         let (archive_path, ocr_source_path) =
             capture_output_paths(&self.data_dir, screenshots_dir, time_str);
-        ensure_parent_dir(&ocr_source_path)?;
-        let persist_result = (|| -> Result<(u32, u32)> {
-            dynamic_image
-                .save_with_format(&ocr_source_path, image::ImageFormat::Png)
-                .map_err(|e| AppError::Screenshot(format!("保存 OCR 临时图失败: {e}")))?;
+        if need_ocr_source {
+            ensure_parent_dir(&ocr_source_path)?;
+        }
+        let persist_result = (|| -> Result<(u32, u32, u64, Option<PathBuf>)> {
+            let image_hash = Self::compute_dhash_from_dynamic_image(&dynamic_image);
+            let saved_ocr_path = if need_ocr_source {
+                dynamic_image
+                    .save_with_format(&ocr_source_path, image::ImageFormat::Png)
+                    .map_err(|e| AppError::Screenshot(format!("保存 OCR 临时图失败: {e}")))?;
+                Some(ocr_source_path.clone())
+            } else {
+                None
+            };
 
             let archive_image = prepare_archive_image_with_config(dynamic_image, &self.config);
             let width = archive_image.width();
@@ -743,9 +1017,10 @@ impl ScreenshotService {
                 &archive_path,
                 self.config.jpeg_quality,
             )?;
-            Ok((width, height))
+            save_thumbnail_cache_from_image(&archive_image, &archive_path);
+            Ok((width, height, image_hash, saved_ocr_path))
         })();
-        let (width, height) = match persist_result {
+        let (width, height, image_hash, saved_ocr_path) = match persist_result {
             Ok(dimensions) => dimensions,
             Err(error) => {
                 cleanup_failed_capture_outputs(&archive_path, &ocr_source_path);
@@ -766,31 +1041,79 @@ impl ScreenshotService {
 
         Ok(ScreenshotResult {
             path: archive_path,
-            ocr_source_path: Some(ocr_source_path),
+            ocr_source_path: saved_ocr_path,
             timestamp,
             width,
             height,
+            image_hash: Some(image_hash),
         })
     }
 
-    /// 将 RGBA 像素数据转为归档截图
+    #[cfg(any(target_os = "macos", target_os = "windows", test))]
+    fn finalize_merge_dynamic_image(
+        &self,
+        dynamic_image: DynamicImage,
+        screenshots_dir: &Path,
+        time_str: &str,
+        timestamp: i64,
+        last_hash: u64,
+        need_ocr: bool,
+    ) -> Result<MergeCaptureResult> {
+        let image_hash = Self::compute_dhash_from_dynamic_image(&dynamic_image);
+        let should_save_ocr = if !need_ocr {
+            false
+        } else if last_hash != 0 {
+            let similarity = Self::hash_similarity(last_hash, image_hash);
+            if similarity > 90 {
+                log::debug!("合并截图内存 dHash 相似度 {similarity}%，跳过编码与 OCR");
+                false
+            } else {
+                log::debug!("合并截图内存 dHash 相似度 {similarity}%，写出 OCR 源图");
+                true
+            }
+        } else {
+            true
+        };
+
+        let ocr_source_path = if should_save_ocr {
+            let (_, ocr_path) = capture_output_paths(&self.data_dir, screenshots_dir, time_str);
+            ensure_parent_dir(&ocr_path)?;
+            dynamic_image
+                .save_with_format(&ocr_path, image::ImageFormat::Png)
+                .map_err(|e| AppError::Screenshot(format!("保存合并 OCR 临时图失败: {e}")))?;
+            Some(ocr_path)
+        } else {
+            None
+        };
+
+        Ok(MergeCaptureResult {
+            image_hash,
+            ocr_source_path,
+            timestamp,
+        })
+    }
+
+    /// 将 RGBA 像素数据转为归档截图（按所有权接管缓冲区，避免额外 `.to_vec()` 复制）
     #[cfg(target_os = "windows")]
+    #[allow(clippy::too_many_arguments)]
     fn persist_rgba_capture(
         &self,
-        pixels: &[u8],
+        pixels: Vec<u8>,
         width: u32,
         height: u32,
         screenshots_dir: &Path,
         time_str: &str,
         timestamp: i64,
+        need_ocr_source: bool,
     ) -> Result<ScreenshotResult> {
-        let img = image::RgbaImage::from_raw(width, height, pixels.to_vec())
+        let img = image::RgbaImage::from_raw(width, height, pixels)
             .ok_or_else(|| AppError::Screenshot("创建图像失败".to_string()))?;
         self.persist_dynamic_image_capture(
             DynamicImage::ImageRgba8(img),
             screenshots_dir,
             time_str,
             timestamp,
+            need_ocr_source,
         )
     }
 
@@ -799,9 +1122,8 @@ impl ScreenshotService {
     fn capture_impl(
         &self,
         active_window: Option<&crate::monitor::ActiveWindow>,
+        need_ocr_source: bool,
     ) -> Result<ScreenshotResult> {
-        use screenshots::Screen;
-
         let now = chrono::Local::now();
         let date_str = now.format("%Y-%m-%d").to_string();
         let time_str = now.format("%H%M%S_%3f").to_string();
@@ -809,8 +1131,54 @@ impl ScreenshotService {
         let screenshots_dir = self.data_dir.join("screenshots").join(&date_str);
         std::fs::create_dir_all(&screenshots_dir)?;
 
-        let dynamic_image = if should_capture_all_displays(&self.config) {
-            self.capture_all_displays_macos(&screenshots_dir, &time_str)?
+        let dynamic_image =
+            self.capture_dynamic_image_macos(active_window, &screenshots_dir, &time_str)?;
+
+        self.persist_dynamic_image_capture(
+            dynamic_image,
+            &screenshots_dir,
+            &time_str,
+            now.timestamp(),
+            need_ocr_source,
+        )
+    }
+
+    #[cfg(target_os = "macos")]
+    fn capture_merge_impl(
+        &self,
+        active_window: Option<&crate::monitor::ActiveWindow>,
+        last_hash: u64,
+        need_ocr: bool,
+    ) -> Result<MergeCaptureResult> {
+        let now = chrono::Local::now();
+        let date_str = now.format("%Y-%m-%d").to_string();
+        let time_str = now.format("%H%M%S_%3f").to_string();
+        let screenshots_dir = self.data_dir.join("screenshots").join(&date_str);
+        std::fs::create_dir_all(&screenshots_dir)?;
+
+        let dynamic_image =
+            self.capture_dynamic_image_macos(active_window, &screenshots_dir, &time_str)?;
+        self.finalize_merge_dynamic_image(
+            dynamic_image,
+            &screenshots_dir,
+            &time_str,
+            now.timestamp(),
+            last_hash,
+            need_ocr,
+        )
+    }
+
+    #[cfg(target_os = "macos")]
+    fn capture_dynamic_image_macos(
+        &self,
+        active_window: Option<&crate::monitor::ActiveWindow>,
+        screenshots_dir: &Path,
+        time_str: &str,
+    ) -> Result<DynamicImage> {
+        use screenshots::Screen;
+
+        if should_capture_all_displays(&self.config) {
+            self.capture_all_displays_macos(screenshots_dir, time_str)
         } else {
             let screen = if let Some((x, y)) = capture_target_point(active_window) {
                 match Screen::from_point(x, y) {
@@ -835,19 +1203,14 @@ impl ScreenshotService {
                     .ok_or_else(|| AppError::Screenshot("没有找到屏幕".to_string()))?
             };
 
-            DynamicImage::ImageRgba8(self.capture_single_display_macos(
-                &screen,
-                &screenshots_dir,
-                &format!("{time_str}_display"),
-            )?)
-        };
-
-        self.persist_dynamic_image_capture(
-            dynamic_image,
-            &screenshots_dir,
-            &time_str,
-            now.timestamp(),
-        )
+            Ok(DynamicImage::ImageRgba8(
+                self.capture_single_display_macos(
+                    &screen,
+                    screenshots_dir,
+                    &format!("{time_str}_display"),
+                )?,
+            ))
+        }
     }
 
     #[cfg(target_os = "macos")]
@@ -994,6 +1357,7 @@ impl ScreenshotService {
     fn capture_impl(
         &self,
         active_window: Option<&crate::monitor::ActiveWindow>,
+        need_ocr_source: bool,
     ) -> Result<ScreenshotResult> {
         let now = chrono::Local::now();
         let date_str = now.format("%Y-%m-%d").to_string();
@@ -1012,6 +1376,7 @@ impl ScreenshotService {
                 now.timestamp(),
                 active_window,
                 desktop_environment,
+                need_ocr_source,
             ),
             LinuxDesktopSession::X11 | LinuxDesktopSession::Unknown => self.capture_linux_x11(
                 &screenshots_dir,
@@ -1019,8 +1384,40 @@ impl ScreenshotService {
                 now.timestamp(),
                 active_window,
                 desktop_environment,
+                need_ocr_source,
             ),
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn capture_merge_impl(
+        &self,
+        active_window: Option<&crate::monitor::ActiveWindow>,
+        last_hash: u64,
+        need_ocr: bool,
+    ) -> Result<MergeCaptureResult> {
+        let fallback = self.capture_impl(active_window, need_ocr)?;
+        let image_hash = fallback.image_hash.unwrap_or(0);
+        let keep_ocr =
+            need_ocr && (last_hash == 0 || Self::hash_similarity(last_hash, image_hash) <= 90);
+        let ocr_source_path = if keep_ocr {
+            fallback.ocr_source_path.clone()
+        } else {
+            if let Some(ref p) = fallback.ocr_source_path {
+                let _ = std::fs::remove_file(p);
+            }
+            None
+        };
+        let _ = std::fs::remove_file(&fallback.path);
+        let thumb = Self::thumbnail_cache_path(&fallback.path);
+        if thumb != fallback.path {
+            let _ = std::fs::remove_file(&thumb);
+        }
+        Ok(MergeCaptureResult {
+            image_hash,
+            ocr_source_path,
+            timestamp: fallback.timestamp,
+        })
     }
 
     #[cfg(target_os = "linux")]
@@ -1043,6 +1440,7 @@ impl ScreenshotService {
     }
 
     #[cfg(target_os = "linux")]
+    #[allow(clippy::too_many_arguments)]
     fn capture_linux_x11(
         &self,
         screenshots_dir: &Path,
@@ -1050,6 +1448,7 @@ impl ScreenshotService {
         timestamp: i64,
         active_window: Option<&crate::monitor::ActiveWindow>,
         desktop_environment: LinuxDesktopEnvironment,
+        need_ocr_source: bool,
     ) -> Result<ScreenshotResult> {
         let temp_png = screenshots_dir.join(format!("{time_str}_temp.png"));
         let _temp_guard = TemporaryCaptureFile::new(&temp_png);
@@ -1100,10 +1499,17 @@ impl ScreenshotService {
             desktop_environment,
         );
 
-        self.persist_existing_png_capture(&temp_png, screenshots_dir, time_str, timestamp)
+        self.persist_existing_png_capture(
+            &temp_png,
+            screenshots_dir,
+            time_str,
+            timestamp,
+            need_ocr_source,
+        )
     }
 
     #[cfg(target_os = "linux")]
+    #[allow(clippy::too_many_arguments)]
     fn capture_linux_wayland(
         &self,
         screenshots_dir: &Path,
@@ -1111,6 +1517,7 @@ impl ScreenshotService {
         timestamp: i64,
         active_window: Option<&crate::monitor::ActiveWindow>,
         desktop_environment: LinuxDesktopEnvironment,
+        need_ocr_source: bool,
     ) -> Result<ScreenshotResult> {
         let temp_png = screenshots_dir.join(format!("{time_str}_temp.png"));
         let _temp_guard = TemporaryCaptureFile::new(&temp_png);
@@ -1162,7 +1569,13 @@ impl ScreenshotService {
             desktop_environment,
         );
 
-        self.persist_existing_png_capture(&temp_png, screenshots_dir, time_str, timestamp)
+        self.persist_existing_png_capture(
+            &temp_png,
+            screenshots_dir,
+            time_str,
+            timestamp,
+            need_ocr_source,
+        )
     }
 
     #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
@@ -1177,9 +1590,32 @@ impl ScreenshotService {
             .unwrap_or_else(|_| full_path.to_string_lossy().to_string())
     }
 
+    /// 计算指定截图路径对应的 400px 磁盘缩略图缓存路径（同目录 `.thumb.jpg`）
+    pub fn thumbnail_cache_path(path: &Path) -> PathBuf {
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("screenshot");
+        path.with_file_name(format!("{stem}.thumb.jpg"))
+    }
+
     pub fn generate_thumbnail_base64(&self, path: &Path, max_size: u32) -> Result<String> {
+        let cache_path = (max_size == 400).then(|| Self::thumbnail_cache_path(path));
+        if let Some(ref thumb_path) = cache_path {
+            if let Ok(cached_bytes) = std::fs::read(thumb_path) {
+                if !cached_bytes.is_empty() {
+                    return Ok(BASE64_STANDARD.encode(&cached_bytes));
+                }
+            }
+        }
+
         let img = image::open(path)?;
-        let thumbnail = img.thumbnail(max_size, max_size);
+        let (src_w, src_h) = (img.width(), img.height());
+        let thumbnail = if src_w > max_size || src_h > max_size {
+            img.resize(max_size, max_size, FilterType::Triangle)
+        } else {
+            img
+        };
 
         let rgb_thumbnail = thumbnail.to_rgb8();
         let mut buffer = Vec::new();
@@ -1192,6 +1628,10 @@ impl ScreenshotService {
             ColorType::Rgb8.into(),
         )?;
 
+        if let Some(ref thumb_path) = cache_path {
+            let _ = std::fs::write(thumb_path, &buffer);
+        }
+
         Ok(BASE64_STANDARD.encode(&buffer))
     }
 
@@ -1200,20 +1640,45 @@ impl ScreenshotService {
         Ok(BASE64_STANDARD.encode(bytes))
     }
 
-    pub fn calculate_image_hash(path: &Path) -> Result<u64> {
-        let img = image::open(path)?;
-        let small = img.resize_exact(8, 8, FilterType::Nearest).to_luma8();
-        let sum: u32 = small.pixels().map(|p| p.0[0] as u32).sum();
-        let avg = sum / 64;
-
+    /// 在内存中计算 64-bit 水平梯度 dHash（9×8 面积/Triangle 缩小灰度图），避免重解码落盘文件。
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux", test))]
+    pub fn compute_dhash_from_dynamic_image(img: &DynamicImage) -> u64 {
+        let small = img.resize_exact(9, 8, FilterType::Triangle).to_luma8();
         let mut hash: u64 = 0;
-        for (i, pixel) in small.pixels().enumerate() {
-            if pixel.0[0] as u32 > avg {
-                hash |= 1u64 << i;
+        let mut bit = 0u32;
+        for y in 0..8u32 {
+            for x in 0..8u32 {
+                let left = small.get_pixel(x, y).0[0];
+                let right = small.get_pixel(x + 1, y).0[0];
+                if left > right {
+                    hash |= 1u64 << bit;
+                }
+                bit += 1;
             }
         }
+        hash
+    }
 
-        Ok(hash)
+    #[allow(dead_code)]
+    pub fn calculate_image_hash(path: &Path) -> Result<u64> {
+        let img = image::open(path)?;
+        #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux", test))]
+        {
+            Ok(Self::compute_dhash_from_dynamic_image(&img))
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux", test)))]
+        {
+            let small = img.resize_exact(8, 8, FilterType::Triangle).to_luma8();
+            let sum: u32 = small.pixels().map(|p| p.0[0] as u32).sum();
+            let avg = sum / 64;
+            let mut hash: u64 = 0;
+            for (i, pixel) in small.pixels().enumerate() {
+                if pixel.0[0] as u32 > avg {
+                    hash |= 1u64 << i;
+                }
+            }
+            Ok(hash)
+        }
     }
 
     pub fn hash_similarity(hash1: u64, hash2: u64) -> u8 {
@@ -1622,9 +2087,38 @@ fn prepare_archive_image_with_config(
     if width > max_width {
         let scale = max_width as f32 / width as f32;
         let new_height = (height as f32 * scale).max(1.0) as u32;
-        dynamic_image.resize(max_width, new_height, FilterType::Lanczos3)
+        dynamic_image.resize(max_width, new_height, FilterType::Triangle)
     } else {
         dynamic_image
+    }
+}
+
+/// 归档截图落盘时同步写出 400px `.thumb.jpg` 磁盘缓存，供时间线首屏直接读取免解码。
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux", test))]
+fn save_thumbnail_cache_from_image(archive_image: &DynamicImage, archive_path: &Path) {
+    let thumb_path = ScreenshotService::thumbnail_cache_path(archive_path);
+    if thumb_path == archive_path {
+        return;
+    }
+    let thumbnail = if archive_image.width() > 400 || archive_image.height() > 400 {
+        archive_image.resize(400, 400, FilterType::Triangle)
+    } else {
+        archive_image.clone()
+    };
+    let rgb = thumbnail.to_rgb8();
+    let mut buffer = Vec::new();
+    let mut cursor = Cursor::new(&mut buffer);
+    let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut cursor, 60);
+    if encoder
+        .encode(
+            rgb.as_raw(),
+            rgb.width(),
+            rgb.height(),
+            ColorType::Rgb8.into(),
+        )
+        .is_ok()
+    {
+        let _ = std::fs::write(&thumb_path, &buffer);
     }
 }
 
@@ -1777,6 +2271,12 @@ fn capture_target_monitor(
     ))
 }
 
+/// 窗口数量超过枚举上限、无法保证遮罩完整时的错误（放弃本次截图）。
+#[cfg(target_os = "windows")]
+fn window_enumeration_truncated_error() -> AppError {
+    AppError::Screenshot("可见窗口数量过多，无法完成截图隐私遮罩，已跳过本次截图".to_string())
+}
+
 #[cfg(target_os = "windows")]
 fn capture_target_monitor_rect(
     active_window: Option<&crate::monitor::ActiveWindow>,
@@ -1863,6 +2363,7 @@ mod tests {
                 height: 800,
             }),
             is_minimized: false,
+            is_private: false,
         };
 
         assert_eq!(
@@ -1880,6 +2381,7 @@ mod tests {
             executable_path: None,
             window_bounds: None,
             is_minimized: false,
+            is_private: false,
         };
 
         assert_eq!(capture_target_point(Some(&active_window)), None);
@@ -2022,17 +2524,49 @@ Monitors: 2
             DynamicImage::ImageRgba8(RgbaImage::from_pixel(3024, 1964, Rgba([24, 48, 96, 255])));
 
         let result = service
-            .persist_dynamic_image_capture(image, &screenshots_dir, "101530_123", 0)
+            .persist_dynamic_image_capture(image, &screenshots_dir, "101530_123", 0, true)
             .unwrap();
         let archive = image::open(&result.path).unwrap();
 
         assert_eq!(result.path, screenshots_dir.join("101530_123.jpg"));
         assert_eq!(archive.width(), 1440);
         assert_eq!(archive.height(), 935);
+        assert!(result.image_hash.is_some(), "应随采集计算内存 dHash");
+        assert!(
+            ScreenshotService::thumbnail_cache_path(&result.path).exists(),
+            "归档落盘应同步生成 400px .thumb.jpg 缓存"
+        );
 
         let ocr_temp_path = result.ocr_source_path.unwrap();
         assert!(ocr_temp_path.ends_with("101530_123_ocr.png"));
         assert!(!ocr_temp_path.starts_with(&screenshots_dir));
+
+        let no_ocr_image =
+            DynamicImage::ImageRgba8(RgbaImage::from_pixel(640, 480, Rgba([10, 20, 30, 255])));
+        let no_ocr = service
+            .persist_dynamic_image_capture(no_ocr_image, &screenshots_dir, "101535_000", 0, false)
+            .unwrap();
+        assert!(
+            no_ocr.ocr_source_path.is_none(),
+            "不需要 OCR 时不应编码写出 PNG 临时图"
+        );
+
+        let dup_img = DynamicImage::ImageRgba8(RgbaImage::from_fn(320, 200, |x, _| {
+            if x < 160 {
+                Rgba([240, 240, 240, 255])
+            } else {
+                Rgba([20, 20, 20, 255])
+            }
+        }));
+        let h1 = ScreenshotService::compute_dhash_from_dynamic_image(&dup_img);
+        let merge_dup = service
+            .finalize_merge_dynamic_image(dup_img, &screenshots_dir, "101540_000", 0, h1, true)
+            .unwrap();
+        assert_eq!(merge_dup.image_hash, h1);
+        assert!(
+            merge_dup.ocr_source_path.is_none(),
+            "合并路径高相似帧应跳过 PNG 编码与 OCR"
+        );
 
         let _ = fs::remove_dir_all(&data_dir);
         let _ = fs::remove_dir_all(super::ocr_temp_root(&data_dir));
@@ -2057,7 +2591,7 @@ Monitors: 2
             DynamicImage::ImageRgba8(RgbaImage::from_pixel(64, 64, Rgba([24, 48, 96, 255])));
 
         assert!(service
-            .persist_dynamic_image_capture(image, &invalid_screenshots_dir, "101530_456", 0,)
+            .persist_dynamic_image_capture(image, &invalid_screenshots_dir, "101530_456", 0, true)
             .is_err());
         assert!(!ocr_temp_path.exists(), "失败后不得遗留 OCR 临时图");
         assert!(!archive_path.exists(), "失败后不得遗留不完整归档");
@@ -2124,7 +2658,7 @@ Monitors: 2
             DynamicImage::ImageRgba8(RgbaImage::from_pixel(1920, 1080, Rgba([12, 34, 56, 255])));
 
         let result = service
-            .persist_dynamic_image_capture(image, &screenshots_dir, "153859_896", 0)
+            .persist_dynamic_image_capture(image, &screenshots_dir, "153859_896", 0, true)
             .unwrap();
 
         let expected = fs::read(&result.path).unwrap();

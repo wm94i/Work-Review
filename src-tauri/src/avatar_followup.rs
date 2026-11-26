@@ -519,6 +519,7 @@ mod tests {
             executable_path: None,
             window_bounds: None,
             is_minimized: false,
+            is_private: false,
         };
 
         let suggestion = find_followup_suggestion(
@@ -560,6 +561,7 @@ mod tests {
             executable_path: None,
             window_bounds: None,
             is_minimized: false,
+            is_private: false,
         };
         let sessions = build_work_sessions(&activities);
         let project_key = session_project_key(&sessions[0]);

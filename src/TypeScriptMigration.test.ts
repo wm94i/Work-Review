@@ -195,9 +195,10 @@ test('前端脚本应提供类型检查和统一验证入口', async () => {
   const packageJson = JSON.parse(await readFile(projectFile('package.json'), 'utf8'));
 
   assert.equal(packageJson.scripts.check, 'svelte-check --tsconfig ./tsconfig.json --threshold error');
+  assert.equal(packageJson.scripts['test:components'], 'vitest run');
   assert.equal(
     packageJson.scripts['test:frontend'],
-    'node --import tsx --test "**/*.test.ts"'
+    'node --import tsx --test "**/*.test.ts" && npm run test:components'
   );
   assert.equal(
     packageJson.scripts['verify:frontend'],
@@ -294,7 +295,7 @@ test('全部第一方 Svelte 组件脚本应启用 TypeScript', async () => {
     }
   }
 
-  assert.equal(svelteFiles.length, 39);
+  assert.equal(svelteFiles.length, 42);
   assert.deepEqual(untypedComponents, []);
 });
 

@@ -16,17 +16,18 @@ test('AI 设置中的 API 密钥输入应支持显示与隐藏切换', async () 
   assert.match(source, /settingsAI\.showApiKey/);
 });
 
-test('联网、语义记忆与长期记忆开关应暴露本地化 switch 语义', async () => {
+test('联网、语义记忆、后台自动索引与长期记忆开关应暴露本地化 switch 语义', async () => {
   const source = await readFile(
     new URL('./components/SettingsAI.svelte', import.meta.url),
     'utf8'
   );
 
-  assert.equal((source.match(/role="switch"/g) || []).length, 3);
+  assert.equal((source.match(/role="switch"/g) || []).length, 4);
   assert.match(source, /aria-label=\{t\('settingsAI\.webAccess\.title'\)\}/);
   assert.match(source, /aria-label=\{t\('settingsAI\.semanticMemory\.title'\)\}/);
+  assert.match(source, /aria-label=\{t\('settingsAI\.semanticMemory\.autoIndexTitle'\)\}/);
   assert.match(source, /aria-label=\{t\('settingsAI\.assistantMemory\.enabled'\)\}/);
-  assert.equal((source.match(/aria-checked=\{/g) || []).length, 3);
+  assert.equal((source.match(/aria-checked=\{/g) || []).length, 4);
 });
 
 test('日报导出目录应从 AI 设置移到存储设置', async () => {

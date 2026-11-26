@@ -163,27 +163,29 @@ fn resolve_at(executable: &Path, default: &Path, preference: &Path) -> io::Resul
             ))
         });
     }
-    let preferred = load_preference(preference).unwrap_or_else(|| default.to_path_buf());
-    let directory = match ensure_data_dir(&preferred) {
+    let custom_preferred = load_preference(preference);
+    let target = custom_preferred.as_deref().unwrap_or(default);
+    let directory = match ensure_data_dir(target) {
         Ok(directory) => directory,
         Err(error) => {
-            log::warn!("创建数据目录失败，回退默认目录: {error}");
-            if preferred != default {
-                if let Ok(directory) = ensure_data_dir(default) {
-                    if let Err(error) =
-                        save_preference_at(executable, default, preference, &directory)
-                    {
-                        log::warn!("保存回退目录偏好失败: {error}");
-                    }
-                    migrate_legacy_data_dir(executable, &directory);
-                    return Ok(directory);
-                }
+            if let Some(preferred) = custom_preferred {
+                // 自定义目录（如外接盘 / 网络映射盘）暂不可用时，绝不删除偏好文件，
+                // 也绝不静默回退到默认目录或 `./data`，避免把新数据写到另一份库造成分裂。
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!(
+                        "无法访问已配置的自定义数据目录 {}：{error}。已保留您的目录设置且未回退到默认目录，请确认磁盘已挂载或目录权限正常后重试。",
+                        preferred.display()
+                    ),
+                ));
             }
-            let fallback = PathBuf::from("./data");
-            if let Err(error) = fs::create_dir_all(&fallback) {
-                log::warn!("创建兜底数据目录失败: {error}");
-            }
-            fallback
+            return Err(io::Error::new(
+                error.kind(),
+                format!(
+                    "无法创建或访问默认数据目录 {}：{error}。请检查目录权限或磁盘空间后重试。",
+                    default.display()
+                ),
+            ));
         }
     };
     migrate_legacy_data_dir(executable, &directory);
@@ -294,7 +296,7 @@ mod tests {
     }
 
     #[test]
-    fn 失效的普通目录偏好仍可回退默认目录() {
+    fn 不可用的自定义目录偏好必须报错且保留偏好不回退() {
         let dirs = TestDirs::new();
         let invalid = dirs.0.join("not-a-directory");
         fs::write(&invalid, b"user-file").unwrap();
@@ -305,8 +307,11 @@ mod tests {
             &invalid,
         )
         .unwrap();
-        assert_eq!(dirs.resolve().unwrap(), dirs.default());
-        assert!(!dirs.preference().exists());
+        let saved_before = fs::read(dirs.preference()).unwrap();
+        assert!(dirs.resolve().is_err());
+        assert!(dirs.preference().exists(), "目录暂不可用时不得删除偏好文件");
+        assert_eq!(fs::read(dirs.preference()).unwrap(), saved_before);
+        assert!(!dirs.default().exists(), "不得静默回退并初始化默认目录");
         assert_eq!(fs::read(invalid).unwrap(), b"user-file");
     }
 

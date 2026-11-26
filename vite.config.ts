@@ -23,7 +23,9 @@ export default defineConfig({
       host: '127.0.0.1',
     },
   },
-  envPrefix: ['VITE_', 'TAURI_'],
+  // 只暴露 Tauri 2 注入的 TAURI_ENV_* 构建信息；不能用宽泛的 TAURI_ 前缀，
+  // 否则发布流程中的 TAURI_SIGNING_PRIVATE_KEY 等变量可能被打进前端产物。
+  envPrefix: ['VITE_', 'TAURI_ENV_'],
   optimizeDeps: {
     entries: ['index.html'],
   },

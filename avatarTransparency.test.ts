@@ -11,7 +11,9 @@ test('Windows 透明恢复应复用电源回调，不能依赖录制循环或新
   const callback = clock.slice(clock.indexOf('unsafe extern "system" fn notification('), clock.indexOf('pub(crate) struct PowerMonitor {'));
   assert.match(callback, /needs_display_recovery\(previous, next_power_state\(previous, event\)\)/);
   assert.match(callback, /crate::avatar_transparency::schedule\(app\)/);
-  assert.ok(main.indexOf('APP_HANDLE.set(') < main.indexOf('background_screenshot_task(state_clone,'));
+  const appHandleSet = main.indexOf('APP_HANDLE.set(');
+  const startRecordingTask = main.indexOf('"background_screenshot_task"');
+  assert.ok(appHandleSet > 0 && startRecordingTask > appHandleSet);
   assert.doesNotMatch(recovery, /is_recording|is_paused|loop\s*\{|interval\(/);
   assert.match(main, /#\[cfg\(target_os = "windows"\)\]\s*mod avatar_transparency;/);
 });

@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, State};
 use work_review_core::error::AppError;
 
-use super::shared::persist_app_config;
+use super::shared::update_app_config;
 
 #[tauri::command]
 pub async fn get_localhost_api_status(
@@ -27,14 +27,19 @@ pub async fn get_telegram_bot_status(
 ) -> Result<serde_json::Value, AppError> {
     let s = state.lock().map_err(|e| AppError::Unknown(e.to_string()))?;
     let now_ts = chrono::Local::now().timestamp();
+    let bind_code_expired = s.config.telegram_bot_bind_code.is_some()
+        && s.config
+            .telegram_bot_bind_code_expires_at
+            .map(|expires_at| expires_at < now_ts)
+            .unwrap_or(true);
     Ok(serde_json::json!({
         "running": s.telegram_bot_runtime.is_running(),
         "starting": s.telegram_bot_runtime.is_starting(),
         "lastError": s.telegram_bot_runtime.last_error(),
         "allowedChatIds": s.config.telegram_bot_allowed_chat_ids.clone(),
-        "bindCode": s.config.telegram_bot_bind_code.clone(),
+        "bindCode": if bind_code_expired { None } else { s.config.telegram_bot_bind_code.clone() },
         "bindCodeExpiresAt": s.config.telegram_bot_bind_code_expires_at,
-        "bindCodeExpired": s.config.telegram_bot_bind_code_expires_at.map(|expires_at| expires_at < now_ts).unwrap_or(false),
+        "bindCodeExpired": bind_code_expired,
     }))
 }
 
@@ -60,17 +65,15 @@ pub async fn generate_telegram_bot_bind_code(
     const TELEGRAM_BIND_CODE_TTL_SECONDS: i64 = 10 * 60;
 
     let raw = uuid::Uuid::new_v4().simple().to_string();
-    let code = format!("WR-{}", raw[..6].to_ascii_uppercase());
+    let code = format!("WR-{}", raw[..8].to_ascii_uppercase());
     let expires_at = chrono::Local::now().timestamp() + TELEGRAM_BIND_CODE_TTL_SECONDS;
-    let next_config = {
-        let state = state.lock().map_err(|e| AppError::Unknown(e.to_string()))?;
-        let mut config = state.config.clone();
+    update_app_config(app, state.inner(), |current| {
+        let mut config = current.clone();
         config.telegram_bot_bind_code = Some(code.clone());
         config.telegram_bot_bind_code_expires_at = Some(expires_at);
-        config
-    };
-
-    persist_app_config(next_config, app, state.inner())?;
+        Ok(config)
+    })?;
+    crate::telegram_bot::reset_telegram_bind_failed_attempts();
 
     Ok(serde_json::json!({
         "code": code,
@@ -137,5 +140,118 @@ pub async fn test_remote_storage(
     match result {
         Ok(url) => Ok(format!("连接成功: {url}")),
         Err(e) => Err(e),
+    }
+}
+
+fn ensure_bot_sender_platform(platform: &str) -> Result<(), AppError> {
+    if crate::bot_common::BOT_SENDER_PLATFORMS.contains(&platform) {
+        Ok(())
+    } else {
+        Err(AppError::Config(format!("不支持的 Bot 平台: {platform}")))
+    }
+}
+
+/// 发送者 ID 只展示首尾，避免设置页截图泄露完整 ID。
+fn mask_sender_id(sender_id: &str) -> String {
+    let chars: Vec<char> = sender_id.chars().collect();
+    if chars.len() <= 6 {
+        return "*".repeat(chars.len().max(1));
+    }
+    let head: String = chars[..3].iter().collect();
+    let tail: String = chars[chars.len() - 3..].iter().collect();
+    format!("{head}…{tail}")
+}
+
+#[tauri::command]
+pub async fn get_bot_sender_binding_status(
+    platform: String,
+    state: State<'_, Arc<Mutex<AppState>>>,
+) -> Result<serde_json::Value, AppError> {
+    ensure_bot_sender_platform(&platform)?;
+    let s = state.lock().map_err(|e| AppError::Unknown(e.to_string()))?;
+    let now_ts = chrono::Local::now().timestamp();
+    let binding = s
+        .config
+        .bot_sender_bindings
+        .get(&platform)
+        .cloned()
+        .unwrap_or_default();
+    // 与授权判断（evaluate_bot_sender）一致：有绑定码但没有过期时间也视为已过期
+    let expired = binding.bind_code.is_some()
+        && binding
+            .bind_code_expires_at
+            .map(|expires_at| expires_at < now_ts)
+            .unwrap_or(true);
+    Ok(serde_json::json!({
+        "allowedCount": binding.allowed_senders.len(),
+        "allowedSenders": binding
+            .allowed_senders
+            .iter()
+            .map(|id| mask_sender_id(id))
+            .collect::<Vec<_>>(),
+        "bindCode": if expired { None } else { binding.bind_code.clone() },
+        "bindCodeExpiresAt": binding.bind_code_expires_at,
+        "bindCodeExpired": expired,
+    }))
+}
+
+#[tauri::command]
+pub async fn generate_bot_sender_bind_code(
+    platform: String,
+    app: AppHandle,
+    state: State<'_, Arc<Mutex<AppState>>>,
+) -> Result<serde_json::Value, AppError> {
+    ensure_bot_sender_platform(&platform)?;
+    let raw = uuid::Uuid::new_v4().simple().to_string();
+    let code = format!("WR-{}", raw[..8].to_ascii_uppercase());
+    let expires_at =
+        chrono::Local::now().timestamp() + crate::bot_common::BOT_BIND_CODE_TTL_SECONDS;
+    update_app_config(app, state.inner(), |current| {
+        let mut config = current.clone();
+        let binding = config.bot_sender_bindings.entry(platform).or_default();
+        binding.bind_code = Some(code.clone());
+        binding.bind_code_expires_at = Some(expires_at);
+        binding.failed_attempts = 0;
+        Ok(config)
+    })?;
+    Ok(serde_json::json!({
+        "code": code,
+        "expiresAt": expires_at,
+    }))
+}
+
+#[tauri::command]
+pub async fn clear_bot_sender_bindings(
+    platform: String,
+    app: AppHandle,
+    state: State<'_, Arc<Mutex<AppState>>>,
+) -> Result<(), AppError> {
+    ensure_bot_sender_platform(&platform)?;
+    update_app_config(app, state.inner(), |current| {
+        let mut config = current.clone();
+        config.bot_sender_bindings.remove(&platform);
+        Ok(config)
+    })
+    .map(|_| ())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ensure_bot_sender_platform, mask_sender_id};
+
+    #[test]
+    fn 只接受支持的bot平台() {
+        assert!(ensure_bot_sender_platform("feishu").is_ok());
+        assert!(ensure_bot_sender_platform("dingtalk").is_ok());
+        assert!(ensure_bot_sender_platform("wecom").is_ok());
+        assert!(ensure_bot_sender_platform("telegram").is_err());
+        assert!(ensure_bot_sender_platform("../x").is_err());
+    }
+
+    #[test]
+    fn 发送者id应脱敏展示() {
+        assert_eq!(mask_sender_id("ou_1234567890"), "ou_…890");
+        assert_eq!(mask_sender_id("abc"), "***");
+        assert_eq!(mask_sender_id(""), "*");
     }
 }

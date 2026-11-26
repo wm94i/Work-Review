@@ -6,6 +6,13 @@
   import { locale, t } from '$lib/i18n/index.ts';
   import type { Locale } from '$lib/i18n/index.ts';
   import AssistantMemoryManager from './AssistantMemoryManager.svelte';
+  import ModelRoutingPanel from './ModelRoutingPanel.svelte';
+  import {
+    isLocalLoopbackEmbeddingEndpoint,
+    OLLAMA_EMBEDDING_PRESETS,
+    OPENAI_COMPAT_LOCAL_PRESETS,
+    type EmbeddingPreset,
+  } from '../embeddingEndpoints.ts';
 
   type AiMode = 'local' | 'summary';
   type SemanticStatus = 'idle' | 'building' | 'ready' | 'failed';
@@ -45,16 +52,32 @@
     maxOutputTokens: boolean;
   }
 
+  interface TaskModelRoutingConfig {
+    report_provider: string | null;
+    assistant_provider: string | null;
+    classification_provider: string | null;
+    proactive_provider: string | null;
+  }
+
+  interface TextModelProfileSummary {
+    id: string;
+    name: string;
+    model_config?: ProviderConfigCache;
+  }
+
   interface AiSettingsConfig {
     ai_mode: AiMode;
     text_model: TextModelConfig;
     assistant_timeout_secs?: number;
     report_generation_timeout_secs?: number;
+    text_model_profiles?: TextModelProfileSummary[];
     text_model_provider_cache?: Partial<Record<ProviderId, ProviderConfigCache>>;
+    task_model_routing?: TaskModelRoutingConfig;
     assistant_web_access_enabled: boolean;
     assistant_search_provider: 'duckduckgo' | 'tavily' | 'bocha';
     assistant_search_api_key: string;
     memory_semantic_enabled: boolean;
+    semantic_auto_index?: boolean;
     embedding_provider: 'ollama' | 'openai';
     embedding_endpoint: string;
     embedding_model: string;
@@ -89,10 +112,16 @@
     rebuildRequired: boolean;
     indexedActivities: number;
     totalActivities: number;
+    pendingReindexDates?: number;
     lastError: string | null;
   }
 
   interface SemanticIndexProgress {
+    processedActivities?: number;
+    upsertedChunks?: number;
+    embeddedChunks?: number;
+    pendingEmbeddings?: number;
+    activitiesDone?: boolean;
     state: SemanticMemoryState;
   }
 
@@ -144,6 +173,7 @@
     rebuildRequired: true,
     indexedActivities: 0,
     totalActivities: 0,
+    pendingReindexDates: 0,
     lastError: null,
   });
   let semanticState = emptySemanticState();
@@ -151,6 +181,45 @@
   let semanticIndexText = '';
   let semanticError = '';
   let semanticDestroyed = false;
+
+  $: semanticPendingActivities = Math.max(
+    0,
+    (semanticState.totalActivities ?? 0) - (semanticState.indexedActivities ?? 0),
+  );
+  $: semanticPendingDates = semanticState.pendingReindexDates ?? 0;
+  $: semanticCanIncremental = !semanticState.rebuildRequired && semanticState.status === 'ready';
+  $: semanticHasLag = semanticCanIncremental && (semanticPendingActivities > 0 || semanticPendingDates > 0);
+  $: embeddingIsLocal = isLocalLoopbackEmbeddingEndpoint(config?.embedding_endpoint);
+  $: activeEmbeddingPresets = config?.embedding_provider === 'ollama'
+    ? OLLAMA_EMBEDDING_PRESETS
+    : OPENAI_COMPAT_LOCAL_PRESETS;
+
+  function resetEmbeddingTest() {
+    memTestStatus = null;
+    memTestMessage = '';
+  }
+
+  function handleEmbeddingFieldChange() {
+    resetEmbeddingTest();
+    handleChange();
+  }
+
+  function applyEmbeddingPreset(preset: EmbeddingPreset) {
+    config.embedding_provider = preset.provider;
+    const currentEndpoint = (config.embedding_endpoint || '').trim();
+    const shouldOverwriteOllamaEndpoint = !currentEndpoint
+      || OPENAI_COMPAT_LOCAL_PRESETS.some((item) => item.endpoint === currentEndpoint);
+    if (preset.provider === 'openai' || shouldOverwriteOllamaEndpoint) {
+      config.embedding_endpoint = preset.endpoint;
+    }
+    config.embedding_model = preset.model;
+    if (preset.clearApiKey) {
+      config.embedding_api_key = '';
+    }
+    resetEmbeddingTest();
+    config = config;
+    handleChange();
+  }
 
   function semanticStatusKey() {
     if (semanticState.status === 'building') return 'settingsAI.semanticMemory.statusBuilding';
@@ -178,7 +247,7 @@
     }
   }
 
-  async function startSemanticIndexing() {
+  async function startSemanticIndexing(forceRebuild = false) {
     if (semanticIndexing) return;
     semanticIndexing = true;
     semanticError = '';
@@ -187,15 +256,24 @@
       // 索引命令读取的是已持久化配置；先把当前界面配置落盘，
       // 避免开关已打开但未保存时出现"界面已启用、后端报未启用"的矛盾
       await invoke('save_config', { config });
-      // 后端持久化真实状态；前端只分批推进，直到状态不再是 building。
-      while (!semanticDestroyed) {
-        const progress = await invoke<SemanticIndexProgress>('index_semantic_memory');
+      // 后端持久化真实状态；仅首轮传入 forceRebuild，后续批次持续推进直至追平。
+      let batchForceRebuild = forceRebuild;
+      for (let round = 0; round < 200 && !semanticDestroyed; round += 1) {
+        const progress = await invoke<SemanticIndexProgress>('index_semantic_memory', {
+          forceRebuild: batchForceRebuild,
+        });
+        batchForceRebuild = false;
         semanticState = progress.state;
         semanticIndexText = t('settingsAI.semanticMemory.progress', {
           indexed: semanticState.indexedActivities ?? 0,
           total: semanticState.totalActivities ?? 0,
         });
-        if (semanticState.status !== 'building') break;
+        if (semanticState.status === 'failed') break;
+        const moreWork = semanticState.status === 'building'
+          || progress.activitiesDone === false
+          || (progress.pendingEmbeddings ?? 0) > 0
+          || (semanticState.pendingReindexDates ?? 0) > 0;
+        if (!moreWork) break;
       }
     } catch (e) {
       semanticError = String(e);
@@ -665,9 +743,17 @@
     return `${provider}|${endpoint}|${model}|${api_key || ''}`;
   }
 
+  let autoTestDelayTimer: ReturnType<typeof setTimeout> | null = null;
+
   onMount(async () => {
     refreshSemanticStats();
-    await new Promise<void>((resolve) => setTimeout(resolve, 200));
+    await new Promise<void>((resolve) => {
+      autoTestDelayTimer = setTimeout(() => {
+        autoTestDelayTimer = null;
+        resolve();
+      }, 200);
+    });
+    if (semanticDestroyed) return;
 
     const currentHash = getConfigHash();
     let lastHash: string | null = null;
@@ -680,6 +766,7 @@
       aiStore.setConfigHash(currentHash);
       await testTextModel();
     }
+    if (semanticDestroyed) return;
 
     if (config?.text_model?.endpoint && (!requiresApiKey || config.text_model.api_key)) {
       await refreshModels();
@@ -688,6 +775,10 @@
 
   onDestroy(() => {
     semanticDestroyed = true;
+    if (autoTestDelayTimer !== null) {
+      clearTimeout(autoTestDelayTimer);
+      autoTestDelayTimer = null;
+    }
     unsubscribe();
   });
 </script>
@@ -695,11 +786,12 @@
 <!-- 日报模式切换 -->
 <fieldset class="mb-5" data-locale={currentLocale}>
   <legend class="settings-label mb-2">{t('settingsAI.modeLegend')}</legend>
-  <div class="flex gap-2">
+  <div class="ui-choice-grid">
     {#each aiModes as mode}
       {@const isSelected = config.ai_mode === mode.value}
       <button
         type="button"
+        aria-pressed={isSelected}
         on:click={() => {
           if (mode.requiresText && !isTextModelConfigured) {
             config.ai_mode = mode.value;
@@ -709,15 +801,26 @@
             handleChange();
           }
         }}
-        class="flex-1 min-h-16 px-3 py-2.5 rounded-lg text-sm font-medium leading-none transition-all duration-150
-               {isSelected
-                 ? 'settings-segment-active'
-                 : 'settings-segment-base'}"
+        class="ui-choice-card {isSelected ? 'ui-choice-card-active' : ''}"
       >
-        <div class="flex h-full flex-col items-center justify-center gap-1 text-center">
-          <div class="leading-none">{mode.label}</div>
-          <div class="text-[10px] leading-none {isSelected ? 'text-white/70' : 'settings-subtle'}">{mode.description}</div>
+        <div class="ui-choice-head">
+          <div class="ui-choice-title-group">
+            <span class="ui-choice-icon" aria-hidden="true">
+              {#if mode.value === 'local'}
+                <svg class="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                </svg>
+              {:else}
+                <svg class="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8" d="M9.813 15.904L9 18.75l-.813-2.846a4.5 4.5 0 00-3.09-3.09L2.25 12l2.846-.813a4.5 4.5 0 003.09-3.09L9 5.25l.813 2.846a4.5 4.5 0 003.09 3.09L15.75 12l-2.846.813a4.5 4.5 0 00-3.09 3.09zM18.259 8.715L18 9.75l-.259-1.035a3.375 3.375 0 00-2.455-2.456L14.25 6l1.036-.259a3.375 3.375 0 002.455-2.456L18 2.25l.259 1.035a3.375 3.375 0 002.456 2.456L21.75 6l-1.035.259a3.375 3.375 0 00-2.456 2.456z" />
+                </svg>
+              {/if}
+            </span>
+            <span class="ui-choice-title">{mode.label}</span>
+          </div>
+          <span class="ui-choice-indicator" aria-hidden="true"></span>
         </div>
+        <p class="ui-choice-desc">{mode.description}</p>
       </button>
     {/each}
   </div>
@@ -726,22 +829,24 @@
 <!-- AI 能力配置：三入口分区 -->
 {#if isAiMode}
   <div class="pt-3 border-t border-slate-200 dark:border-[#30363d]">
-    <div class="mb-3 grid grid-cols-1 gap-2 md:grid-cols-3">
-      {#each [
-        { id: 'model', label: t('settingsAI.sectionModel'), on: isTextModelConfigured },
-        { id: 'web', label: t('settingsAI.sectionWeb'), on: Boolean(config.assistant_web_access_enabled) },
-        { id: 'memory', label: t('settingsAI.sectionMemory'), on: Boolean(config.memory_semantic_enabled || config.assistant_memory_enabled) },
-      ] as section (section.id)}
-        <button
-          type="button"
-          class="segment-btn rounded-lg border px-3 py-2 text-sm flex items-center justify-center gap-1.5
-            {aiSection === section.id ? 'settings-segment-success' : 'settings-segment-idle'}"
-          on:click={() => (aiSection = section.id)}
-        >
-          <span class="inline-block h-1.5 w-1.5 rounded-full {section.on ? 'bg-emerald-400' : 'bg-slate-300 dark:bg-[#484f58]'}"></span>
-          <span>{section.label}</span>
-        </button>
-      {/each}
+    <div class="settings-ai-section-tabs mb-3">
+      <div class="mb-3 grid grid-cols-1 gap-2 md:grid-cols-3" role="group" aria-label={t('settings.aiCardTitle')}>
+        {#each [
+          { id: 'model', label: t('settingsAI.sectionModel'), on: isTextModelConfigured },
+          { id: 'web', label: t('settingsAI.sectionWeb'), on: Boolean(config.assistant_web_access_enabled) },
+          { id: 'memory', label: t('settingsAI.sectionMemory'), on: Boolean(config.memory_semantic_enabled || config.assistant_memory_enabled) },
+        ] as section (section.id)}
+          <button
+            type="button"
+            aria-pressed={aiSection === section.id}
+            class="settings-ai-section-tab {aiSection === section.id ? 'settings-ai-section-tab-active' : ''}"
+            on:click={() => (aiSection = section.id)}
+          >
+            <span class="inline-block h-1.5 w-1.5 rounded-full {section.on ? 'bg-emerald-500 dark:bg-emerald-400' : 'bg-slate-300 dark:bg-[#484f58]'}"></span>
+            <span>{section.label}</span>
+          </button>
+        {/each}
+      </div>
     </div>
 
     {#if aiSection === 'model'}
@@ -749,11 +854,12 @@
     <!-- 提供商：品牌卡片网格（主流 AI 客户端形态） -->
     <div>
       <span class="settings-label mb-1.5 block">{t('settingsAI.provider')}</span>
-      <div class="grid grid-cols-2 gap-2 sm:grid-cols-3">
+      <div class="grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 2xl:grid-cols-6">
         {#each localizedProviders as provider (provider.id)}
           {@const active = (config.text_model?.provider || 'ollama') === provider.id}
           <button
             type="button"
+            aria-pressed={active}
             class="flex items-center gap-2.5 rounded-xl border px-3 py-2.5 text-start transition
               {active
                 ? 'border-indigo-400 bg-indigo-50/70 ring-1 ring-indigo-300/60 dark:border-indigo-500/70 dark:bg-indigo-950/30 dark:ring-indigo-500/40'
@@ -1038,6 +1144,15 @@
       </div>
     </div>
 
+    <ModelRoutingPanel
+      config={config}
+      providers={localizedProviders}
+      onchange={(next) => {
+        config = { ...config, task_model_routing: next.task_model_routing };
+        dispatch('change', config);
+      }}
+    />
+
     </div>
     {:else if aiSection === 'web'}
     <!-- 助手联网能力：默认关闭；开启后助手可读网页/查天气，配搜索 Key 后可联网搜索 -->
@@ -1159,7 +1274,13 @@
             <select
               id="embedding-provider"
               bind:value={config.embedding_provider}
-              on:change={handleChange}
+              on:change={() => {
+                if (config.embedding_provider === 'ollama') {
+                  config.embedding_api_key = '';
+                  config = config;
+                }
+                handleEmbeddingFieldChange();
+              }}
               class="control-input"
             >
               <option value="ollama">{t('settingsAI.semanticMemory.providerOllama')}</option>
@@ -1171,9 +1292,10 @@
               id="embedding-endpoint"
               type="text"
               bind:value={config.embedding_endpoint}
-              on:change={handleChange}
+              on:input={resetEmbeddingTest}
+              on:change={handleEmbeddingFieldChange}
               class="control-input"
-              placeholder={config.embedding_provider === 'ollama' ? 'http://localhost:11434' : 'https://api.siliconflow.cn'}
+              placeholder={config.embedding_provider === 'ollama' ? 'http://localhost:11434' : 'http://127.0.0.1:1234/v1 · https://api.siliconflow.cn'}
               autocomplete="off"
             />
 
@@ -1182,9 +1304,10 @@
               id="embedding-model"
               type="text"
               bind:value={config.embedding_model}
-              on:change={handleChange}
+              on:input={resetEmbeddingTest}
+              on:change={handleEmbeddingFieldChange}
               class="control-input"
-              placeholder={config.embedding_provider === 'ollama' ? 'nomic-embed-text' : 'BAAI/bge-m3'}
+              placeholder={config.embedding_provider === 'ollama' ? 'shaw/dmeta-embedding-zh' : 'BAAI/bge-m3'}
               autocomplete="off"
             />
 
@@ -1194,14 +1317,39 @@
               id="embedding-key"
               type="password"
               bind:value={config.embedding_api_key}
-              on:change={handleChange}
+              on:input={resetEmbeddingTest}
+              on:change={handleEmbeddingFieldChange}
               class="control-input"
-              placeholder="sk-..."
+              placeholder={embeddingIsLocal ? t('settingsAI.semanticMemory.apiKeyOptionalPlaceholder') : 'sk-...'}
               autocomplete="off"
             />
             {/if}
           </div>
-          <p class="settings-muted">{config.embedding_provider === 'ollama' ? t('settingsAI.semanticMemory.ollamaHint') : t('settingsAI.semanticMemory.cloudHint')}</p>
+
+          <div class="flex flex-wrap items-center gap-1.5 pt-0.5">
+            <span class="settings-muted text-[11px]">{t('settingsAI.semanticMemory.presetsLabel')}</span>
+            {#each activeEmbeddingPresets as preset (preset.id)}
+              <button
+                type="button"
+                class="rounded-md border border-slate-200 px-2 py-0.5 text-[11px] text-slate-600 transition hover:border-indigo-300 hover:text-indigo-600 dark:border-[#30363d] dark:text-[#adbac7] dark:hover:border-indigo-500/60 dark:hover:text-indigo-300"
+                on:click={() => applyEmbeddingPreset(preset)}
+              >
+                {t(preset.labelKey)}
+              </button>
+            {/each}
+          </div>
+
+          <p class="settings-muted">
+            {#if config.embedding_provider === 'ollama'}
+              {embeddingIsLocal
+                ? t('settingsAI.semanticMemory.ollamaHint')
+                : t('settingsAI.semanticMemory.cloudHint')}
+            {:else}
+              {embeddingIsLocal
+                ? t('settingsAI.semanticMemory.localCompatHint')
+                : t('settingsAI.semanticMemory.cloudHint')}
+            {/if}
+          </p>
 
           <!-- 嵌入模型连通性测试 -->
           <div class="flex items-center gap-2 pt-1">
@@ -1222,6 +1370,34 @@
             {/if}
           </div>
 
+          <!-- 后台自动增量索引（默认关闭，用户显式开启） -->
+          <div class="rounded-lg border border-slate-200 px-3 py-2.5 dark:border-[#30363d]">
+            <label class="flex items-center justify-between gap-3 cursor-pointer">
+              <div class="min-w-0">
+                <span class="settings-text text-xs font-medium inline-flex items-center gap-2">
+                  {t('settingsAI.semanticMemory.autoIndexTitle')}
+                  <span class="rounded-full px-1.5 py-0.5 text-[10px] font-medium {config.semantic_auto_index ? 'bg-emerald-50 text-emerald-600 dark:bg-emerald-950/40 dark:text-emerald-400' : 'bg-slate-100 text-slate-400 dark:bg-[#21262d] dark:text-[#636c76]'}">
+                    {config.semantic_auto_index ? t('settingsAI.statusEnabled') : t('settingsAI.statusDisabled')}
+                  </span>
+                </span>
+                <p class="settings-muted mt-0.5">{t('settingsAI.semanticMemory.autoIndexHint')}</p>
+              </div>
+              <button
+                type="button"
+                class="switch-track shrink-0 {config.semantic_auto_index ? 'bg-emerald-500' : 'bg-slate-300 dark:bg-[#484f58]'}"
+                role="switch"
+                aria-label={t('settingsAI.semanticMemory.autoIndexTitle')}
+                aria-checked={Boolean(config.semantic_auto_index)}
+                on:click={() => {
+                  config.semantic_auto_index = !config.semantic_auto_index;
+                  handleChange();
+                }}
+              >
+                <span class="switch-thumb {config.semantic_auto_index ? 'translate-x-5' : 'translate-x-0'}"></span>
+              </button>
+            </label>
+          </div>
+
           <!-- 索引管理：状态由后端持久化，未 ready 时助手自动降级为 FTS -->
           <div class="space-y-2 rounded-lg border border-slate-200 px-3 py-2.5 dark:border-[#30363d]">
             <div class="flex flex-wrap items-center justify-between gap-2 text-xs">
@@ -1229,14 +1405,35 @@
                 {t('settingsAI.semanticMemory.statusLabel')}：
                 <strong class="text-slate-700 dark:text-[#c9d1d9]">{t(semanticStatusKey())}</strong>
               </span>
-              <button
-                type="button"
-                class="text-indigo-500 hover:text-indigo-600 dark:text-indigo-400 dark:hover:text-indigo-300 disabled:opacity-50"
-                on:click={startSemanticIndexing}
-                disabled={semanticIndexing}
-              >
-                {semanticIndexing ? t('settingsAI.semanticMemory.statusBuilding') : t(semanticActionKey())}
-              </button>
+              <div class="flex items-center gap-3">
+                {#if semanticCanIncremental}
+                  <button
+                    type="button"
+                    class="text-indigo-500 hover:text-indigo-600 dark:text-indigo-400 dark:hover:text-indigo-300 disabled:opacity-50"
+                    on:click={() => startSemanticIndexing(false)}
+                    disabled={semanticIndexing}
+                  >
+                    {semanticIndexing ? t('settingsAI.semanticMemory.statusBuilding') : t('settingsAI.semanticMemory.incrementalUpdate')}
+                  </button>
+                  <button
+                    type="button"
+                    class="text-slate-500 hover:text-slate-700 dark:text-[#7d8590] dark:hover:text-[#c9d1d9] disabled:opacity-50"
+                    on:click={() => startSemanticIndexing(true)}
+                    disabled={semanticIndexing}
+                  >
+                    {t('settingsAI.semanticMemory.forceRebuild')}
+                  </button>
+                {:else}
+                  <button
+                    type="button"
+                    class="text-indigo-500 hover:text-indigo-600 dark:text-indigo-400 dark:hover:text-indigo-300 disabled:opacity-50"
+                    on:click={() => startSemanticIndexing(semanticState.rebuildRequired)}
+                    disabled={semanticIndexing}
+                  >
+                    {semanticIndexing ? t('settingsAI.semanticMemory.statusBuilding') : t(semanticActionKey())}
+                  </button>
+                {/if}
+              </div>
             </div>
             <p class="settings-muted">
               {t('settingsAI.semanticMemory.progress', {
@@ -1244,6 +1441,14 @@
                 total: semanticState.totalActivities ?? 0,
               })}
             </p>
+            {#if semanticHasLag}
+              <p class="text-xs text-amber-600 dark:text-amber-400">
+                {t('settingsAI.semanticMemory.pendingLag', {
+                  activities: semanticPendingActivities,
+                  dates: semanticPendingDates,
+                })}
+              </p>
+            {/if}
             {#if semanticState.lastError}
               <p class="text-xs text-rose-500 dark:text-rose-400 break-words">
                 {t('settingsAI.semanticMemory.lastError', { error: semanticState.lastError })}

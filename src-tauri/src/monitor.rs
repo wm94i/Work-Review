@@ -3,29 +3,33 @@ use crate::linux_session::{
     current_linux_desktop_environment, current_linux_desktop_session, LinuxDesktopEnvironment,
     LinuxDesktopSession,
 };
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux", test))]
 use once_cell::sync::Lazy;
 #[cfg(any(target_os = "linux", test))]
 use regex::Regex;
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
 use serde_json::Value;
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux", test))]
+use std::collections::HashMap;
 #[cfg(any(target_os = "windows", test))]
-use std::collections::{HashMap, HashSet};
-#[cfg(target_os = "windows")]
-use std::os::windows::process::CommandExt;
+use std::collections::HashSet;
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
 use std::path::{Path, PathBuf};
-#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::process::{Command, Output, Stdio};
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux", test))]
+use std::sync::Mutex;
 #[cfg(any(target_os = "windows", test))]
 use std::sync::{
     atomic::{AtomicU8, Ordering},
     Arc,
 };
 #[cfg(target_os = "windows")]
-use std::sync::{mpsc, Condvar, Mutex};
+use std::sync::{mpsc, Condvar};
 #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
 use std::thread;
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+use std::time::SystemTime;
 #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
 use std::time::{Duration, Instant};
 #[cfg(target_os = "windows")]
@@ -41,10 +45,10 @@ use work_review_core::categorize::{
 use work_review_core::error::AppError;
 use work_review_core::error::Result;
 
-#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 const MONITOR_COMMAND_TIMEOUT: Duration = Duration::from_millis(1200);
 
-#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn run_monitor_command_with_timeout(command: &mut Command, context: &str) -> Result<Output> {
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
 
@@ -127,6 +131,8 @@ pub struct ActiveWindow {
     pub window_bounds: Option<WindowBounds>,
     /// 当前前台窗口是否已最小化（Windows “显示桌面”时最后一个窗口仍可能保持前台）
     pub is_minimized: bool,
+    /// 是否为浏览器无痕 / 隐私窗口（在清洗浏览器标题前识别）
+    pub is_private: bool,
 }
 
 /// 剥离 Windows 在应用挂起时给窗口标题追加的"（未响应）"/"(Not Responding)"后缀。
@@ -634,6 +640,52 @@ fn firefox_family_session_store_base_dir(app_lower: &str) -> Option<PathBuf> {
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
+struct FirefoxSessionCacheEntry {
+    modified: Option<SystemTime>,
+    len: u64,
+    value: Value,
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+static FIREFOX_SESSION_STORE_CACHE: Lazy<Mutex<HashMap<PathBuf, FirefoxSessionCacheEntry>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+fn read_cached_firefox_session_store(session_path: &Path) -> Option<Value> {
+    let meta = std::fs::metadata(session_path).ok()?;
+    let modified = meta.modified().ok();
+    let len = meta.len();
+
+    if let Ok(cache) = FIREFOX_SESSION_STORE_CACHE.lock() {
+        if let Some(entry) = cache.get(session_path) {
+            if entry.modified == modified && entry.len == len {
+                return Some(entry.value.clone());
+            }
+        }
+    }
+
+    let raw = std::fs::read(session_path).ok()?;
+    let decoded = decode_mozlz4_bytes(&raw).ok()?;
+    let value = serde_json::from_slice::<Value>(&decoded).ok()?;
+
+    if let Ok(mut cache) = FIREFOX_SESSION_STORE_CACHE.lock() {
+        if cache.len() >= 8 {
+            cache.clear();
+        }
+        cache.insert(
+            session_path.to_path_buf(),
+            FirefoxSessionCacheEntry {
+                modified,
+                len,
+                value: value.clone(),
+            },
+        );
+    }
+
+    Some(value)
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 fn firefox_family_session_store_url(app_name: &str, window_title: &str) -> Option<String> {
     let app_lower = app_name.to_lowercase();
     let base_dir = firefox_family_session_store_base_dir(&app_lower)?;
@@ -647,13 +699,7 @@ fn firefox_family_session_store_url(app_name: &str, window_title: &str) -> Optio
     ];
 
     for session_path in session_paths {
-        let Ok(raw) = std::fs::read(&session_path) else {
-            continue;
-        };
-        let Ok(decoded) = decode_mozlz4_bytes(&raw) else {
-            continue;
-        };
-        let Ok(value) = serde_json::from_slice::<Value>(&decoded) else {
+        let Some(value) = read_cached_firefox_session_store(&session_path) else {
             continue;
         };
         if let Some(url) = extract_active_tab_url_from_session_store_value(&value, window_title) {
@@ -675,20 +721,140 @@ pub fn get_active_window_fast() -> Result<ActiveWindow> {
     get_active_window_with_options(false)
 }
 
+/// 解析 UWP 应用在 `ApplicationFrameHost.exe` 下托管的真实子窗口进程 PID。
+/// 优先匹配类名为 `Windows.UI.Core.CoreWindow` 的子窗口，否则回退首个非宿主 PID 子窗口。
 #[cfg(target_os = "windows")]
-fn get_active_window_with_options(include_browser_url: bool) -> Result<ActiveWindow> {
+fn resolve_uwp_child_pid_windows(hwnd: winapi::shared::windef::HWND, host_pid: u32) -> Option<u32> {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt;
+    use winapi::shared::minwindef::{BOOL, FALSE, LPARAM, TRUE};
+    use winapi::shared::windef::HWND;
+    use winapi::um::winuser::{EnumChildWindows, GetClassNameW, GetWindowThreadProcessId};
+
+    struct UwpLookup {
+        host_pid: u32,
+        core_window_pid: Option<u32>,
+        fallback_pid: Option<u32>,
+    }
+
+    unsafe extern "system" fn enum_uwp_child(child: HWND, lparam: LPARAM) -> BOOL {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let state = &mut *(lparam as *mut UwpLookup);
+            let mut child_pid: u32 = 0;
+            GetWindowThreadProcessId(child, &mut child_pid);
+            if child_pid == 0 || child_pid == state.host_pid {
+                return TRUE;
+            }
+            let mut class_buf = [0u16; 128];
+            let len = GetClassNameW(child, class_buf.as_mut_ptr(), class_buf.len() as i32);
+            if len > 0 {
+                let class_name = OsString::from_wide(&class_buf[..len as usize])
+                    .to_string_lossy()
+                    .to_string();
+                if class_name == "Windows.UI.Core.CoreWindow" {
+                    state.core_window_pid = Some(child_pid);
+                    return FALSE;
+                }
+            }
+            if state.fallback_pid.is_none() {
+                state.fallback_pid = Some(child_pid);
+            }
+            TRUE
+        }))
+        .unwrap_or(FALSE)
+    }
+
+    let mut lookup = UwpLookup {
+        host_pid,
+        core_window_pid: None,
+        fallback_pid: None,
+    };
+    unsafe {
+        EnumChildWindows(
+            hwnd,
+            Some(enum_uwp_child),
+            &mut lookup as *mut UwpLookup as LPARAM,
+        );
+    }
+    lookup.core_window_pid.or(lookup.fallback_pid)
+}
+
+#[cfg(target_os = "windows")]
+fn resolve_process_name_windows(
+    pid: u32,
+    executable_path: Option<&str>,
+    window_title: &str,
+) -> String {
     use std::ffi::OsString;
     use std::os::windows::ffi::OsStringExt;
     use winapi::um::handleapi::CloseHandle;
     use winapi::um::processthreadsapi::OpenProcess;
     use winapi::um::psapi::GetModuleBaseNameW;
     use winapi::um::winnt::PROCESS_QUERY_INFORMATION;
+
+    const PROCESS_QUERY_LIMITED: u32 = 0x1000;
+
+    if pid == 0 {
+        return "Unknown".to_string();
+    }
+
+    unsafe {
+        // 方法一：PROCESS_QUERY_LIMITED_INFORMATION + GetModuleBaseNameW
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED, 0, pid);
+        if !handle.is_null() {
+            let mut name: [u16; 256] = [0; 256];
+            let len = GetModuleBaseNameW(handle, std::ptr::null_mut(), name.as_mut_ptr(), 256);
+            CloseHandle(handle);
+            if len > 0 {
+                return OsString::from_wide(&name[..len as usize])
+                    .to_string_lossy()
+                    .to_string();
+            }
+        }
+
+        // 方法二：回退完整权限
+        let handle2 = OpenProcess(PROCESS_QUERY_INFORMATION | 0x0010, 0, pid);
+        if !handle2.is_null() {
+            let mut name: [u16; 256] = [0; 256];
+            let len = GetModuleBaseNameW(handle2, std::ptr::null_mut(), name.as_mut_ptr(), 256);
+            CloseHandle(handle2);
+            if len > 0 {
+                return OsString::from_wide(&name[..len as usize])
+                    .to_string_lossy()
+                    .to_string();
+            }
+        }
+    }
+
+    // 方法三：QueryFullProcessImageNameW
+    get_process_name_by_image(pid).unwrap_or_else(|| {
+        if let Some(name_from_path) = executable_path.and_then(|path| {
+            std::path::Path::new(path)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(|name| name.to_string())
+        }) {
+            name_from_path
+        } else if !window_title.is_empty() {
+            window_title
+                .split(" - ")
+                .last()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty() && s.len() < 40)
+                .unwrap_or_else(|| "Unknown".to_string())
+        } else {
+            "Unknown".to_string()
+        }
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn get_active_window_with_options(include_browser_url: bool) -> Result<ActiveWindow> {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt;
     use winapi::um::winuser::{
         GetForegroundWindow, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, IsIconic,
     };
-    // PROCESS_QUERY_LIMITED_INFORMATION 是 Vista+ 专为低权限场景设计的标志
-    // 无需 PROCESS_VM_READ，对 UAC 保护进程、Store 应用等成功率远高于完整权限
-    const PROCESS_QUERY_LIMITED: u32 = 0x1000;
 
     unsafe {
         let hwnd = GetForegroundWindow();
@@ -715,93 +881,39 @@ fn get_active_window_with_options(include_browser_url: bool) -> Result<ActiveWin
         let mut pid: u32 = 0;
         GetWindowThreadProcessId(hwnd, &mut pid);
 
-        let executable_path = if pid > 0 {
+        let mut executable_path = if pid > 0 {
             get_process_image_path(pid)
         } else {
             None
         };
+        let mut raw_app_name =
+            resolve_process_name_windows(pid, executable_path.as_deref(), &window_title);
 
-        // 获取进程名，使用多级备用策略确保 Win10 低权限下能正确读取
-        let raw_app_name = if pid > 0 {
-            // 方法一：PROCESS_QUERY_LIMITED_INFORMATION + GetModuleBaseNameW
-            // 对大多数普通进程（Word、VSCode、WPS 等）有效
-            let handle = OpenProcess(PROCESS_QUERY_LIMITED, 0, pid);
-            let name_opt = if !handle.is_null() {
-                let mut name: [u16; 256] = [0; 256];
-                let len = GetModuleBaseNameW(handle, std::ptr::null_mut(), name.as_mut_ptr(), 256);
-                CloseHandle(handle);
-                if len > 0 {
-                    Some(
-                        OsString::from_wide(&name[..len as usize])
-                            .to_string_lossy()
-                            .to_string(),
-                    )
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-
-            if let Some(n) = name_opt {
-                n
-            } else {
-                // 方法二：回退完整权限（覆盖 GetModuleBaseNameW 需要 PROCESS_VM_READ 的场景）
-                let handle2 = OpenProcess(PROCESS_QUERY_INFORMATION | 0x0010, 0, pid);
-                let name_opt2 = if !handle2.is_null() {
-                    let mut name: [u16; 256] = [0; 256];
-                    let len =
-                        GetModuleBaseNameW(handle2, std::ptr::null_mut(), name.as_mut_ptr(), 256);
-                    CloseHandle(handle2);
-                    if len > 0 {
-                        Some(
-                            OsString::from_wide(&name[..len as usize])
-                                .to_string_lossy()
-                                .to_string(),
-                        )
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
-
-                if let Some(n) = name_opt2 {
-                    n
-                } else {
-                    // 方法三：QueryFullProcessImageNameW，只需低权限，返回完整路径取文件名
-                    get_process_name_by_image(pid).unwrap_or_else(|| {
-                        // 方法四：从窗口标题最后一段推断（如 "文件名 - 应用名" 取最后段）
-                        // 避免进程全部落入 Unknown 导致时长无法区分统计
-                        if let Some(name_from_path) = executable_path.as_deref().and_then(|path| {
-                            std::path::Path::new(path)
-                                .file_name()
-                                .and_then(|name| name.to_str())
-                                .map(|name| name.to_string())
-                        }) {
-                            name_from_path
-                        } else if !window_title.is_empty() {
-                            window_title
-                                .split(" - ")
-                                .last()
-                                .map(|s| s.trim().to_string())
-                                .filter(|s| !s.is_empty() && s.len() < 40)
-                                .unwrap_or_else(|| "Unknown".to_string())
-                        } else {
-                            "Unknown".to_string()
-                        }
-                    })
+        // UWP 应用外层由 ApplicationFrameHost.exe 托管：通过子窗口 CoreWindow 解析真实应用进程
+        if pid > 0
+            && raw_app_name
+                .trim_end_matches(".exe")
+                .trim_end_matches(".EXE")
+                .eq_ignore_ascii_case("ApplicationFrameHost")
+        {
+            if let Some(child_pid) = resolve_uwp_child_pid_windows(hwnd, pid) {
+                let child_exe = get_process_image_path(child_pid);
+                let child_name =
+                    resolve_process_name_windows(child_pid, child_exe.as_deref(), &window_title);
+                if !child_name.is_empty() && child_name != "Unknown" {
+                    executable_path = child_exe.or(executable_path);
+                    raw_app_name = child_name;
                 }
             }
-        } else {
-            "Unknown".to_string()
-        };
+        }
 
         let app_name = normalize_display_app_name(&raw_app_name);
         let is_minimized = IsIconic(hwnd) != 0;
+        let is_private =
+            work_review_core::privacy::is_private_browser_window_title(&app_name, &window_title);
 
-        // 尝试获取浏览器 URL (Windows)，使用原始标题
-        let browser_url = if include_browser_url {
+        // 尝试获取浏览器 URL (Windows)，使用原始标题；无痕窗口不再触发 UIA 扫描
+        let browser_url = if include_browser_url && !is_private {
             get_browser_url_windows(&raw_app_name, &window_title, hwnd as isize)
         } else {
             None
@@ -841,6 +953,7 @@ fn get_active_window_with_options(include_browser_url: bool) -> Result<ActiveWin
             executable_path,
             window_bounds,
             is_minimized,
+            is_private,
         })
     }
 }
@@ -854,6 +967,8 @@ fn get_process_image_path(pid: u32) -> Option<String> {
     use winapi::um::processthreadsapi::OpenProcess;
     use winapi::um::winbase::QueryFullProcessImageNameW;
 
+    const ERROR_INSUFFICIENT_BUFFER: i32 = 122;
+
     unsafe {
         // 只需 PROCESS_QUERY_LIMITED_INFORMATION，对 UAC 保护进程也有效
         let handle = OpenProcess(0x1000, 0, pid);
@@ -861,20 +976,28 @@ fn get_process_image_path(pid: u32) -> Option<String> {
             return None;
         }
 
-        let mut buf: [u16; 512] = [0; 512];
-        let mut size: u32 = 512;
-        let ok = QueryFullProcessImageNameW(handle, 0, buf.as_mut_ptr(), &mut size);
+        let mut capacity = 512usize;
+        let mut resolved = None;
+        while capacity <= 4096 {
+            let mut buf = vec![0u16; capacity];
+            let mut size = capacity as u32;
+            let ok = QueryFullProcessImageNameW(handle, 0, buf.as_mut_ptr(), &mut size);
+            if ok != 0 && size > 0 {
+                resolved = normalize_executable_path(
+                    OsString::from_wide(&buf[..size as usize])
+                        .to_string_lossy()
+                        .as_ref(),
+                );
+                break;
+            }
+            if std::io::Error::last_os_error().raw_os_error() != Some(ERROR_INSUFFICIENT_BUFFER) {
+                break;
+            }
+            capacity *= 2;
+        }
         CloseHandle(handle);
 
-        if ok == 0 || size == 0 {
-            return None;
-        }
-
-        normalize_executable_path(
-            OsString::from_wide(&buf[..size as usize])
-                .to_string_lossy()
-                .as_ref(),
-        )
+        resolved
     }
 }
 
@@ -889,6 +1012,18 @@ fn get_process_name_by_image(pid: u32) -> Option<String> {
             .map(|s| s.to_string())
             .filter(|s| !s.is_empty())
     })
+}
+
+/// 进程 ID → 展示用应用名（与前台窗口采集同一套归一化），供截图遮罩判断隐私级别。
+/// 无法读取进程信息时返回空字符串。
+#[cfg(target_os = "windows")]
+pub(crate) fn display_app_name_for_pid(pid: u32) -> String {
+    if pid == 0 {
+        return String::new();
+    }
+    get_process_name_by_image(pid)
+        .map(|name| normalize_display_app_name(&name))
+        .unwrap_or_default()
 }
 
 #[cfg(target_os = "windows")]
@@ -1016,8 +1151,10 @@ struct BrowserUrlProtectionConfig {
 impl Default for BrowserUrlProtectionConfig {
     fn default() -> Self {
         Self {
-            success_ttl_ms: 3_000,
-            failure_ttl_ms: 2_000,
+            // 缓存键含 (hwnd, pid, raw_window_title)，标题一变立即失效；
+            // 标题未变化时延长 TTL 到 15 秒，大幅减少静态浏览页的重复 UIA 扫描。
+            success_ttl_ms: 15_000,
+            failure_ttl_ms: 3_000,
             slow_query_threshold_ms: 1_000,
             circuit_breaker_cooldown_ms: 20_000,
         }
@@ -1160,9 +1297,6 @@ static WINDOWS_BROWSER_URL_PROTECTION_CLOCK: Lazy<Instant> = Lazy::new(Instant::
 const WINDOWS_BROWSER_URL_WAIT_TIMEOUT_MS: u64 = 350;
 
 #[cfg(target_os = "windows")]
-const WINDOWS_BROWSER_URL_NATIVE_FALLBACK_BUDGET_MS: u64 = 200;
-
-#[cfg(target_os = "windows")]
 #[derive(Debug)]
 enum BrowserUrlWorkerResponse {
     Completed(Option<String>),
@@ -1193,46 +1327,56 @@ impl WindowsBrowserUrlWorker {
         let worker_queue = Arc::clone(&queue);
         let available = thread::Builder::new()
             .name("work-review-browser-uia".to_string())
-            .spawn(move || loop {
-                let job = {
-                    let (queue_lock, queue_ready) = &*worker_queue;
-                    let mut slot = queue_lock
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    while slot.pending.is_none() {
-                        slot = queue_ready
-                            .wait(slot)
+            .spawn(move || {
+                // 在固定 UIA 工作线程内复用 COM UIAutomation 实例与按 HWND 缓存的地址栏元素
+                let mut uia_session = WindowsUiaSession::default();
+                loop {
+                    let job = {
+                        let (queue_lock, queue_ready) = &*worker_queue;
+                        let mut slot = queue_lock
+                            .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        while slot.pending.is_none() {
+                            slot = queue_ready
+                                .wait(slot)
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        }
+                        slot.take().expect("待处理任务已由条件变量确认")
+                    };
+
+                    let now_ms = windows_browser_url_now_ms();
+                    let key_is_current = browser_url_cache_key_is_current_windows(&job.ticket.key);
+                    let query_is_active = WINDOWS_BROWSER_URL_PROTECTION
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .is_query_active(&job.ticket.key, now_ms);
+                    if !job
+                        .ticket
+                        .try_start(now_ms, key_is_current, query_is_active)
+                    {
+                        let _ = job.response_tx.send(BrowserUrlWorkerResponse::Skipped);
+                        continue;
                     }
-                    slot.take().expect("待处理任务已由条件变量确认")
-                };
 
-                let now_ms = windows_browser_url_now_ms();
-                let key_is_current = browser_url_cache_key_is_current_windows(&job.ticket.key);
-                let query_is_active = WINDOWS_BROWSER_URL_PROTECTION
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .is_query_active(&job.ticket.key, now_ms);
-                if !job
-                    .ticket
-                    .try_start(now_ms, key_is_current, query_is_active)
-                {
-                    let _ = job.response_tx.send(BrowserUrlWorkerResponse::Skipped);
-                    continue;
+                    let hwnd = job.ticket.key.identity.hwnd;
+                    let window_title = job.ticket.key.raw_window_title.as_str();
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        query_browser_url_windows_unprotected(
+                            &mut uia_session,
+                            &job.app_name,
+                            window_title,
+                            hwnd,
+                        )
+                    }))
+                    .unwrap_or_else(|_| {
+                        log::warn!("浏览器 URL 工作线程捕获到异常，重置 UIA 会话: hwnd={hwnd}");
+                        uia_session.reset();
+                        None
+                    });
+                    let _ = job
+                        .response_tx
+                        .send(BrowserUrlWorkerResponse::Completed(result));
                 }
-
-                let hwnd = job.ticket.key.identity.hwnd;
-                let window_title = job.ticket.key.raw_window_title.as_str();
-                let result = std::panic::catch_unwind(|| {
-                    query_browser_url_windows_unprotected(&job.app_name, window_title, hwnd)
-                })
-                .unwrap_or_else(|_| {
-                    log::warn!("浏览器 URL 工作线程捕获到异常: hwnd={hwnd}");
-                    None
-                });
-                let _ = job
-                    .response_tx
-                    .send(BrowserUrlWorkerResponse::Completed(result));
             })
             .map(|_| true)
             .unwrap_or_else(|error| {
@@ -1441,168 +1585,38 @@ fn get_browser_url_windows(app_name: &str, window_title: &str, hwnd: isize) -> O
     }
 }
 
+/// 固定在 UIA 工作线程内的会话状态：复用 `UIAutomation` COM 实例，并按 HWND 缓存地址栏元素，
+/// 避免每次轮询都重新初始化 COM 或遍历整个浏览器辅助功能树（且彻底移除 PowerShell 子进程兜底）。
 #[cfg(target_os = "windows")]
-fn query_browser_url_windows_unprotected(
-    app_name: &str,
-    window_title: &str,
-    hwnd: isize,
-) -> Option<String> {
-    let started_at = Instant::now();
-    // 使用原生 UI Automation 获取 URL，catch_unwind 防止 COM 异常导致崩溃
-    let native_result = std::panic::catch_unwind(|| get_url_via_uiautomation(hwnd)).unwrap_or(None);
-    if let Some(url) = native_result {
-        log::debug!("浏览器 URL 命中原生 UIA: {url}");
-        return Some(url);
-    }
-
-    let native_elapsed_ms = started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
-    if !should_run_windows_browser_url_fallback(
-        native_elapsed_ms,
-        WINDOWS_BROWSER_URL_NATIVE_FALLBACK_BUDGET_MS,
-    ) {
-        log::warn!(
-            "原生 UIA 已耗时 {}ms，跳过 PowerShell 二次扫描: hwnd={}",
-            native_elapsed_ms,
-            hwnd
-        );
-        return infer_browser_page_hint(window_title);
-    }
-
-    let powershell_result = get_url_via_powershell_uia(hwnd);
-    if let Some(url) = powershell_result {
-        log::debug!("浏览器 URL 命中 PowerShell UIA: {url}");
-        return Some(url);
-    }
-
-    // UI Automation 失败时，尝试从窗口标题提取域名信息作为兜底
-    let title_result = infer_browser_page_hint(window_title);
-    if title_result.is_none() {
-        log::debug!(
-            "浏览器 URL 获取失败: app={}, title={}",
-            app_name,
-            window_title
-        );
-    }
-    title_result
+#[derive(Default)]
+struct WindowsUiaSession {
+    automation: Option<uiautomation::UIAutomation>,
+    address_bar_cache: HashMap<isize, uiautomation::UIElement>,
 }
 
-#[cfg(any(target_os = "windows", test))]
-fn should_run_windows_browser_url_fallback(elapsed_ms: u64, budget_ms: u64) -> bool {
-    elapsed_ms < budget_ms
-}
-
-/// Windows PowerShell 5.1 + UIAutomation 兜底读取真实地址栏 URL
-/// 仅在原生 UIAutomation 失败时调用，避免常态化子进程开销。
 #[cfg(target_os = "windows")]
-fn get_url_via_powershell_uia(hwnd: isize) -> Option<String> {
-    const CREATE_NO_WINDOW: u32 = 0x08000000;
-    const POWERSHELL_PATH: &str = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe";
+impl WindowsUiaSession {
+    const MAX_CACHED_HWNDS: usize = 16;
 
-    let script = format!(
-        r#"
-$ErrorActionPreference = 'Stop'
-Add-Type -AssemblyName UIAutomationClient
-Add-Type -AssemblyName UIAutomationTypes
+    fn reset(&mut self) {
+        self.automation = None;
+        self.address_bar_cache.clear();
+    }
 
-$hwnd = [IntPtr]::new({hwnd})
-if ($hwnd -eq [IntPtr]::Zero) {{ exit 0 }}
-
-$window = [System.Windows.Automation.AutomationElement]::FromHandle($hwnd)
-if ($null -eq $window) {{ exit 0 }}
-
-$editCondition = New-Object System.Windows.Automation.PropertyCondition(
-    [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
-    [System.Windows.Automation.ControlType]::Edit
-)
-$docCondition = New-Object System.Windows.Automation.PropertyCondition(
-    [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
-    [System.Windows.Automation.ControlType]::Document
-)
-$allConditions = New-Object System.Windows.Automation.OrCondition($editCondition, $docCondition)
-$nodes = $window.FindAll([System.Windows.Automation.TreeScope]::Descendants, $allConditions)
-
-for ($i = 0; $i -lt $nodes.Count; $i++) {{
-    $node = $nodes.Item($i)
-    $candidates = New-Object System.Collections.Generic.List[string]
-
-    try {{
-        $vp = $node.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern)
-        if ($vp -ne $null -and $vp.Current.Value) {{ [void]$candidates.Add($vp.Current.Value) }}
-    }} catch {{ }}
-
-    try {{
-        $lp = $node.GetCurrentPattern([System.Windows.Automation.LegacyIAccessiblePattern]::Pattern)
-        if ($lp -ne $null -and $lp.Current.Value) {{ [void]$candidates.Add($lp.Current.Value) }}
-    }} catch {{ }}
-
-    try {{
-        if ($node.Current.Name) {{ [void]$candidates.Add($node.Current.Name) }}
-    }} catch {{ }}
-
-    foreach ($raw in $candidates) {{
-        if ([string]::IsNullOrWhiteSpace($raw)) {{ continue }}
-        $value = $raw.Trim()
-        if ($value -match '^(https?://|chrome://|edge://|about:|file:)' -or
-            $value -match '^(localhost|([a-zA-Z0-9-]+\.)+[a-zA-Z]{{2,}}|\d{{1,3}}(\.\d{{1,3}}){{3}})(:\d{{2,5}})?([/?#].*)?$') {{
-            Write-Output $value
-            exit 0
-        }}
-    }}
-}}
-"#
-    );
-
-    let output = run_monitor_command_with_timeout(
-        Command::new(POWERSHELL_PATH)
-            .args([
-                "-NoProfile",
-                "-NonInteractive",
-                "-Sta",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-Command",
-                &script,
-            ])
-            .creation_flags(CREATE_NO_WINDOW),
-        "Windows PowerShell URL 采集",
-    )
-    .ok()?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if !stderr.trim().is_empty() {
-            log::debug!("PowerShell URL 采集失败: {}", stderr.trim());
+    fn ensure_automation(&mut self) -> Option<&uiautomation::UIAutomation> {
+        if self.automation.is_none() {
+            self.automation = uiautomation::UIAutomation::new().ok();
         }
-        return None;
+        self.automation.as_ref()
     }
 
-    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    normalize_browser_url_candidate(&value)
-}
+    fn extract_url_from_control(control: &uiautomation::UIElement) -> Option<(i32, String)> {
+        use uiautomation::patterns::{UILegacyIAccessiblePattern, UIValuePattern};
+        use uiautomation::types::ControlType;
 
-/// 通过原生 UI Automation COM 接口获取浏览器地址栏 URL
-/// 使用 HWND 精准定位浏览器窗口，查找 Edit 控件并读取 ValuePattern
-#[cfg(target_os = "windows")]
-fn get_url_via_uiautomation(hwnd: isize) -> Option<String> {
-    use uiautomation::patterns::{UILegacyIAccessiblePattern, UIValuePattern};
-    use uiautomation::types::{ControlType, Handle};
-    use uiautomation::UIAutomation;
-
-    let automation = UIAutomation::new().ok()?;
-    // Handle 内部字段在 0.24.4 变为私有，改用 From trait 构造
-    let window_element = automation.element_from_handle(Handle::from(hwnd)).ok()?;
-
-    let mut best_match: Option<(i32, String)> = None;
-
-    let inspect_control = |control: uiautomation::UIElement,
-                           best_match: &mut Option<(i32, String)>| {
-        let control_type = match control.get_control_type() {
-            Ok(t) => t,
-            Err(_) => return,
-        };
-
+        let control_type = control.get_control_type().ok()?;
         if control_type != ControlType::Edit && control_type != ControlType::Document {
-            return;
+            return None;
         }
 
         let name = control.get_name().unwrap_or_default();
@@ -1629,6 +1643,7 @@ fn get_url_via_uiautomation(hwnd: isize) -> Option<String> {
         }
         candidates.push(name.clone());
 
+        let mut best: Option<(i32, String)> = None;
         for raw in candidates {
             let Some(url) = normalize_browser_url_candidate(&raw) else {
                 continue;
@@ -1639,7 +1654,6 @@ fn get_url_via_uiautomation(hwnd: isize) -> Option<String> {
                 ControlType::Document => 15,
                 _ => 0,
             };
-
             if address_like {
                 score += 50;
             }
@@ -1650,51 +1664,128 @@ fn get_url_via_uiautomation(hwnd: isize) -> Option<String> {
             }
 
             if score >= 60
-                && best_match
+                && best
                     .as_ref()
                     .map(|(best_score, _)| score > *best_score)
                     .unwrap_or(true)
             {
-                *best_match = Some((score, url));
+                best = Some((score, url));
             }
         }
-    };
-
-    // 先扫描全部 Edit 控件。
-    // Chrome/Chromium 的地址栏在不同版本和 UI 状态下不一定是第一个 Edit；
-    // 只取 find_first 很容易误拿到页面内搜索框，导致 URL 统计长期为空。
-    if let Ok(edits) = automation
-        .create_matcher()
-        .from(window_element.clone())
-        .control_type(ControlType::Edit)
-        .timeout(300)
-        .find_all()
-    {
-        for edit in edits {
-            inspect_control(edit, &mut best_match);
-        }
-    }
-    if let Some((score, url)) = &best_match {
-        if *score >= 85 {
-            return Some(url.clone());
-        }
+        best
     }
 
-    // 再扫 Document 控件作为补充。
-    // 某些浏览器或特殊页面会把可读 URL 暴露在 Document，而不是地址栏 Edit。
-    if let Ok(docs) = automation
-        .create_matcher()
-        .from(window_element)
-        .control_type(ControlType::Document)
-        .timeout(300)
-        .find_all()
-    {
-        for doc in docs {
-            inspect_control(doc, &mut best_match);
+    fn get_url(&mut self, hwnd: isize) -> Option<String> {
+        use uiautomation::types::{ControlType, Handle};
+
+        // 快路径：命中该窗口已缓存的地址栏元素，直接读取 ValuePattern，无需遍历整棵 UIA 树。
+        if let Some(cached) = self.address_bar_cache.get(&hwnd) {
+            if let Some((_, url)) = Self::extract_url_from_control(cached) {
+                return Some(url);
+            }
+            self.address_bar_cache.remove(&hwnd);
         }
+
+        let window_element = {
+            let first_try = self
+                .ensure_automation()
+                .and_then(|automation| automation.element_from_handle(Handle::from(hwnd)).ok());
+            match first_try {
+                Some(el) => el,
+                None => {
+                    // COM 实例异常时重建一次重试
+                    self.reset();
+                    self.ensure_automation()?
+                        .element_from_handle(Handle::from(hwnd))
+                        .ok()?
+                }
+            }
+        };
+        let automation = self.automation.as_ref()?;
+
+        let mut best_match: Option<(i32, String, Option<uiautomation::UIElement>)> = None;
+
+        // 先扫描全部 Edit 控件，定位真实地址栏并缓存该元素。
+        if let Ok(edits) = automation
+            .create_matcher()
+            .from(window_element.clone())
+            .control_type(ControlType::Edit)
+            .timeout(300)
+            .find_all()
+        {
+            for edit in edits {
+                if let Some((score, url)) = Self::extract_url_from_control(&edit) {
+                    if best_match
+                        .as_ref()
+                        .map(|(best_score, _, _)| score > *best_score)
+                        .unwrap_or(true)
+                    {
+                        best_match = Some((score, url, Some(edit)));
+                    }
+                }
+            }
+        }
+        if let Some((score, url, cached_el)) = best_match.take() {
+            if score >= 85 {
+                if let Some(el) = cached_el {
+                    if self.address_bar_cache.len() >= Self::MAX_CACHED_HWNDS {
+                        self.address_bar_cache.clear();
+                    }
+                    self.address_bar_cache.insert(hwnd, el);
+                }
+                return Some(url);
+            }
+            best_match = Some((score, url, cached_el));
+        }
+
+        // 再扫 Document 控件作为补充。
+        if let Ok(docs) = automation
+            .create_matcher()
+            .from(window_element)
+            .control_type(ControlType::Document)
+            .timeout(300)
+            .find_all()
+        {
+            for doc in docs {
+                if let Some((score, url)) = Self::extract_url_from_control(&doc) {
+                    if best_match
+                        .as_ref()
+                        .map(|(best_score, _, _)| score > *best_score)
+                        .unwrap_or(true)
+                    {
+                        best_match = Some((score, url, None));
+                    }
+                }
+            }
+        }
+
+        best_match.map(|(_, url, _)| url)
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn query_browser_url_windows_unprotected(
+    uia_session: &mut WindowsUiaSession,
+    app_name: &str,
+    window_title: &str,
+    hwnd: isize,
+) -> Option<String> {
+    // 仅使用复用的原生 UI Automation COM 接口，不再派生注定超时的 PowerShell 子进程。
+    if let Some(url) = uia_session.get_url(hwnd) {
+        log::debug!("浏览器 URL 命中原生 UIA: {url}");
+        return Some(url);
     }
 
-    best_match.map(|(_, url)| url)
+    // UI Automation 失败时，尝试从窗口标题提取域名信息作为兜底
+    let title_result = infer_browser_page_hint(window_title);
+    if title_result.is_none() {
+        log::debug!(
+            "浏览器 URL 获取失败: app={}, title={}",
+            app_name,
+            window_title
+        );
+    }
+    title_result
 }
 
 #[cfg(test)]
@@ -1714,9 +1805,9 @@ mod tests {
         normalize_macos_frontmost_app_name, parse_gnome_focused_window_dbus_output,
         parse_hyprland_window_bounds, parse_kdotool_geometry_output,
         parse_xdotool_geometry_shell_output, resolve_browser_url_for_window_linux,
-        should_run_windows_browser_url_fallback, strip_not_responding_suffix, BrowserUrlCacheKey,
-        BrowserUrlProtection, BrowserUrlProtectionConfig, BrowserUrlQueryDecision,
-        BrowserUrlQueryTicket, LatestOnlySlot, WindowBounds,
+        strip_not_responding_suffix, BrowserUrlCacheKey, BrowserUrlProtection,
+        BrowserUrlProtectionConfig, BrowserUrlQueryDecision, BrowserUrlQueryTicket, LatestOnlySlot,
+        WindowBounds,
     };
     use std::path::Path;
     #[cfg(target_os = "macos")]
@@ -1999,10 +2090,18 @@ mod tests {
     }
 
     #[test]
-    fn windows浏览器url保护_原生查询超过预算后不应再运行powershell() {
-        assert!(should_run_windows_browser_url_fallback(199, 200));
-        assert!(!should_run_windows_browser_url_fallback(200, 200));
-        assert!(!should_run_windows_browser_url_fallback(800, 200));
+    fn windows浏览器url保护_默认策略应在标题未变时延长缓存ttl() {
+        let mut protection = BrowserUrlProtection::new(windows浏览器url保护测试配置());
+        let key = windows浏览器url保护测试键(111, 1011, "静态页面 - Google Chrome");
+        assert_eq!(
+            protection.begin_query(&key, 0),
+            BrowserUrlQueryDecision::StartQuery
+        );
+        assert!(!protection.finish_query(&key, 0, 50, Some("https://docs.rs".to_string()), false));
+        assert_eq!(
+            protection.begin_query(&key, 1_500),
+            BrowserUrlQueryDecision::UseCached(Some("https://docs.rs".to_string()))
+        );
     }
 
     #[test]
@@ -2734,13 +2833,15 @@ fn get_active_window_with_options(include_browser_url: bool) -> Result<ActiveWin
         app_path.as_deref(),
     );
 
+    let is_private =
+        work_review_core::privacy::is_private_browser_window_title(&app_name, &raw_window_title);
     let window_title = clean_browser_window_title(&raw_window_title, &app_name);
 
     let window_bounds =
         ax_bounds.or_else(|| find_frontmost_window_bounds(&raw_app_name, &raw_window_title));
 
-    // 如果是浏览器，尝试获取 URL（使用原始标题，清理后的标题可能丢失 URL 信息）
-    let browser_url = if include_browser_url {
+    // 如果是浏览器，尝试获取 URL（使用原始标题，清理后的标题可能丢失 URL 信息；无痕窗口不抓 URL）
+    let browser_url = if include_browser_url && !is_private {
         get_browser_url(&app_name, &raw_window_title)
     } else {
         None
@@ -2753,6 +2854,7 @@ fn get_active_window_with_options(include_browser_url: bool) -> Result<ActiveWin
         executable_path: app_path,
         window_bounds,
         is_minimized: false,
+        is_private,
     })
 }
 
@@ -3538,7 +3640,37 @@ fn get_browser_url_via_system_events(process_name: &str) -> Option<String> {
 }
 
 #[cfg(target_os = "macos")]
+static MACOS_BROWSER_URL_CACHE: Lazy<Mutex<HashMap<(String, String), (Instant, Option<String>)>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+#[cfg(target_os = "macos")]
+const MACOS_BROWSER_URL_CACHE_TTL: Duration = Duration::from_secs(3);
+
+#[cfg(target_os = "macos")]
 fn get_browser_url(app_name: &str, window_title: &str) -> Option<String> {
+    let cache_key = (app_name.to_string(), window_title.to_string());
+    if let Ok(cache) = MACOS_BROWSER_URL_CACHE.lock() {
+        if let Some((cached_at, cached_url)) = cache.get(&cache_key) {
+            if cached_at.elapsed() < MACOS_BROWSER_URL_CACHE_TTL {
+                return cached_url.clone();
+            }
+        }
+    }
+
+    let resolved = get_browser_url_uncached_macos(app_name, window_title);
+
+    if let Ok(mut cache) = MACOS_BROWSER_URL_CACHE.lock() {
+        if cache.len() >= 32 {
+            cache.retain(|_, (cached_at, _)| cached_at.elapsed() < MACOS_BROWSER_URL_CACHE_TTL);
+        }
+        cache.insert(cache_key, (Instant::now(), resolved.clone()));
+    }
+
+    resolved
+}
+
+#[cfg(target_os = "macos")]
+fn get_browser_url_uncached_macos(app_name: &str, window_title: &str) -> Option<String> {
     let app_lower = app_name.to_lowercase();
 
     if app_lower.contains("firefox") || app_lower.contains("zen") {
@@ -3777,7 +3909,13 @@ fn build_linux_x11_active_window(
     window_bounds: Option<WindowBounds>,
 ) -> ActiveWindow {
     let app_name = normalize_display_app_name(&raw_app_name);
-    let browser_url = resolve_browser_url_for_window_linux(&app_name, &raw_window_title);
+    let is_private =
+        work_review_core::privacy::is_private_browser_window_title(&app_name, &raw_window_title);
+    let browser_url = if is_private {
+        None
+    } else {
+        resolve_browser_url_for_window_linux(&app_name, &raw_window_title)
+    };
     let window_title = clean_browser_window_title(&raw_window_title, &app_name);
 
     ActiveWindow {
@@ -3787,12 +3925,205 @@ fn build_linux_x11_active_window(
         executable_path,
         window_bounds,
         is_minimized: false,
+        is_private,
+    }
+}
+
+/// Linux X11 原生协议直连读取活动窗口信息，零子进程派生；失败时回退 xdotool。
+#[cfg(target_os = "linux")]
+fn get_active_window_linux_x11_native() -> Result<ActiveWindow> {
+    use std::ffi::CString;
+    use std::os::raw::{c_int, c_long, c_uchar, c_ulong, c_void};
+    use x11::xlib;
+
+    unsafe {
+        let display = xlib::XOpenDisplay(std::ptr::null());
+        if display.is_null() {
+            return Err(AppError::Unknown("无法连接 X11 Display".to_string()));
+        }
+
+        struct XDisplayGuard(*mut xlib::Display);
+        impl Drop for XDisplayGuard {
+            fn drop(&mut self) {
+                unsafe {
+                    xlib::XCloseDisplay(self.0);
+                }
+            }
+        }
+        let _guard = XDisplayGuard(display);
+
+        let root = xlib::XDefaultRootWindow(display);
+        let intern = |name: &str| -> xlib::Atom {
+            let c_name = CString::new(name).expect("X11 atom name has no NUL");
+            xlib::XInternAtom(display, c_name.as_ptr(), xlib::False)
+        };
+
+        let atom_active = intern("_NET_ACTIVE_WINDOW");
+        let atom_utf8 = intern("UTF8_STRING");
+        let atom_net_wm_name = intern("_NET_WM_NAME");
+        let atom_net_wm_pid = intern("_NET_WM_PID");
+        let atom_wm_class = intern("WM_CLASS");
+
+        let read_window_prop = |win: xlib::Window,
+                                prop: xlib::Atom,
+                                req_type: xlib::Atom,
+                                max_longs: c_long|
+         -> Option<(xlib::Atom, c_int, Vec<u8>)> {
+            let mut actual_type: xlib::Atom = 0;
+            let mut actual_format: c_int = 0;
+            let mut nitems: c_ulong = 0;
+            let mut bytes_after: c_ulong = 0;
+            let mut data: *mut c_uchar = std::ptr::null_mut();
+            let status = xlib::XGetWindowProperty(
+                display,
+                win,
+                prop,
+                0,
+                max_longs,
+                xlib::False,
+                req_type,
+                &mut actual_type,
+                &mut actual_format,
+                &mut nitems,
+                &mut bytes_after,
+                &mut data,
+            );
+            if status != c_int::from(xlib::Success) || data.is_null() || nitems == 0 {
+                if !data.is_null() {
+                    xlib::XFree(data as *mut c_void);
+                }
+                return None;
+            }
+            let byte_len = match actual_format {
+                8 => nitems as usize,
+                16 => (nitems as usize) * 2,
+                32 => (nitems as usize) * std::mem::size_of::<c_long>(),
+                _ => 0,
+            };
+            let bytes = std::slice::from_raw_parts(data, byte_len).to_vec();
+            xlib::XFree(data as *mut c_void);
+            Some((actual_type, actual_format, bytes))
+        };
+
+        let (_, fmt, bytes) = read_window_prop(root, atom_active, xlib::XA_WINDOW, 1)
+            .ok_or_else(|| AppError::Unknown("X11 _NET_ACTIVE_WINDOW 不可用".to_string()))?;
+        if fmt != 32 || bytes.len() < std::mem::size_of::<c_long>() {
+            return Err(AppError::Unknown("X11 活动窗口 ID 格式异常".to_string()));
+        }
+        let mut raw_long = [0u8; std::mem::size_of::<c_long>()];
+        raw_long.copy_from_slice(&bytes[..raw_long.len()]);
+        let active_win = c_long::from_ne_bytes(raw_long) as xlib::Window;
+        if active_win == 0 {
+            return Err(AppError::Unknown("没有活动窗口".to_string()));
+        }
+
+        // 窗口标题：优先 _NET_WM_NAME (UTF-8)，回退 WM_NAME
+        let window_title = read_window_prop(active_win, atom_net_wm_name, atom_utf8, 1024)
+            .or_else(|| {
+                read_window_prop(
+                    active_win,
+                    xlib::XA_WM_NAME,
+                    xlib::AnyPropertyType as xlib::Atom,
+                    1024,
+                )
+            })
+            .map(|(_, _, b)| {
+                let end = b.iter().position(|&c| c == 0).unwrap_or(b.len());
+                String::from_utf8_lossy(&b[..end]).trim().to_string()
+            })
+            .unwrap_or_default();
+
+        // PID：读 _NET_WM_PID
+        let pid = read_window_prop(active_win, atom_net_wm_pid, xlib::XA_CARDINAL, 1).and_then(
+            |(_, pid_fmt, pid_bytes)| {
+                if pid_fmt == 32 && pid_bytes.len() >= std::mem::size_of::<c_long>() {
+                    let mut buf = [0u8; std::mem::size_of::<c_long>()];
+                    buf.copy_from_slice(&pid_bytes[..buf.len()]);
+                    let val = c_long::from_ne_bytes(buf);
+                    u32::try_from(val).ok().filter(|&p| p > 0)
+                } else {
+                    None
+                }
+            },
+        );
+
+        let (app_name, executable_path) = if let Some(pid) = pid {
+            let exe_path = std::fs::read_link(format!("/proc/{pid}/exe"))
+                .ok()
+                .map(|p| p.to_string_lossy().to_string());
+            let comm = std::fs::read_to_string(format!("/proc/{pid}/comm"))
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            let name = if !comm.is_empty() {
+                comm
+            } else if let Some(ref ep) = exe_path {
+                std::path::Path::new(ep)
+                    .file_name()
+                    .map(|f| f.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "Unknown".to_string())
+            } else {
+                "Unknown".to_string()
+            };
+            (name, exe_path)
+        } else {
+            let class_name = read_window_prop(active_win, atom_wm_class, xlib::XA_STRING, 256)
+                .and_then(|(_, _, b)| {
+                    let parts: Vec<&str> = b
+                        .split(|&byte| byte == 0)
+                        .filter(|s| !s.is_empty())
+                        .filter_map(|s| std::str::from_utf8(s).ok())
+                        .collect();
+                    parts
+                        .get(1)
+                        .or_else(|| parts.first())
+                        .map(|s| s.to_string())
+                })
+                .unwrap_or_else(|| "Unknown".to_string());
+            (class_name, None)
+        };
+
+        let mut attrs: xlib::XWindowAttributes = std::mem::zeroed();
+        let window_bounds = if xlib::XGetWindowAttributes(display, active_win, &mut attrs) != 0
+            && attrs.width > 0
+            && attrs.height > 0
+        {
+            let mut abs_x: c_int = 0;
+            let mut abs_y: c_int = 0;
+            let mut child: xlib::Window = 0;
+            if xlib::XTranslateCoordinates(
+                display, active_win, root, 0, 0, &mut abs_x, &mut abs_y, &mut child,
+            ) != 0
+            {
+                Some(WindowBounds {
+                    x: abs_x,
+                    y: abs_y,
+                    width: attrs.width as u32,
+                    height: attrs.height as u32,
+                })
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        Ok(build_linux_x11_active_window(
+            app_name,
+            window_title,
+            executable_path,
+            window_bounds,
+        ))
     }
 }
 
 #[cfg(target_os = "linux")]
 fn get_active_window_linux_x11() -> Result<ActiveWindow> {
-    // 使用 xdotool 获取当前活动窗口 ID
+    if let Ok(window) = get_active_window_linux_x11_native() {
+        return Ok(window);
+    }
+
+    // 原生 X11 不可用时回退 xdotool
     let wid_output = run_monitor_command_with_timeout(
         Command::new("xdotool").arg("getactivewindow"),
         "xdotool getactivewindow",
@@ -4052,7 +4383,13 @@ fn build_linux_wayland_active_window(
 
     let app_name = normalize_display_app_name(trimmed_app_name);
     let executable_path = pid.and_then(read_executable_path_from_pid);
-    let browser_url = resolve_browser_url_for_window_linux(&app_name, trimmed_title);
+    let is_private =
+        work_review_core::privacy::is_private_browser_window_title(&app_name, trimmed_title);
+    let browser_url = if is_private {
+        None
+    } else {
+        resolve_browser_url_for_window_linux(&app_name, trimmed_title)
+    };
     let cleaned_title = clean_browser_window_title(trimmed_title, &app_name);
 
     Ok(ActiveWindow {
@@ -4062,6 +4399,7 @@ fn build_linux_wayland_active_window(
         executable_path,
         window_bounds,
         is_minimized: false,
+        is_private,
     })
 }
 
@@ -4159,7 +4497,13 @@ fn parse_gnome_focused_window_dbus_output(output: &str) -> Result<ActiveWindow> 
         .and_then(|pid| read_executable_path_from_pid(pid as u32));
 
     let app_name = normalize_display_app_name(raw_app_name);
-    let browser_url = resolve_browser_url_for_window_linux(&app_name, &window_title);
+    let is_private =
+        work_review_core::privacy::is_private_browser_window_title(&app_name, &window_title);
+    let browser_url = if is_private {
+        None
+    } else {
+        resolve_browser_url_for_window_linux(&app_name, &window_title)
+    };
     let cleaned_title = clean_browser_window_title(&window_title, &app_name);
 
     Ok(ActiveWindow {
@@ -4169,6 +4513,7 @@ fn parse_gnome_focused_window_dbus_output(output: &str) -> Result<ActiveWindow> 
         executable_path,
         window_bounds,
         is_minimized: false,
+        is_private,
     })
 }
 
@@ -4339,6 +4684,7 @@ pub fn get_active_window_fast() -> Result<ActiveWindow> {
         executable_path: None,
         window_bounds: None,
         is_minimized: false,
+        is_private: false,
     })
 }
 
@@ -4546,6 +4892,10 @@ pub fn get_overlay_windows(frontmost_app: &str) -> Vec<ActiveWindow> {
                 height as i32
             );
 
+            let is_private = work_review_core::privacy::is_private_browser_window_title(
+                &owner_name,
+                &window_title,
+            );
             results.push(ActiveWindow {
                 app_name: owner_name,
                 window_title,
@@ -4553,6 +4903,7 @@ pub fn get_overlay_windows(frontmost_app: &str) -> Vec<ActiveWindow> {
                 executable_path: None,
                 window_bounds: None,
                 is_minimized: false,
+                is_private,
             });
         }
 

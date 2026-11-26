@@ -2,13 +2,13 @@
   import { onMount, onDestroy } from 'svelte';
   import { invoke } from '@tauri-apps/api/core';
   import { open as openDialog, save as saveDialog } from '@tauri-apps/plugin-dialog';
-  import { open } from '@tauri-apps/plugin-shell';
   import { marked } from 'marked';
   import DOMPurify from 'dompurify';
   import { get } from 'svelte/store';
   import { showToast } from '../../lib/stores/toast.ts';
   import { confirm } from '../../lib/stores/confirm.ts';
   import { portalToBody } from '$lib/actions/portal.ts';
+  import { interceptExternalLinks } from '$lib/actions/externalLinks.ts';
   import { cache, type CacheState } from '../../lib/stores/cache.ts';
   import { formatLocalizedDate, formatLocalizedTime, formatDurationLocalized, locale, t, tm, translateCategoryLabel } from '$lib/i18n/index.ts';
   import { formatUserError } from '$lib/utils/errorDisplay.ts';
@@ -25,6 +25,7 @@
     type VisibleReportSection,
   } from './reportSections.ts';
   import { createReportGenerationOwnership, createReportRequestSnapshot, shiftIsoDate } from './reportDateNavigation.ts';
+  import { getIsoWeekKey, shiftIsoWeekKey, getMonthKey, shiftMonthKey } from './reportPeriodNavigation.ts';
   import LocalizedDatePicker from '../../lib/components/LocalizedDatePicker.svelte';
 
   interface DailyReport {
@@ -83,6 +84,25 @@
     count: number;
   }
 
+  type ReportViewMode = 'day' | 'week' | 'month';
+
+  const reportViewTabs: ReadonlyArray<{ id: ReportViewMode; labelKey: string }> = [
+    { id: 'day', labelKey: 'report.viewDay' },
+    { id: 'week', labelKey: 'report.viewWeek' },
+    { id: 'month', labelKey: 'report.viewMonth' },
+  ];
+
+  interface PeriodReviewPayload {
+    periodType: 'week' | 'month';
+    periodKey: string;
+    dateFrom: string;
+    dateTo: string;
+    locale: string;
+    content: string;
+    createdAt: number;
+    cached: boolean;
+  }
+
   type BatchPreset = 'thisWeek' | 'lastWeek' | 'thisMonth' | 'lastMonth';
 
   function isRecord(value: unknown): value is Record<string, unknown> {
@@ -113,6 +133,169 @@
 
   function getYesterdayDateString() {
     return shiftIsoDate(getLocalDateString(), -1);
+  }
+
+  // ===== 周报 / 月报周期复盘（M3-6） =====
+  let reportViewMode: ReportViewMode = 'day';
+  let selectedWeekKey = getIsoWeekKey(new Date());
+  let selectedMonthKey = getMonthKey(new Date());
+  let periodReview: PeriodReviewPayload | null = null;
+  let periodLoading = false;
+  let periodGenerating = false;
+  let periodExporting = false;
+  let periodError: string | null = null;
+  let periodRequestId = 0;
+  let lastLoadedPeriodCacheKey = '';
+
+  function syncViewModeFromHash() {
+    if (typeof window === 'undefined') return;
+    const hash = window.location.hash || '';
+    const qIdx = hash.indexOf('?');
+    if (qIdx < 0) return;
+    const params = new URLSearchParams(hash.slice(qIdx + 1));
+    const view = params.get('view');
+    if (view === 'week' || view === 'month' || view === 'day') {
+      reportViewMode = view;
+    }
+  }
+
+  function setReportViewMode(mode: ReportViewMode) {
+    if (reportViewMode === mode) return;
+    reportViewMode = mode;
+    showExportMenu = false;
+    if (mode === 'day') {
+      lastLoadedPeriodCacheKey = '';
+    }
+    if (typeof window !== 'undefined' && window.location.hash.startsWith('#/report')) {
+      const targetHash = mode === 'day' ? '#/report' : `#/report?view=${mode}`;
+      if (window.location.hash !== targetHash) {
+        window.history.replaceState(null, '', targetHash);
+      }
+    }
+  }
+
+  function stepPeriod(delta: number) {
+    if (reportViewMode === 'week') {
+      const next = shiftIsoWeekKey(selectedWeekKey, delta);
+      const current = getIsoWeekKey(new Date());
+      if (delta > 0 && next > current) return;
+      selectedWeekKey = next;
+    } else if (reportViewMode === 'month') {
+      const next = shiftMonthKey(selectedMonthKey, delta);
+      const current = getMonthKey(new Date());
+      if (delta > 0 && next > current) return;
+      selectedMonthKey = next;
+    }
+  }
+
+  function selectCurrentPeriod() {
+    if (reportViewMode === 'week') {
+      selectedWeekKey = getIsoWeekKey(new Date());
+    } else if (reportViewMode === 'month') {
+      selectedMonthKey = getMonthKey(new Date());
+    }
+  }
+
+  async function loadPeriodReview(
+    periodType: 'week' | 'month',
+    periodKey: string,
+    targetLocale: string,
+  ) {
+    const requestId = ++periodRequestId;
+    // 切换周期/语言时立即释放前一个被覆盖的生成态，防止 periodGenerating 永久卡死
+    periodGenerating = false;
+    periodLoading = true;
+    periodError = null;
+    periodReview = null;
+    try {
+      const saved = await invoke<PeriodReviewPayload | null>('get_saved_period_review', {
+        periodType,
+        periodKey,
+        locale: targetLocale,
+      });
+      if (requestId !== periodRequestId) return;
+      periodReview = saved;
+    } catch (e) {
+      if (requestId === periodRequestId) {
+        periodError = formatUserError(e, t('common.loadFailedRetry'));
+      }
+    } finally {
+      if (requestId === periodRequestId) {
+        periodLoading = false;
+      }
+    }
+  }
+
+  async function generatePeriodReview(force = false) {
+    if (reportViewMode === 'day' || periodGenerating) return;
+    const periodType = reportViewMode;
+    const periodKey = periodType === 'week' ? selectedWeekKey : selectedMonthKey;
+    const targetLocale = currentLocale;
+    const requestId = ++periodRequestId;
+    periodLoading = false;
+    periodGenerating = true;
+    periodError = null;
+    try {
+      const generated = await invoke<PeriodReviewPayload>('generate_period_review', {
+        periodType,
+        periodKey,
+        locale: targetLocale,
+        force,
+      });
+      if (requestId !== periodRequestId) return;
+      periodReview = generated;
+    } catch (e) {
+      if (requestId === periodRequestId) {
+        periodError = formatUserError(e, t('common.loadFailedRetry'));
+      }
+    } finally {
+      if (requestId === periodRequestId) {
+        periodGenerating = false;
+      }
+    }
+  }
+
+  async function copyPeriodReviewContent() {
+    if (!periodReview?.content) return;
+    try {
+      await navigator.clipboard.writeText(periodReview.content);
+      showToast(t('report.periodCopied'), 'success');
+    } catch {
+      showToast(t('report.copyFailed'), 'error');
+    }
+  }
+
+  async function exportPeriodReviewMarkdown() {
+    if (!periodReview || periodExporting) return;
+    periodExporting = true;
+    try {
+      let exportDir = config?.daily_report_export_dir || null;
+      if (!exportDir) {
+        const selected = await openDialog({
+          directory: true,
+          multiple: false,
+        });
+        if (!selected || Array.isArray(selected)) {
+          return;
+        }
+        exportDir = selected;
+      }
+      const path = await invoke<string>('export_period_review_markdown', {
+        periodType: periodReview.periodType,
+        periodKey: periodReview.periodKey,
+        content: periodReview.content,
+        exportDir,
+        locale: periodReview.locale || currentLocale,
+      });
+      showToast(t('report.periodExportSuccess', { path }), 'success');
+    } catch (e) {
+      showToast(
+        t('report.exportFailed', { error: formatUserError(e, t('common.loadFailedRetry')) }),
+        'error',
+      );
+    } finally {
+      periodExporting = false;
+    }
   }
 
   let report: DailyReport | null = null;
@@ -151,6 +334,19 @@
   $: generating = cacheData?.reportGenerating ?? false;
   $: currentLocale = $locale;
   $: currentReportCacheKey = `${selectedDate}:${currentLocale}`;
+  $: activePeriodKey = reportViewMode === 'week' ? selectedWeekKey : selectedMonthKey;
+  $: canStepPeriodForward = reportViewMode === 'week'
+    ? selectedWeekKey < getIsoWeekKey(new Date())
+    : selectedMonthKey < getMonthKey(new Date());
+  $: activePeriodCacheKey = reportViewMode === 'day'
+    ? ''
+    : `${reportViewMode}:${activePeriodKey}:${currentLocale}`;
+  $: if (activePeriodCacheKey && activePeriodCacheKey !== lastLoadedPeriodCacheKey) {
+    lastLoadedPeriodCacheKey = activePeriodCacheKey;
+    if (reportViewMode !== 'day') {
+      void loadPeriodReview(reportViewMode, activePeriodKey, currentLocale);
+    }
+  }
 
   // 获取 AI 模式显示名称
   function getAiModeName(mode: unknown): string {
@@ -345,7 +541,13 @@
     promptSaving = true;
     try {
       config.daily_report_custom_prompt = (config.daily_report_custom_prompt || '').trim();
-      await invoke('save_config', { config });
+      // 只提交本页负责的字段：页面持有的旧配置整份写回会覆盖托盘 / 段落偏好等刚做的修改
+      await invoke('patch_config', {
+        patch: {
+          daily_report_custom_prompt: config.daily_report_custom_prompt,
+          daily_report_system_prompt_override: config.daily_report_system_prompt_override ?? null,
+        },
+      });
     } finally {
       promptSaving = false;
     }
@@ -357,7 +559,12 @@
   async function savePresets() {
     if (!config) return;
     try {
-      await invoke('save_config', { config });
+      await invoke('patch_config', {
+        patch: {
+          daily_report_prompt_presets: config.daily_report_prompt_presets,
+          daily_report_custom_prompt: config.daily_report_custom_prompt,
+        },
+      });
     } catch (e) {
       console.error('保存预设失败:', e);
     }
@@ -390,7 +597,10 @@
       });
       showToast(t('report.exportSuccess', { path: exportPath }), 'success');
     } catch (e) {
-      showToast(t('report.exportFailed', { error: e }), 'error');
+      showToast(
+        t('report.exportFailed', { error: formatUserError(e, t('common.loadFailedRetry')) }),
+        'error',
+      );
     } finally {
       exportInProgress = false;
     }
@@ -513,37 +723,12 @@
 
   function renderMarkdown(content: string): string {
     const rawHtml = marked.parse(content);
-    return typeof rawHtml === 'string' ? DOMPurify.sanitize(rawHtml) : '';
-  }
-
-  async function handleReportLinkClick(event: MouseEvent) {
-    const target = event.target;
-    const link = target instanceof Element ? target.closest('a[href]') : null;
-    if (!link) return;
-
-    const href = link.getAttribute('href');
-    if (!href || href.startsWith('#')) return;
-
-    event.preventDefault();
-    try {
-      await open(href);
-    } catch (e) {
-      console.error('打开日报链接失败:', e);
-    }
-  }
-
-  function interceptReportLinks(node: HTMLElement) {
-    const listener = (event: MouseEvent) => {
-      handleReportLinkClick(event);
-    };
-
-    node.addEventListener('click', listener);
-
-    return {
-      destroy() {
-        node.removeEventListener('click', listener);
-      }
-    };
+    return typeof rawHtml === 'string'
+      ? DOMPurify.sanitize(rawHtml, {
+        FORBID_TAGS: ['form', 'input', 'button', 'textarea', 'select', 'area', 'map'],
+        FORBID_ATTR: ['xlink:href'],
+      })
+      : '';
   }
 
   // 结构化编辑：将 markdown 按 ## 标题拆分为段落
@@ -962,12 +1147,20 @@
   }
 
   onMount(() => {
+    syncViewModeFromHash();
+    const handleHashChange = () => syncViewModeFromHash();
+    if (typeof window !== 'undefined') {
+      window.addEventListener('hashchange', handleHashChange);
+    }
     loadConfig();
     // 分类色板：数据对照面板构成条着色（与概览/时间线同一色源）
     invoke<CategoryDefinition[]>('get_categories')
       .then((cats) => { categoryList = cats || []; })
       .catch(() => { categoryList = []; });
     return () => {
+      if (typeof window !== 'undefined') {
+        window.removeEventListener('hashchange', handleHashChange);
+      }
       sectionObserver?.disconnect();
       sectionObserver = null;
     };
@@ -1004,6 +1197,20 @@
         </div>
       </div>
       <div class="report-hero-actions">
+        <div class="inline-flex items-center rounded-lg border border-slate-200 dark:border-[#30363d] bg-slate-50/80 dark:bg-[#161b22] p-0.5">
+          {#each reportViewTabs as viewTab (viewTab.id)}
+            <button
+              type="button"
+              class="rounded-md px-2.5 py-1 text-xs font-medium transition-colors {reportViewMode === viewTab.id
+                ? 'bg-white text-slate-900 shadow-xs dark:bg-[#21262d] dark:text-[#e6edf3]'
+                : 'text-slate-500 hover:text-slate-800 dark:text-[#7d8590] dark:hover:text-[#c9d1d9]'}"
+              on:click={() => setReportViewMode(viewTab.id)}
+            >
+              {t(viewTab.labelKey)}
+            </button>
+          {/each}
+        </div>
+        {#if reportViewMode === 'day'}
         <div class="page-toolbar-end">
           <button
             type="button"
@@ -1128,11 +1335,71 @@
             {/if}
           </button>
         {/if}
+        {:else}
+        <div class="page-toolbar-end">
+          <button
+            type="button"
+            class="page-control-btn"
+            on:click={() => stepPeriod(-1)}
+          >
+            {t('report.periodPrevious')}
+          </button>
+          <button
+            type="button"
+            class="page-control-btn {!canStepPeriodForward ? 'page-control-btn-active' : ''}"
+            on:click={selectCurrentPeriod}
+          >
+            {reportViewMode === 'week' ? t('report.periodCurrentWeek') : t('report.periodCurrentMonth')}
+          </button>
+          <span class="px-2.5 py-1 text-xs font-mono font-medium text-slate-700 dark:text-[#c9d1d9] rounded-lg border border-slate-200 dark:border-[#30363d] bg-white dark:bg-[#161b22]">
+            {activePeriodKey}
+          </span>
+          <button
+            type="button"
+            class="page-control-btn disabled:opacity-40 disabled:cursor-not-allowed"
+            disabled={!canStepPeriodForward}
+            on:click={() => stepPeriod(1)}
+          >
+            {t('report.periodNext')}
+          </button>
+        </div>
+        {#if periodReview}
+          <button
+            type="button"
+            class="page-action-secondary min-h-9 px-3 py-1.5"
+            on:click={copyPeriodReviewContent}
+          >
+            {t('report.exportMenuCopy')}
+          </button>
+          <button
+            type="button"
+            class="page-action-secondary min-h-9 px-3 py-1.5"
+            disabled={periodExporting}
+            on:click={exportPeriodReviewMarkdown}
+          >
+            {periodExporting ? t('report.exporting') : t('report.exportMarkdown')}
+          </button>
+          <button
+            type="button"
+            class="page-action-warn"
+            disabled={periodGenerating}
+            on:click={() => generatePeriodReview(true)}
+          >
+            {#if periodGenerating}
+              <div class="animate-spin rounded-full h-4 w-4 border-2 border-white border-t-transparent"></div>
+              {t('report.periodGenerating')}
+            {:else}
+              {t('report.periodRegenerate')}
+            {/if}
+          </button>
+        {/if}
+        {/if}
       </div>
     </div>
   </div>
 
   <div class="report-editorial-stack">
+  {#if reportViewMode === 'day'}
   <!-- 历史周条：工具栏下方一行,弱化为无卡片细行（解 A6） -->
   <div class="report-weekstrip" aria-label={t('report.weekStripLabel')}>
     <span class="report-weekstrip-label">{t('report.weekStripLabel')}</span>
@@ -1423,7 +1690,7 @@
             <div class="report-section group/section" id={`report-sec-${i}`} use:tocAnchor={i}>
               <div class="report-section-header">
                 <div
-                  use:interceptReportLinks
+                  use:interceptExternalLinks
                   class="report-section-content"
                 >
                   {@html renderMarkdown(reportSectionMarkdownForDisplay(section, section.displaySectionIndex ?? i, currentLocale))}
@@ -1574,6 +1841,91 @@
       </button>
     </div>
   {/if}
+  {:else}
+    <!-- 周报 / 月报周期复盘视图（M3-6） -->
+    {#if periodLoading}
+      <div class="empty-state-lg">
+        <div class="empty-state-icon">
+          <div class="animate-spin rounded-full h-8 w-8 border-2 border-blue-500 border-t-transparent"></div>
+        </div>
+        <h3 class="empty-state-title">{t('report.loadingTitle')}</h3>
+        <p class="empty-state-copy mt-1">{t('report.loadingCopy')}</p>
+      </div>
+    {:else if periodError}
+      <div class="page-banner-error">
+        <div>
+          <div class="flex items-center gap-3 text-red-500 mb-2">
+            <span class="font-medium">{t('report.generateFailed')}</span>
+          </div>
+          <p class="text-sm">{periodError}</p>
+        </div>
+        <button type="button" class="page-action-brand" on:click={() => generatePeriodReview(false)}>{t('common.retry')}</button>
+      </div>
+    {:else if periodReview}
+      <div class="page-card report-sheet report-article-card min-w-0">
+        <div class="report-sheet-content">
+          <header class="report-article-head">
+            <p class="report-article-kicker">{reportViewMode === 'week' ? t('report.viewWeek') : t('report.viewMonth')}</p>
+            <h1 class="report-article-title">{periodReview.periodKey}</h1>
+            <div class="report-hero-meta">
+              <div class="report-hero-date-row report-article-metaline">
+                <span>{periodReview.dateFrom} ~ {periodReview.dateTo}</span>
+                <span class="report-article-metadot">·</span>
+                <span>{t('report.generatedAt', { time: formatLocalizedDate(new Date(periodReview.createdAt * 1000), { month: '2-digit', day: '2-digit' }) + ' ' + formatLocalizedTime(new Date(periodReview.createdAt * 1000), { hour: '2-digit', minute: '2-digit' }) })}</span>
+              </div>
+            </div>
+          </header>
+          <div
+            use:interceptExternalLinks
+            class="markdown-body report-sheet-body prose prose-slate dark:prose-invert max-w-none"
+          >
+            {@html renderMarkdown(periodReview.content)}
+          </div>
+        </div>
+      </div>
+    {:else if periodGenerating}
+      <div class="page-card report-sheet report-article-card">
+        <div class="report-sheet-content animate-pulse space-y-4 py-2">
+          <div class="h-4 w-48 rounded-full bg-slate-200/80 dark:bg-[#21262d] mx-auto"></div>
+          <div class="space-y-2.5">
+            {#each Array(4) as _}
+              <div class="h-3.5 rounded-full bg-slate-100/90 dark:bg-[#161b22]"></div>
+            {/each}
+          </div>
+          <p class="pt-2 text-center text-xs text-slate-400 dark:text-[#636c76]">{t('report.periodGenerating')}</p>
+        </div>
+      </div>
+    {:else}
+      <div class="empty-state-lg">
+        <div class="empty-state-icon !w-16 !h-16 !mb-5 bg-indigo-50 dark:bg-indigo-950/30">
+          <span class="text-3xl">📊</span>
+        </div>
+        <h3 class="empty-state-title">
+          {reportViewMode === 'week'
+            ? t('report.periodEmptyWeek', { period: activePeriodKey })
+            : t('report.periodEmptyMonth', { period: activePeriodKey })}
+        </h3>
+        <p class="empty-state-copy mb-5">
+          {t('report.periodEmptyHint')}
+        </p>
+        <button
+          type="button"
+          class="page-action-warn min-h-11 px-6 py-3"
+          on:click={() => generatePeriodReview(false)}
+          disabled={periodGenerating}
+        >
+          {#if periodGenerating}
+            <div class="inline-flex items-center gap-2">
+              <div class="animate-spin rounded-full h-4 w-4 border-2 border-white border-t-transparent"></div>
+              {t('report.periodGenerating')}
+            </div>
+          {:else}
+            ✨ {t('report.periodGenerate')}
+          {/if}
+        </button>
+      </div>
+    {/if}
+  {/if}
 </div>
 </div>
 
@@ -1584,7 +1936,7 @@
     <div class="modal-panel relative z-10">
       <div class="modal-header">
         <h3 id="report-edit-section-title" class="modal-title">{t('report.editSection')}</h3>
-        <button class="modal-close" on:click={cancelEditSection}>
+        <button class="modal-close" aria-label={t('window.close')} on:click={cancelEditSection}>
           <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
           </svg>
@@ -1629,7 +1981,7 @@
     <div class="modal-panel relative z-10" style="max-width: 36rem;">
       <div class="modal-header">
         <h3 id="report-preset-dialog-title" class="modal-title">{editingPresetIndex >= 0 ? editingPresetName || t('report.presetsTitle') : t('report.addPreset')}</h3>
-        <button class="modal-close" on:click={() => { showPresetModal = false; }}>
+        <button class="modal-close" aria-label={t('window.close')} on:click={() => { showPresetModal = false; }}>
           <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
         </button>
       </div>
@@ -1689,6 +2041,7 @@
         <h3 id="report-batch-export-dialog-title" class="modal-title">{t('report.batchExportModalTitle')}</h3>
         <button
           class="modal-close"
+          aria-label={t('window.close')}
           on:click={() => { if (!batchExporting) showBatchExportModal = false; }}
           disabled={batchExporting}
         >

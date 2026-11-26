@@ -228,7 +228,7 @@ Work Review 的核心始終是**本地記錄**。AI 的作用是讓記錄更容�
 - 更新請下載便攜 ZIP，退出後替換 EXE 並保留原 `Data`，不要執行安裝版更新程式。便攜模式不能切換至外部資料目錄；退出並備份、移走 `Data` 後可恢復本機原有目錄。
 - WebView2 快取、自動啟動註冊及使用者選擇的外部匯出路徑仍由系統管理；`Data` 可能含 API Key，請勿公開分享。
 
-**可透過 [v1.1.4-rc.2 測試版](https://github.com/wm94i/Work-Review/releases/tag/v1.1.4-rc.2) 試用；`v1.1.4-rc.1` 及更早版本不包含此支援。**
+**可透過 [v1.2.0-rc.1 測試版](https://github.com/wm94i/Work-Review/releases/tag/v1.2.0-rc.1) 試用；`v1.1.4-rc.1` 及更早版本不包含此支援。**
 
 > **Windows 11 智慧型應用程式控制**：若系統提示「智慧型應用程式控制已封鎖應用程式」，是因為本應用使用自簽憑證（非 EV 商業憑證）。可在「Windows 安全性 → 應用程式與瀏覽器控制 → 智慧型應用程式控制」中關閉後執行。詳見 [#139](https://github.com/wm94i/Work-Review/issues/139)。
 
@@ -315,10 +315,11 @@ Authorization: Bearer <token>
 |------|------|------|
 | GET | `/health` | 健康檢查（免鑑權） |
 | GET | `/v1/device` | 設備資訊 |
-| GET | `/v1/timeline/{date}` | 時間線（`date` 格式 `YYYY-MM-DD`，支援 `?limit=&offset=`） |
-| GET | `/v1/activities/{date}` | 活動列表（支援 `?limit=&offset=&category=`） |
+| GET | `/v1/timeline/{date}` | 時間線（`date` 格式 `YYYY-MM-DD`，支援 `?limit=&offset=&include_ocr=`；預設 500 筆、上限 2000 筆；需在 config.json 開啟 `localhost_api_include_ocr` 且請求帶 `include_ocr=true` 才回傳 OCR 文字） |
+| GET | `/v1/activities/{date}` | 活動列表（支援 `?limit=&include_ocr=`；筆數上限與 OCR 規則同時間線） |
 | GET | `/v1/stats/today` | 今日統計 |
 | GET | `/v1/stats/overview` | 綜合統計（`?mode=today|date|week|range`） |
+| GET | `/v1/stats/focus` | 專注度與上下文切換/打斷指標（`?mode=today|date|week|range`） |
 | GET | `/v1/stats/daily/{date}` | 指定日期統計 |
 | GET | `/v1/reports` | 日報列表（`?limit=`） |
 | GET | `/v1/reports/{date}` | 指定日期日報（`?locale=`） |
@@ -353,7 +354,7 @@ curl -H "Authorization: Bearer $(cat ~/work-review/localhost_api_token.txt)" \
 <details>
 <summary>MCP Server</summary>
 
-通過 stdio 協議將工作記錄接入 AI 編碼工具（Claude Code / Cursor / VS Code Copilot 等）。
+通過 stdio 協議將工作記錄接入 AI 編碼工具（Claude Code / Cursor / VS Code Copilot 等）。MCP 預設不回傳 OCR 原文與截圖路徑（需在 `config.json` 中明確設定 `mcp_include_ocr: true`）並依目前隱私規則去識別化；飛書 / 釘釘 / 企業微信 Bot 需先在「設定 → 接入管理」產生一次性綁定碼並在對話中傳送 `/bind 綁定碼` 完成授權。
 
 ```bash
 cargo build --release -p work-review-mcp-server

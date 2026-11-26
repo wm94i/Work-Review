@@ -96,6 +96,8 @@ pub struct PolicyEnforcer {
     max_audit_entries: usize,
     /// MCP 客户端权限白名单
     mcp_permissions: Vec<Permission>,
+    /// MCP 读取活动/会话时是否输出原文（OCR、截图路径等）；默认 false → 脱敏后允许
+    mcp_raw_activities: bool,
     /// Localhost API 权限
     localhost_permissions: Vec<Permission>,
     /// Skill 权限映射
@@ -133,9 +135,15 @@ impl PolicyEnforcer {
             audit_log: Vec::new(),
             max_audit_entries: 1000,
             mcp_permissions,
+            mcp_raw_activities: config.mcp_include_ocr,
             localhost_permissions,
             skill_permissions: HashMap::new(),
         }
+    }
+
+    /// 根据最新配置刷新策略开关（用于 MCP 热重载配置）
+    pub fn update_from_config(&mut self, config: &AppConfig) {
+        self.mcp_raw_activities = config.mcp_include_ocr;
     }
 
     /// 检查权限并记录审计日志
@@ -187,13 +195,23 @@ impl PolicyEnforcer {
     ) -> (PolicyDecision, Option<String>) {
         match source {
             CallSource::McpTool { .. } => {
-                if self.mcp_permissions.contains(&permission) {
-                    (PolicyDecision::Allow, None)
-                } else {
+                if !self.mcp_permissions.contains(&permission) {
                     (
                         PolicyDecision::Deny,
                         Some(format!("MCP 客户端无 {permission:?} 权限")),
                     )
+                } else if !self.mcp_raw_activities
+                    && matches!(
+                        permission,
+                        Permission::ReadActivities
+                            | Permission::ReadSessions
+                            | Permission::ReadStats
+                    )
+                {
+                    // 活动/会话/统计可能携带 OCR、可执行文件路径或远程截图 URL，默认脱敏后再交给外部 AI 客户端
+                    (PolicyDecision::AllowSanitized, None)
+                } else {
+                    (PolicyDecision::Allow, None)
                 }
             }
             CallSource::SkillExecution { skill_id } => {
@@ -242,5 +260,60 @@ impl PolicyEnforcer {
             self.audit_log
                 .drain(0..self.audit_log.len() - self.max_audit_entries);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::field_reassign_with_default)]
+
+    use super::*;
+
+    fn mcp_source() -> CallSource {
+        CallSource::McpTool {
+            tool_name: "query_timeline".to_string(),
+            client_id: None,
+        }
+    }
+
+    #[test]
+    fn mcp读取活动默认应脱敏后允许() {
+        let mut policy = PolicyEnforcer::new(&AppConfig::default());
+        assert_eq!(
+            policy.check_permission(&mcp_source(), Permission::ReadActivities),
+            PolicyDecision::AllowSanitized
+        );
+        assert_eq!(
+            policy.check_permission(&mcp_source(), Permission::ReadSessions),
+            PolicyDecision::AllowSanitized
+        );
+        assert_eq!(
+            policy.check_permission(&mcp_source(), Permission::ReadStats),
+            PolicyDecision::AllowSanitized
+        );
+        assert_eq!(
+            policy.check_permission(&mcp_source(), Permission::ReadReports),
+            PolicyDecision::Allow
+        );
+    }
+
+    #[test]
+    fn 显式开启原文后mcp读取活动应直接允许() {
+        let mut config = AppConfig::default();
+        config.mcp_include_ocr = true;
+        let mut policy = PolicyEnforcer::new(&config);
+        assert_eq!(
+            policy.check_permission(&mcp_source(), Permission::ReadActivities),
+            PolicyDecision::Allow
+        );
+    }
+
+    #[test]
+    fn mcp不在白名单内的权限应拒绝() {
+        let mut policy = PolicyEnforcer::new(&AppConfig::default());
+        assert_eq!(
+            policy.check_permission(&mcp_source(), Permission::WriteConfig),
+            PolicyDecision::Deny
+        );
     }
 }

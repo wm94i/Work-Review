@@ -4,6 +4,7 @@ use crate::screenshot::ScreenshotService;
 use crate::storage::StorageManager;
 use crate::AppState;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, State};
 use work_review_core::config::AppConfig;
@@ -11,7 +12,37 @@ use work_review_core::database::Database;
 use work_review_core::error::AppError;
 use work_review_core::privacy::PrivacyFilter;
 
-use super::shared::persist_app_config;
+use super::shared::update_app_config;
+
+static DATA_MAINTENANCE_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+
+/// 进程级数据目录维护互斥守卫（覆盖 `change_data_dir` 与 `restore_backup`），
+/// 防止迁移与恢复并发争用数据目录和 SQLite 句柄。
+pub(crate) struct DataMaintenanceGuard {
+    armed: bool,
+}
+
+impl DataMaintenanceGuard {
+    /// 进程即将重启时保留锁态直到进程退出，防止重启前 600ms 窗口内并发修改数据目录。
+    pub(crate) fn keep_locked_until_exit(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for DataMaintenanceGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            DATA_MAINTENANCE_IN_PROGRESS.store(false, Ordering::Release);
+        }
+    }
+}
+
+pub(crate) fn try_acquire_data_maintenance_lock() -> Result<DataMaintenanceGuard, AppError> {
+    DATA_MAINTENANCE_IN_PROGRESS
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .map(|_| DataMaintenanceGuard { armed: true })
+        .map_err(|_| AppError::Config("当前正在执行数据目录迁移或备份恢复，请稍候再试".to_string()))
+}
 
 const MANAGED_DATA_ENTRIES: &[&str] = &[
     "config.json",
@@ -39,7 +70,24 @@ pub async fn save_config(
     app: AppHandle,
     state: State<'_, Arc<Mutex<AppState>>>,
 ) -> Result<(), AppError> {
-    // 模型端点安全校验：远程端点必须使用 https，明文 http 仅允许本机/内网（Ollama 等）
+    validate_config_endpoints(&config)?;
+    update_app_config(app, state.inner(), move |current| {
+        Ok(preserve_server_owned_fields(config, current))
+    })
+    .map(|_| ())
+}
+
+/// 由后端维护、前端草稿不应覆盖的字段：设置页持有的是打开时的配置快照，
+/// 期间在聊天中完成的 Bot 发送者绑定 / Telegram 绑定码消费若被整份写回就会丢失（绑定码也会"复活"）。
+fn preserve_server_owned_fields(mut incoming: AppConfig, current: &AppConfig) -> AppConfig {
+    incoming.bot_sender_bindings = current.bot_sender_bindings.clone();
+    incoming.telegram_bot_bind_code = current.telegram_bot_bind_code.clone();
+    incoming.telegram_bot_bind_code_expires_at = current.telegram_bot_bind_code_expires_at;
+    incoming
+}
+
+/// 模型端点安全校验：远程端点必须使用 https，明文 http 仅允许本机/内网（Ollama 等）
+fn validate_config_endpoints(config: &AppConfig) -> Result<(), AppError> {
     super::ai::validate_model_endpoint(&config.text_model.endpoint)?;
     super::ai::validate_model_endpoint(&config.vision_model.endpoint)?;
     super::ai::validate_model_endpoint(&config.ai_provider.endpoint)?;
@@ -49,7 +97,275 @@ pub async fn save_config(
     for cached in config.text_model_provider_cache.values() {
         super::ai::validate_model_endpoint(&cached.endpoint)?;
     }
-    persist_app_config(config, app, state.inner())
+    // 嵌入服务会收到活动文本（含 OCR）与 embedding_api_key，同样禁止公网明文 http
+    super::ai::validate_model_endpoint(&config.embedding_endpoint)?;
+    Ok(())
+}
+
+/// 动态 Map 类字段（如 `HashMap<String, ModelConfig>`）在局部补丁时整体替换，
+/// 避免对象深度递归合并导致无法删除键或清空缓存。
+const MAP_REPLACE_KEYS: &[&str] = &["text_model_provider_cache"];
+
+/// 深度合并：对象逐键递归，动态 Map 与其它值（含数组与 null）整体替换。
+fn merge_json_value(base: &mut serde_json::Value, patch: &serde_json::Value) {
+    match (base, patch) {
+        (serde_json::Value::Object(base_map), serde_json::Value::Object(patch_map)) => {
+            for (key, value) in patch_map {
+                if MAP_REPLACE_KEYS.contains(&key.as_str()) {
+                    base_map.insert(key.clone(), value.clone());
+                    continue;
+                }
+                match base_map.get_mut(key) {
+                    Some(existing) if existing.is_object() && value.is_object() => {
+                        merge_json_value(existing, value)
+                    }
+                    _ => {
+                        base_map.insert(key.clone(), value.clone());
+                    }
+                }
+            }
+        }
+        (base, patch) => *base = patch.clone(),
+    }
+}
+
+/// 把局部配置合并到当前配置上（纯函数）。未知的顶层字段直接报错，避免拼写错误被静默忽略。
+pub(crate) fn apply_config_patch(
+    current: &AppConfig,
+    patch: &serde_json::Value,
+) -> Result<AppConfig, AppError> {
+    let patch_map = patch
+        .as_object()
+        .ok_or_else(|| AppError::Config("配置补丁必须是对象".to_string()))?;
+    let mut merged = serde_json::to_value(current)
+        .map_err(|e| AppError::Unknown(format!("序列化当前配置失败: {e}")))?;
+    if let Some(base_map) = merged.as_object() {
+        if let Some(unknown) = patch_map.keys().find(|key| !base_map.contains_key(*key)) {
+            return Err(AppError::Config(format!("未知的配置字段: {unknown}")));
+        }
+    }
+    merge_json_value(&mut merged, patch);
+    serde_json::from_value(merged).map_err(|e| AppError::Config(format!("配置补丁无效: {e}")))
+}
+
+/// 局部更新配置：只合并调用方提交的字段，服务端读-改-写，
+/// 避免页面持有的旧配置整份写回时覆盖其它位置（托盘、Bot、同步等）刚做的修改。
+#[tauri::command]
+pub async fn patch_config(
+    patch: serde_json::Value,
+    app: AppHandle,
+    state: State<'_, Arc<Mutex<AppState>>>,
+) -> Result<AppConfig, AppError> {
+    if patch.get("bot_sender_bindings").is_some()
+        || patch.get("telegram_bot_bind_code").is_some()
+        || patch.get("telegram_bot_bind_code_expires_at").is_some()
+        || patch.get("config_synced_at").is_some()
+    {
+        return Err(AppError::Config(
+            "Bot 绑定与同步元数据字段只能通过专用后端命令维护".to_string(),
+        ));
+    }
+    update_app_config(app, state.inner(), |current| {
+        let next = apply_config_patch(current, &patch)?;
+        validate_config_endpoints(&next)?;
+        Ok(next)
+    })
+}
+
+/// 设置单个应用的隐私级别（`full` 表示移除规则）。服务端读-改-写，不依赖前端持有的配置。
+pub(crate) fn apply_app_privacy_level(
+    config: &mut AppConfig,
+    app_name: &str,
+    level: &str,
+) -> Result<(), AppError> {
+    use work_review_core::config::{AppPrivacyRule, PrivacyLevel};
+    let app_name = app_name.trim();
+    if app_name.is_empty() {
+        return Err(AppError::Config("应用名不能为空".to_string()));
+    }
+    let target_key = work_review_core::categorize::normalize_display_app_name(app_name)
+        .trim()
+        .to_lowercase();
+    if target_key.is_empty() {
+        return Err(AppError::Config("应用名无效".to_string()));
+    }
+    let level = match level {
+        "full" => None,
+        "anonymized" => Some(PrivacyLevel::Anonymized),
+        "ignored" => Some(PrivacyLevel::Ignored),
+        other => return Err(AppError::Config(format!("未知的隐私级别: {other}"))),
+    };
+    let matches_target = |raw: &str| {
+        work_review_core::categorize::normalize_display_app_name(raw.trim())
+            .trim()
+            .to_lowercase()
+            == target_key
+    };
+    // 按归一化应用名对齐并清理所有别名/大小写重复项以及遗留 excluded_apps
+    config
+        .privacy
+        .excluded_apps
+        .retain(|app| !matches_target(app));
+    let rules = &mut config.privacy.app_rules;
+    match level {
+        None => rules.retain(|rule| !matches_target(&rule.app_name)),
+        Some(level) => {
+            let mut updated = false;
+            rules.retain_mut(|rule| {
+                if matches_target(&rule.app_name) {
+                    if !updated {
+                        rule.level = level;
+                        updated = true;
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    true
+                }
+            });
+            if !updated {
+                rules.push(AppPrivacyRule {
+                    app_name: app_name.to_string(),
+                    level,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn set_app_privacy_level(
+    app_name: String,
+    level: String,
+    app: AppHandle,
+    state: State<'_, Arc<Mutex<AppState>>>,
+) -> Result<(), AppError> {
+    update_app_config(app, state.inner(), |current| {
+        let mut config = current.clone();
+        apply_app_privacy_level(&mut config, &app_name, &level)?;
+        Ok(config)
+    })
+    .map(|_| ())
+}
+
+#[cfg(test)]
+mod patch_tests {
+    #![allow(clippy::field_reassign_with_default)]
+
+    use super::{apply_app_privacy_level, apply_config_patch, preserve_server_owned_fields};
+    use work_review_core::config::{AppConfig, BotSenderBinding, PrivacyLevel};
+
+    #[test]
+    fn 整份保存配置不得覆盖后端维护的bot绑定() {
+        let mut current = AppConfig::default();
+        current.bot_sender_bindings.insert(
+            "feishu".to_string(),
+            BotSenderBinding {
+                allowed_senders: vec!["ou_new".to_string()],
+                ..BotSenderBinding::default()
+            },
+        );
+        // 设置页草稿是打开页面时的快照：绑定码尚未使用、没有授权成员
+        let mut stale_draft = AppConfig::default();
+        stale_draft.theme = "dark".to_string();
+        stale_draft.bot_sender_bindings.insert(
+            "feishu".to_string(),
+            BotSenderBinding {
+                bind_code: Some("WR-OLD".to_string()),
+                bind_code_expires_at: Some(i64::MAX),
+                ..BotSenderBinding::default()
+            },
+        );
+        let saved = preserve_server_owned_fields(stale_draft, &current);
+        assert_eq!(saved.theme, "dark");
+        let binding = &saved.bot_sender_bindings["feishu"];
+        assert_eq!(binding.allowed_senders, vec!["ou_new".to_string()]);
+        assert!(binding.bind_code.is_none());
+    }
+
+    #[test]
+    fn 局部更新只改提交的字段() {
+        let mut current = AppConfig::default();
+        current.theme = "light".to_string();
+        current.telegram_bot_allowed_chat_ids = vec![42];
+        let next = apply_config_patch(
+            &current,
+            &serde_json::json!({ "daily_report_custom_prompt": "新提示词" }),
+        )
+        .unwrap();
+        assert_eq!(next.daily_report_custom_prompt, "新提示词");
+        assert_eq!(next.theme, "light");
+        assert_eq!(next.telegram_bot_allowed_chat_ids, vec![42]);
+    }
+
+    #[test]
+    fn 局部更新嵌套对象应逐键合并() {
+        let mut current = AppConfig::default();
+        current.storage.jpeg_quality = 70;
+        let next = apply_config_patch(
+            &current,
+            &serde_json::json!({ "storage": { "screenshot_retention_days": 3 } }),
+        )
+        .unwrap();
+        assert_eq!(next.storage.screenshot_retention_days, 3);
+        assert_eq!(next.storage.jpeg_quality, 70);
+    }
+
+    #[test]
+    fn 局部更新应拒绝未知字段与类型错误() {
+        let current = AppConfig::default();
+        assert!(apply_config_patch(&current, &serde_json::json!({ "no_such_field": 1 })).is_err());
+        assert!(apply_config_patch(&current, &serde_json::json!({ "theme": 123 })).is_err());
+        assert!(apply_config_patch(&current, &serde_json::json!([1, 2])).is_err());
+    }
+
+    #[test]
+    fn 局部更新可把可选字段置空() {
+        let mut current = AppConfig::default();
+        current.daily_report_system_prompt_override = Some("override".to_string());
+        let next = apply_config_patch(
+            &current,
+            &serde_json::json!({ "daily_report_system_prompt_override": null }),
+        )
+        .unwrap();
+        assert!(next.daily_report_system_prompt_override.is_none());
+    }
+
+    #[test]
+    fn 设置应用隐私级别应新增更新与移除规则() {
+        let mut config = AppConfig::default();
+        apply_app_privacy_level(&mut config, "WeChat", "ignored").unwrap();
+        let level = |config: &AppConfig| {
+            config
+                .privacy
+                .app_rules
+                .iter()
+                .find(|rule| rule.app_name == "WeChat")
+                .map(|rule| rule.level)
+        };
+        assert_eq!(level(&config), Some(PrivacyLevel::Ignored));
+        apply_app_privacy_level(&mut config, "WeChat", "anonymized").unwrap();
+        assert_eq!(level(&config), Some(PrivacyLevel::Anonymized));
+        apply_app_privacy_level(&mut config, "WeChat", "full").unwrap();
+        assert_eq!(level(&config), None);
+        assert!(apply_app_privacy_level(&mut config, "WeChat", "bogus").is_err());
+        assert!(apply_app_privacy_level(&mut config, "  ", "ignored").is_err());
+
+        // 大小写不同视为同一应用：不新增重复规则，也能正确移除
+        apply_app_privacy_level(&mut config, "WeChat", "ignored").unwrap();
+        apply_app_privacy_level(&mut config, "wechat", "anonymized").unwrap();
+        let count = config
+            .privacy
+            .app_rules
+            .iter()
+            .filter(|rule| rule.app_name.eq_ignore_ascii_case("wechat"))
+            .count();
+        assert_eq!(count, 1);
+        apply_app_privacy_level(&mut config, "WECHAT", "full").unwrap();
+        assert_eq!(level(&config), None);
+    }
 }
 
 /// 获取数据目录
@@ -65,7 +381,7 @@ pub async fn get_default_data_dir() -> Result<String, AppError> {
     Ok(path_for_display(&crate::default_data_dir()))
 }
 
-fn path_for_display(path: &Path) -> String {
+pub(crate) fn path_for_display(path: &Path) -> String {
     let raw = path.to_string_lossy().to_string();
 
     #[cfg(target_os = "windows")]
@@ -157,7 +473,7 @@ fn migration_entry_names() -> Vec<&'static str> {
     names
 }
 
-fn remove_migration_path(path: &Path) -> Result<(), AppError> {
+pub(crate) fn remove_migration_path(path: &Path) -> Result<(), AppError> {
     let metadata = match std::fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -172,7 +488,7 @@ fn remove_migration_path(path: &Path) -> Result<(), AppError> {
     Ok(())
 }
 
-fn migration_sibling_path(target_dir: &Path, label: &str) -> Result<PathBuf, AppError> {
+pub(crate) fn migration_sibling_path(target_dir: &Path, label: &str) -> Result<PathBuf, AppError> {
     let parent = target_dir
         .parent()
         .ok_or_else(|| AppError::Config("无法为数据迁移创建临时目录".to_string()))?;
@@ -215,7 +531,7 @@ fn restore_migration_entries(
     Ok(())
 }
 
-fn commit_migration_stage(stage_dir: &Path, target_dir: &Path) -> Result<(), AppError> {
+pub(crate) fn commit_migration_stage(stage_dir: &Path, target_dir: &Path) -> Result<(), AppError> {
     let backup_dir = migration_sibling_path(target_dir, "migration-backup")?;
     std::fs::create_dir_all(&backup_dir)?;
     let mut moved_entries = Vec::new();
@@ -259,7 +575,7 @@ fn commit_migration_stage(stage_dir: &Path, target_dir: &Path) -> Result<(), App
     Ok(())
 }
 
-fn copy_managed_data_without_live_db(
+pub(crate) fn copy_managed_data_without_live_db(
     source_dir: &Path,
     target_dir: &Path,
 ) -> Result<u64, AppError> {
@@ -337,6 +653,7 @@ pub async fn change_data_dir(
     app: AppHandle,
     state: State<'_, Arc<Mutex<AppState>>>,
 ) -> Result<serde_json::Value, AppError> {
+    let _maintenance_guard = try_acquire_data_maintenance_lock()?;
     let requested_dir = target_dir.trim();
     if requested_dir.is_empty() {
         return Err(AppError::Config("目标目录不能为空".to_string()));
@@ -360,6 +677,30 @@ pub async fn change_data_dir(
 
     // 只校验目标目录，不先删除其中的旧数据。
     let replaced_existing_data = ensure_target_dir_ready(&target_dir)?;
+
+    // 迁移窗口期暂停录制，防止后台采集线程向即将替换的旧库继续写入活动导致迁移丢数。
+    struct RecordingPauseGuard {
+        state: Arc<Mutex<AppState>>,
+        previous_paused: bool,
+    }
+    impl Drop for RecordingPauseGuard {
+        fn drop(&mut self) {
+            if let Ok(mut guard) = self.state.lock() {
+                guard.is_paused = self.previous_paused;
+            }
+        }
+    }
+    let previous_paused = {
+        let mut guard = state.lock().map_err(|e| AppError::Unknown(e.to_string()))?;
+        let prev = guard.is_paused;
+        guard.is_paused = true;
+        prev
+    };
+    let pause_guard = RecordingPauseGuard {
+        state: state.inner().clone(),
+        previous_paused,
+    };
+
     let staging_dir = migration_sibling_path(&target_dir, "migration-stage")?;
     std::fs::create_dir_all(&staging_dir)?;
 
@@ -398,19 +739,24 @@ pub async fn change_data_dir(
     };
 
     // 重新获取锁，仅做轻量状态更新
-    let mut state = state.lock().map_err(|e| AppError::Unknown(e.to_string()))?;
-    state.database = Database::new(&target_dir.join("workreview.db"))?;
-    if let Err(e) = state.database.rebuild_fts_index() {
+    let mut state_guard = state.lock().map_err(|e| AppError::Unknown(e.to_string()))?;
+    state_guard.database = Database::new(&target_dir.join("workreview.db"))?;
+    if let Err(e) = state_guard.database.rebuild_fts_index() {
         log::warn!("迁移后 FTS 索引重建失败: {e}");
     }
-    state.privacy_filter = PrivacyFilter::from_config(&config.privacy);
-    state.screenshot_service = ScreenshotService::new(&target_dir, &config.storage);
-    state.storage_manager = StorageManager::new(&target_dir, config.storage.clone());
-    state.data_dir = target_dir.clone();
-    state.config_path = config_path;
+    state_guard.privacy_filter = PrivacyFilter::from_config(&config.privacy);
+    state_guard.screenshot_service = ScreenshotService::new(&target_dir, &config.storage);
+    state_guard
+        .screenshot_service
+        .update_privacy(&config.privacy);
+    state_guard.storage_manager = StorageManager::new(&target_dir, config.storage.clone());
+    state_guard.data_dir = target_dir.clone();
+    state_guard.config_path = config_path;
 
     log::info!("数据目录已切换到: {target_dir:?}");
-    drop(state);
+    drop(state_guard);
+    // 显式释放暂停守卫，恢复原录制暂停状态并同步通知前端
+    drop(pause_guard);
     crate::emit_recording_state_changed(&app);
 
     Ok(serde_json::json!({

@@ -185,7 +185,7 @@ test('欢迎态应减少空白、调整字体并固定为两列两行', () => {
 });
 
 test('新聊天画布应继续保留阅读轴、输入框和深色低对比边界', () => {
-  assert.match(appCssSource, /\.ask-thread-shell\s*\{[^}]*max-width:\s*(?:47|48|50)rem/s);
-  assert.match(appCssSource, /\.ask-composer-shell\s*\{[^}]*max-width:\s*(?:50|52)rem/s);
+  assert.match(appCssSource, /\.ask-thread-shell\s*\{[^}]*max-width:\s*min\(100%,\s*72rem\)/s);
+  assert.match(appCssSource, /\.ask-composer-shell\s*\{[^}]*max-width:\s*min\(100%,\s*74rem\)/s);
   assert.match(appCssSource, /\.dark \.ask-composer-shell\s*\{[^}]*border-color:\s*var\(--surface-border-default\)[^}]*box-shadow:\s*none/s);
 });

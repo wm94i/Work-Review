@@ -11,12 +11,12 @@ async function readCommandsSource() {
 }
 
 test('主窗口显示逻辑应尽量跟随当前活跃空间而不是停留在应用原空间', async () => {
-  const mainSource = await readFile(new URL('./src/main.rs', import.meta.url), 'utf8');
+  const windowSource = await readFile(new URL('./src/window.rs', import.meta.url), 'utf8');
   const commandSource = await readCommandsSource();
   const avatarSource = await readFile(new URL('../src/routes/avatar/AvatarWindow.svelte', import.meta.url), 'utf8');
 
-  assert.match(mainSource, /MoveToActiveSpace|setCollectionBehavior_/);
-  assert.match(mainSource, /source_window_label/);
+  assert.match(windowSource, /MoveToActiveSpace|setCollectionBehavior_/);
+  assert.match(windowSource, /source_window_label/);
   assert.match(commandSource, /show_main_window/);
   assert.match(avatarSource, /invoke\('show_main_window', \{ sourceWindowLabel: appWindow\.label \}\)/);
 });

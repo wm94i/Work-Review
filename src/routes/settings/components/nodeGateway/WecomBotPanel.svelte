@@ -1,6 +1,7 @@
 <script lang="ts">
   import { t } from '$lib/i18n/index.ts';
   import { createEventDispatcher } from 'svelte';
+  import BotSenderBindingPanel from './BotSenderBindingPanel.svelte';
 
   interface WecomConfig {
     wecom_bot_enabled: boolean;
@@ -141,6 +142,7 @@
         {/if}
       {/if}
       <p class="text-[11px] text-slate-400 dark:text-[#636c76]">{t('nodeGatewayPage.wecomBotHint')}</p>
+      <BotSenderBindingPanel platform="wecom" disabled={saving} />
       <button
         type="button"
         class="text-[11px] text-slate-500 underline-offset-2 hover:underline dark:text-[#7d8590]"

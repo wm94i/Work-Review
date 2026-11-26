@@ -6,10 +6,14 @@ use image::{imageops::FilterType, DynamicImage, ImageFormat};
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Output, Stdio};
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+use std::process::Output;
+use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::{mpsc, Mutex, OnceLock};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+use std::time::Instant;
 use uuid::Uuid;
 use work_review_core::error::{AppError, Result};
 
@@ -61,6 +65,339 @@ pub struct OcrService {
 }
 
 static PADDLE_WORKER: OnceLock<Mutex<Option<PaddleWorkerClient>>> = OnceLock::new();
+
+#[cfg(target_os = "windows")]
+static WINDOWS_OCR_WORKER: OnceLock<Mutex<Option<WindowsOcrWorker>>> = OnceLock::new();
+
+#[cfg(target_os = "windows")]
+const WINDOWS_OCR_WORKER_READY_TIMEOUT: Duration = Duration::from_secs(20);
+
+#[cfg(target_os = "windows")]
+struct WindowsOcrWorker {
+    child: Child,
+    stdin: ChildStdin,
+    response_rx: mpsc::Receiver<String>,
+    script_path: PathBuf,
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for WindowsOcrWorker {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let _ = std::fs::remove_file(&self.script_path);
+    }
+}
+
+#[cfg(target_os = "windows")]
+const WINDOWS_OCR_WORKER_SCRIPT: &str = r#"
+$utf8 = New-Object System.Text.UTF8Encoding($false)
+[Console]::InputEncoding = $utf8
+[Console]::OutputEncoding = $utf8
+$OutputEncoding = $utf8
+
+Add-Type -AssemblyName System.Runtime.WindowsRuntime
+
+function Write-OcrJson($payload) {
+    [Console]::Out.WriteLine((ConvertTo-Json $payload -Depth 5 -Compress))
+    [Console]::Out.Flush()
+}
+
+function Write-OcrError([string]$message) {
+    Write-OcrJson @{
+        text = ""
+        error = ([string]$message)
+        boxes = @()
+        confidence = 0
+    }
+}
+
+[Windows.Media.Ocr.OcrEngine, Windows.Foundation.UniversalApiContract, ContentType = WindowsRuntime] | Out-Null
+[Windows.Graphics.Imaging.BitmapDecoder, Windows.Foundation.UniversalApiContract, ContentType = WindowsRuntime] | Out-Null
+[Windows.Graphics.Imaging.BitmapTransform, Windows.Foundation.UniversalApiContract, ContentType = WindowsRuntime] | Out-Null
+[Windows.Storage.StorageFile, Windows.Foundation.UniversalApiContract, ContentType = WindowsRuntime] | Out-Null
+[Windows.Globalization.Language, Windows.Foundation.UniversalApiContract, ContentType = WindowsRuntime] | Out-Null
+[Windows.System.UserProfile.GlobalizationPreferences, Windows.Foundation.UniversalApiContract, ContentType = WindowsRuntime] | Out-Null
+
+$asTaskGeneric = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {
+    $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1'
+})[0]
+if ($null -eq $asTaskGeneric) {
+    Write-OcrError "System.WindowsRuntimeSystemExtensions.AsTask 未找到"
+    exit 1
+}
+
+function Await($WinRtTask, $ResultType) {
+    if ($null -eq $WinRtTask) {
+        throw "WinRT 异步任务为空: $ResultType"
+    }
+    $asTask = $asTaskGeneric.MakeGenericMethod($ResultType)
+    $netTask = $asTask.Invoke($null, @($WinRtTask))
+    $netTask.Wait(-1) | Out-Null
+    $netTask.Result
+}
+
+$ocrEngine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromUserProfileLanguages()
+if ($null -eq $ocrEngine) {
+    foreach ($langTag in @('zh-Hans', 'zh-Hans-CN', 'en-US')) {
+        try {
+            $language = [Windows.Globalization.Language]::new($langTag)
+            $candidate = [Windows.Media.Ocr.OcrEngine]::TryCreateFromLanguage($language)
+            if ($null -ne $candidate) {
+                $ocrEngine = $candidate
+                break
+            }
+        } catch {
+        }
+    }
+}
+
+if ($null -eq $ocrEngine) {
+    $profileLanguages = [string]::Join(',', [Windows.System.UserProfile.GlobalizationPreferences]::Languages)
+    Write-OcrError ("No OCR engine available; user profile languages=" + ([string]$profileLanguages))
+    exit 1
+}
+
+$maxDimension = [Windows.Media.Ocr.OcrEngine]::MaxImageDimension
+[Console]::Out.WriteLine("READY")
+[Console]::Out.Flush()
+
+while ($null -ne ($encodedLine = [Console]::In.ReadLine())) {
+    $trimmed = $encodedLine.Trim()
+    if ([string]::IsNullOrEmpty($trimmed)) {
+        continue
+    }
+    if ($trimmed -eq "__QUIT__") {
+        break
+    }
+
+    $stream = $null
+    $bitmap = $null
+    $ocrBitmap = $null
+    try {
+        $imagePath = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($trimmed))
+        $file = Await ([Windows.Storage.StorageFile]::GetFileFromPathAsync($imagePath)) ([Windows.Storage.StorageFile])
+        if ($null -eq $file) {
+            throw "读取截图文件失败: $imagePath"
+        }
+        $stream = Await ($file.OpenAsync([Windows.Storage.FileAccessMode]::Read)) ([Windows.Storage.Streams.IRandomAccessStream])
+        if ($null -eq $stream) {
+            throw "打开截图流失败: $imagePath"
+        }
+
+        $decoder = Await ([Windows.Graphics.Imaging.BitmapDecoder]::CreateAsync($stream)) ([Windows.Graphics.Imaging.BitmapDecoder])
+        $sourceWidth = $decoder.PixelWidth
+        $sourceHeight = $decoder.PixelHeight
+        if ([Math]::Max($sourceWidth, $sourceHeight) -gt $maxDimension) {
+            $scale = [double]$maxDimension / [Math]::Max($sourceWidth, $sourceHeight)
+            $transform = [Windows.Graphics.Imaging.BitmapTransform]::new()
+            $transform.ScaledWidth = [uint32][Math]::Max(1, [Math]::Floor($sourceWidth * $scale))
+            $transform.ScaledHeight = [uint32][Math]::Max(1, [Math]::Floor($sourceHeight * $scale))
+            $bitmap = Await ($decoder.GetSoftwareBitmapAsync(
+                [Windows.Graphics.Imaging.BitmapPixelFormat]::Bgra8,
+                [Windows.Graphics.Imaging.BitmapAlphaMode]::Premultiplied,
+                $transform,
+                [Windows.Graphics.Imaging.ExifOrientationMode]::IgnoreExifOrientation,
+                [Windows.Graphics.Imaging.ColorManagementMode]::DoNotColorManage
+            )) ([Windows.Graphics.Imaging.SoftwareBitmap])
+        } else {
+            $bitmap = Await ($decoder.GetSoftwareBitmapAsync()) ([Windows.Graphics.Imaging.SoftwareBitmap])
+        }
+        if ($null -eq $bitmap) {
+            throw "解码截图失败: $imagePath"
+        }
+
+        $ocrBitmap = [Windows.Graphics.Imaging.SoftwareBitmap]::Convert(
+            $bitmap,
+            [Windows.Graphics.Imaging.BitmapPixelFormat]::Bgra8,
+            [Windows.Graphics.Imaging.BitmapAlphaMode]::Premultiplied
+        )
+        if ($null -eq $ocrBitmap) {
+            throw "转换 OCR 位图失败: $imagePath"
+        }
+
+        $result = Await ($ocrEngine.RecognizeAsync($ocrBitmap)) ([Windows.Media.Ocr.OcrResult])
+        if ($null -eq $result) {
+            throw "OCR 结果为空"
+        }
+
+        $lines = New-Object System.Collections.Generic.List[string]
+        foreach ($line in $result.Lines) {
+            [void]$lines.Add($line.Text)
+        }
+
+        Write-OcrJson @{
+            text = [string]::Join("`n", $lines)
+            boxes = @()
+            confidence = 0.9
+        }
+    } catch {
+        $message = if ($_.Exception -and $_.Exception.Message) {
+            [string]$_.Exception.Message
+        } else {
+            [string]$_
+        }
+        Write-OcrError $message
+    } finally {
+        if ($null -ne $ocrBitmap) { try { $ocrBitmap.Dispose() } catch {} }
+        if ($null -ne $bitmap) { try { $bitmap.Dispose() } catch {} }
+        if ($null -ne $stream) { try { $stream.Dispose() } catch {} }
+    }
+}
+"#;
+
+#[cfg(target_os = "windows")]
+impl WindowsOcrWorker {
+    fn spawn() -> Result<Self> {
+        use std::os::windows::process::CommandExt;
+
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        let powershell_path =
+            PathBuf::from(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe");
+        let script_path = std::env::temp_dir().join(format!(
+            "work_review_winrt_ocr_worker_{}.ps1",
+            Uuid::new_v4().simple()
+        ));
+
+        let bom: &[u8] = b"\xEF\xBB\xBF";
+        let mut content = Vec::with_capacity(bom.len() + WINDOWS_OCR_WORKER_SCRIPT.len());
+        content.extend_from_slice(bom);
+        content.extend_from_slice(WINDOWS_OCR_WORKER_SCRIPT.as_bytes());
+        std::fs::write(&script_path, &content)?;
+
+        let mut child = match Command::new(&powershell_path)
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-WindowStyle",
+                "Hidden",
+                "-Sta",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                script_path.to_string_lossy().as_ref(),
+            ])
+            .creation_flags(CREATE_NO_WINDOW)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(error) => {
+                let _ = std::fs::remove_file(&script_path);
+                return Err(AppError::Unknown(format!(
+                    "启动 Windows OCR 常驻进程失败: {error}"
+                )));
+            }
+        };
+
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| AppError::Unknown("无法打开 Windows OCR worker stdin".to_string()))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| AppError::Unknown("无法打开 Windows OCR worker stdout".to_string()))?;
+        let stderr = child.stderr.take();
+
+        if let Some(stderr) = stderr {
+            thread::Builder::new()
+                .name("work-review-winrt-ocr-stderr".to_string())
+                .spawn(move || {
+                    let reader = BufReader::new(stderr);
+                    for line in reader.lines().map_while(std::result::Result::ok) {
+                        let trimmed = line.trim();
+                        if !trimmed.is_empty() {
+                            log::debug!("Windows OCR worker stderr: {trimmed}");
+                        }
+                    }
+                })
+                .ok();
+        }
+
+        let (tx, rx) = mpsc::channel();
+        thread::Builder::new()
+            .name("work-review-winrt-ocr-stdout".to_string())
+            .spawn(move || {
+                let reader = BufReader::new(stdout);
+                for line in reader.lines().map_while(std::result::Result::ok) {
+                    if tx.send(line).is_err() {
+                        break;
+                    }
+                }
+            })
+            .ok();
+
+        let worker = Self {
+            child,
+            stdin,
+            response_rx: rx,
+            script_path,
+        };
+
+        match worker
+            .response_rx
+            .recv_timeout(WINDOWS_OCR_WORKER_READY_TIMEOUT)
+        {
+            Ok(line) if line.trim() == "READY" => {
+                log::info!("Windows WinRT OCR 常驻进程已就绪");
+                Ok(worker)
+            }
+            Ok(line) => Err(AppError::Unknown(format!(
+                "Windows OCR worker 初始化返回异常: {}",
+                line.trim()
+            ))),
+            Err(error) => Err(AppError::Unknown(format!(
+                "等待 Windows OCR worker 就绪超时或断开: {error}"
+            ))),
+        }
+    }
+
+    fn recognize(&mut self, image_path: &Path) -> Result<String> {
+        use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
+
+        let encoded = BASE64_STANDARD.encode(image_path.to_string_lossy().as_bytes());
+        writeln!(self.stdin, "{encoded}")?;
+        self.stdin.flush()?;
+        self.response_rx
+            .recv_timeout(OCR_COMMAND_TIMEOUT)
+            .map_err(|e| AppError::Unknown(format!("Windows OCR worker 响应超时或断开: {e}")))
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn request_windows_ocr_via_worker(image_path: &Path) -> Result<String> {
+    let lock = WINDOWS_OCR_WORKER.get_or_init(|| Mutex::new(None));
+    let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+
+    // 最多尝试一次现有进程 + 一次重启后重试
+    for attempt in 0..2 {
+        if guard.is_none() {
+            *guard = Some(WindowsOcrWorker::spawn()?);
+        }
+        let result = guard
+            .as_mut()
+            .expect("Windows OCR worker 已初始化")
+            .recognize(image_path);
+        match result {
+            Ok(line) => return Ok(line),
+            Err(error) => {
+                log::warn!(
+                    "Windows OCR worker 请求失败 (attempt {}): {error}，准备重建 worker",
+                    attempt + 1
+                );
+                *guard = None;
+                if attempt == 1 {
+                    return Err(error);
+                }
+            }
+        }
+    }
+
+    Err(AppError::Unknown("Windows OCR worker 调用失败".to_string()))
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 struct PaddleModelConfig {
@@ -283,6 +620,7 @@ if __name__ == "__main__":
         Ok(())
     }
 
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn run_command_with_timeout(command: &mut Command, context: &str) -> Result<Output> {
         command.stdout(Stdio::piped()).stderr(Stdio::piped());
 
@@ -456,233 +794,14 @@ if __name__ == "__main__":
         }
     }
 
-    /// 使用 Windows OCR API (通过 PowerShell)
+    /// 使用 Windows OCR API（通过常驻 PowerShell + WinRT worker，避免每张截图冷启动进程）
     #[cfg(target_os = "windows")]
     fn extract_with_windows_ocr(&self, image_path: &Path) -> Result<Option<OcrResult>> {
-        use std::os::windows::process::CommandExt;
-        use std::path::PathBuf;
-        use std::time::{SystemTime, UNIX_EPOCH};
-
-        // CREATE_NO_WINDOW 标志，防止弹出黑色控制台窗口
-        const CREATE_NO_WINDOW: u32 = 0x08000000;
-        let powershell_path =
-            PathBuf::from(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe");
-
-        let script = format!(
-            r#"
-$utf8 = New-Object System.Text.UTF8Encoding($false)
-[Console]::OutputEncoding = $utf8
-$OutputEncoding = $utf8
-
-Add-Type -AssemblyName System.Runtime.WindowsRuntime
-
-$imagePath = '{}'
-
-function Write-OcrJson($payload) {{
-    Write-Output (ConvertTo-Json $payload -Depth 5 -Compress)
-}}
-
-function Write-OcrError([string]$message) {{
-    Write-OcrJson @{{
-        text = ""
-        error = ([string]$message)
-        boxes = @()
-        confidence = 0
-    }}
-}}
-
-# 加载 Windows.Media.Ocr
-[Windows.Media.Ocr.OcrEngine, Windows.Foundation.UniversalApiContract, ContentType = WindowsRuntime] | Out-Null
-[Windows.Graphics.Imaging.BitmapDecoder, Windows.Foundation.UniversalApiContract, ContentType = WindowsRuntime] | Out-Null
-[Windows.Graphics.Imaging.BitmapTransform, Windows.Foundation.UniversalApiContract, ContentType = WindowsRuntime] | Out-Null
-[Windows.Storage.StorageFile, Windows.Foundation.UniversalApiContract, ContentType = WindowsRuntime] | Out-Null
-[Windows.Globalization.Language, Windows.Foundation.UniversalApiContract, ContentType = WindowsRuntime] | Out-Null
-[Windows.System.UserProfile.GlobalizationPreferences, Windows.Foundation.UniversalApiContract, ContentType = WindowsRuntime] | Out-Null
-
-# 辅助函数：等待异步操作完成
-$asTaskGeneric = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {{ $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1' }})[0]
-if ($null -eq $asTaskGeneric) {{
-    Write-OcrError "System.WindowsRuntimeSystemExtensions.AsTask 未找到"
-    exit
-}}
-
-Function Await($WinRtTask, $ResultType) {{
-    if ($null -eq $WinRtTask) {{
-        throw "WinRT 异步任务为空: $ResultType"
-    }}
-    $asTask = $asTaskGeneric.MakeGenericMethod($ResultType)
-    $netTask = $asTask.Invoke($null, @($WinRtTask))
-    $netTask.Wait(-1) | Out-Null
-    $netTask.Result
-}}
-
-try {{
-    # 打开图片文件
-    $file = Await ([Windows.Storage.StorageFile]::GetFileFromPathAsync($imagePath)) ([Windows.Storage.StorageFile])
-    if ($null -eq $file) {{
-        throw "读取截图文件失败: $imagePath"
-    }}
-    $stream = Await ($file.OpenAsync([Windows.Storage.FileAccessMode]::Read)) ([Windows.Storage.Streams.IRandomAccessStream])
-    if ($null -eq $stream) {{
-        throw "打开截图流失败: $imagePath"
-    }}
-    
-    # 解码图片
-    $decoder = Await ([Windows.Graphics.Imaging.BitmapDecoder]::CreateAsync($stream)) ([Windows.Graphics.Imaging.BitmapDecoder])
-    $maxDimension = [Windows.Media.Ocr.OcrEngine]::MaxImageDimension
-    $sourceWidth = $decoder.PixelWidth
-    $sourceHeight = $decoder.PixelHeight
-    $boxScaleX = 1.0
-    $boxScaleY = 1.0
-    if ([Math]::Max($sourceWidth, $sourceHeight) -gt $maxDimension) {{
-        # 在同一个进程中按引擎上限等比缩小，避免先分配完整的超大位图。
-        $scale = [double]$maxDimension / [Math]::Max($sourceWidth, $sourceHeight)
-        $transform = [Windows.Graphics.Imaging.BitmapTransform]::new()
-        $transform.ScaledWidth = [uint32][Math]::Max(1, [Math]::Floor($sourceWidth * $scale))
-        $transform.ScaledHeight = [uint32][Math]::Max(1, [Math]::Floor($sourceHeight * $scale))
-        $bitmap = Await ($decoder.GetSoftwareBitmapAsync(
-            [Windows.Graphics.Imaging.BitmapPixelFormat]::Bgra8,
-            [Windows.Graphics.Imaging.BitmapAlphaMode]::Premultiplied,
-            $transform,
-            [Windows.Graphics.Imaging.ExifOrientationMode]::IgnoreExifOrientation,
-            [Windows.Graphics.Imaging.ColorManagementMode]::DoNotColorManage
-        )) ([Windows.Graphics.Imaging.SoftwareBitmap])
-        $boxScaleX = [double]$sourceWidth / $transform.ScaledWidth
-        $boxScaleY = [double]$sourceHeight / $transform.ScaledHeight
-    }} else {{
-        $bitmap = Await ($decoder.GetSoftwareBitmapAsync()) ([Windows.Graphics.Imaging.SoftwareBitmap])
-    }}
-    if ($null -eq $bitmap) {{
-        throw "解码截图失败: $imagePath"
-    }}
-    $ocrBitmap = [Windows.Graphics.Imaging.SoftwareBitmap]::Convert(
-        $bitmap,
-        [Windows.Graphics.Imaging.BitmapPixelFormat]::Bgra8,
-        [Windows.Graphics.Imaging.BitmapAlphaMode]::Premultiplied
-    )
-    if ($null -eq $ocrBitmap) {{
-        throw "转换 OCR 位图失败: $imagePath"
-    }}
-    
-    # 创建 OCR 引擎 (优先用户语言，其次简中/英文)
-    $ocrEngine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromUserProfileLanguages()
-    if ($ocrEngine -eq $null) {{
-        foreach ($langTag in @('zh-Hans', 'zh-Hans-CN', 'en-US')) {{
-            try {{
-                $language = [Windows.Globalization.Language]::new($langTag)
-                $candidate = [Windows.Media.Ocr.OcrEngine]::TryCreateFromLanguage($language)
-                if ($candidate -ne $null) {{
-                    $ocrEngine = $candidate
-                    break
-                }}
-            }} catch {{
-            }}
-        }}
-    }}
-    
-    if ($ocrEngine -eq $null) {{
-        $profileLanguages = [string]::Join(',', [Windows.System.UserProfile.GlobalizationPreferences]::Languages)
-        Write-OcrError ("No OCR engine available; user profile languages=" + ([string]$profileLanguages))
-        exit
-    }}
-    
-    # 执行 OCR
-    $result = Await ($ocrEngine.RecognizeAsync($ocrBitmap)) ([Windows.Media.Ocr.OcrResult])
-    if ($null -eq $result) {{
-        throw "OCR 结果为空"
-    }}
-    
-    $allText = @()
-    $boxes = @()
-    
-    foreach ($line in $result.Lines) {{
-        $allText += $line.Text
-        foreach ($word in $line.Words) {{
-            $rect = $word.BoundingRect
-            $boxes += @{{
-                text = $word.Text
-                confidence = 0.9
-                x = [int]($rect.X * $boxScaleX)
-                y = [int]($rect.Y * $boxScaleY)
-                width = [int]($rect.Width * $boxScaleX)
-                height = [int]($rect.Height * $boxScaleY)
-            }}
-        }}
-    }}
-    
-    $output = @{{
-        text = ($allText -join "`n")
-        boxes = $boxes
-        confidence = 0.9
-    }}
-    
-    Write-OcrJson $output
-    
-    try {{ $stream.Dispose() }} catch {{}}
-    try {{ $bitmap.Dispose() }} catch {{}}
-    try {{ $ocrBitmap.Dispose() }} catch {{}}
-}} catch {{
-    $message = if ($_.Exception -and $_.Exception.Message) {{
-        [string]$_.Exception.Message
-    }} else {{
-        [string]$_
-    }}
-    Write-OcrError $message
-}}
-"#,
-            image_path.to_string_lossy().replace("'", "''")
-        );
-
-        let script_name = format!(
-            "work_review_ocr_{}.ps1",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        );
-        let script_path = std::env::temp_dir().join(script_name);
-
-        // 写入时添加 UTF-8 BOM，确保 Windows PowerShell 正确识别编码
-        let bom: &[u8] = b"\xEF\xBB\xBF";
-        let script_bytes = script.as_bytes();
-        let mut content = Vec::with_capacity(bom.len() + script_bytes.len());
-        content.extend_from_slice(bom);
-        content.extend_from_slice(script_bytes);
-
-        if let Err(e) = std::fs::write(&script_path, &content) {
-            log::warn!("写入 Windows OCR 临时脚本失败: {e}");
-            return Ok(None);
-        }
-
-        let output = Self::run_command_with_timeout(
-            Command::new(&powershell_path)
-                .args([
-                    "-NoProfile",
-                    "-WindowStyle",
-                    "Hidden",
-                    "-Sta",
-                    "-ExecutionPolicy",
-                    "Bypass",
-                    "-File",
-                    script_path.to_string_lossy().as_ref(),
-                ])
-                .creation_flags(CREATE_NO_WINDOW),
-            "Windows OCR",
-        );
-
-        let _ = std::fs::remove_file(&script_path);
-
-        match output {
-            Ok(result) if result.status.success() => {
-                let stdout = String::from_utf8_lossy(&result.stdout);
-                let stderr = String::from_utf8_lossy(&result.stderr);
-
+        match request_windows_ocr_via_worker(image_path) {
+            Ok(stdout) => {
                 if let Ok(ocr_output) = serde_json::from_str::<serde_json::Value>(&stdout) {
                     if let Some(error) = ocr_output.get("error").and_then(|v| v.as_str()) {
                         log::warn!("Windows OCR 错误: {error}");
-                        if !stderr.trim().is_empty() {
-                            log::warn!("Windows OCR stderr: {}", stderr.trim());
-                        }
                         return Ok(None);
                     }
 
@@ -717,25 +836,11 @@ try {{
                     if !stdout.trim().is_empty() {
                         log::warn!("Windows OCR 输出无法解析为 JSON: {}", stdout.trim());
                     }
-                    if !stderr.trim().is_empty() {
-                        log::warn!("Windows OCR stderr: {}", stderr.trim());
-                    }
                     Ok(None)
                 }
             }
-            Ok(result) => {
-                let stderr = String::from_utf8_lossy(&result.stderr);
-                let stdout = String::from_utf8_lossy(&result.stdout);
-                log::warn!(
-                    "Windows OCR PowerShell 执行失败: status={:?}, stderr={}, stdout={}",
-                    result.status.code(),
-                    stderr.trim(),
-                    stdout.trim()
-                );
-                Ok(None)
-            }
             Err(e) => {
-                log::warn!("Windows OCR PowerShell 启动失败: {e}");
+                log::warn!("Windows OCR worker 执行失败: {e}");
                 Ok(None)
             }
         }
@@ -1514,74 +1619,150 @@ fn is_valid_char(c: char) -> bool {
     punctuation.contains(&c)
 }
 
+/// 常见密钥 / 令牌格式（OCR 常见于终端、IDE、控制台页面）。先于数字类规则执行，
+/// 避免令牌中的数字段被手机号/卡号规则拆碎后残留其余部分。
+static SECRET_TOKEN_PATTERNS: once_cell::sync::Lazy<Vec<regex::Regex>> = once_cell::sync::Lazy::new(
+    || {
+        [
+            // 多行 PEM 私钥块（含正文与尾标，避免只删首行头而漏掉 Base64 私钥主体）
+            r"(?s)-----BEGIN [A-Z ]*PRIVATE KEY-----.*?(?:-----END [A-Z ]*PRIVATE KEY-----|$)",
+            // HTTP Bearer 令牌
+            r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]{16,}",
+            // OpenAI / Anthropic 等 sk- 前缀密钥
+            r"\bsk-[A-Za-z0-9_-]{16,}",
+            // GitHub / GitLab 令牌
+            r"\bgh[pousr]_[A-Za-z0-9]{20,}",
+            r"\bgithub_pat_[A-Za-z0-9_]{20,}",
+            r"\bglpat-[A-Za-z0-9_-]{16,}",
+            // AWS Access Key ID
+            r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b",
+            // Slack 令牌
+            r"\bxox[abprs]-[A-Za-z0-9-]{10,}",
+            r"\bxapp-\d-[A-Za-z0-9-]{16,}",
+            // Google API / OAuth 令牌
+            r"\bAIza[0-9A-Za-z_-]{35}\b",
+            r"\bya29\.[0-9A-Za-z_-]{20,}",
+            // JWT
+            r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}",
+            // 常见环境变量形式（如 AWS_SECRET_ACCESS_KEY=... / GITHUB_TOKEN=...）
+            r#"(?i)\b[A-Z0-9_]*(?:SECRET|API_KEY|ACCESS_KEY|AUTH_TOKEN|PRIVATE_KEY)[A-Z0-9_]*["']?\s*[:=：]\s*["']?[^\s"',;}\]]{8,}"#,
+        ]
+        .iter()
+        .map(|pattern| regex::Regex::new(pattern).expect("内置密钥正则必须可编译"))
+        .collect()
+    },
+);
+
+static PHONE_PATTERN: once_cell::sync::Lazy<Option<regex::Regex>> =
+    once_cell::sync::Lazy::new(|| regex::Regex::new(r"1[3-9]\d{9}").ok());
+static ID_CARD_PATTERN: once_cell::sync::Lazy<Option<regex::Regex>> =
+    once_cell::sync::Lazy::new(|| {
+        regex::Regex::new(
+            r"[1-9]\d{5}(?:18|19|20)\d{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])\d{3}[\dXx]",
+        )
+        .ok()
+    });
+static BANK_CARD_PATTERN: once_cell::sync::Lazy<Option<regex::Regex>> =
+    once_cell::sync::Lazy::new(|| {
+        regex::Regex::new(r"\d{4}[\s-]?\d{4}[\s-]?\d{4}[\s-]?\d{4}[\s-]?\d{0,3}").ok()
+    });
+static EMAIL_PATTERN: once_cell::sync::Lazy<Option<regex::Regex>> =
+    once_cell::sync::Lazy::new(|| {
+        regex::Regex::new(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}").ok()
+    });
+static IPV4_PATTERN: once_cell::sync::Lazy<Option<regex::Regex>> =
+    once_cell::sync::Lazy::new(|| {
+        regex::Regex::new(r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b").ok()
+    });
+static PASSWORD_PATTERN: once_cell::sync::Lazy<Option<regex::Regex>> =
+    once_cell::sync::Lazy::new(|| {
+        regex::Regex::new(r#"(?i)(?:password|密码|pwd|passwd)["']?[:：=\s]+["']?[^\s"',;}\]]+"#)
+            .ok()
+    });
+
+fn replace_with_non_digit_boundary(text: &str, re: &regex::Regex, replacement: &str) -> String {
+    let mut filtered = String::with_capacity(text.len());
+    let mut last_end = 0;
+    for m in re.find_iter(text) {
+        let prev_is_digit = text[..m.start()]
+            .chars()
+            .next_back()
+            .is_some_and(|c| c.is_ascii_digit());
+        let next_is_digit = text[m.end()..]
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_digit());
+        if prev_is_digit || next_is_digit {
+            continue;
+        }
+        filtered.push_str(&text[last_end..m.start()]);
+        filtered.push_str(replacement);
+        last_end = m.end();
+    }
+    filtered.push_str(&text[last_end..]);
+    filtered
+}
+
 /// 过滤敏感信息
 pub fn filter_sensitive_text(text: &str) -> String {
-    use regex::Regex;
-
     // 先清理乱码和特殊字符
     let cleaned = clean_ocr_text(text);
     let mut result = cleaned;
 
-    // 过滤手机号
-    if let Ok(re) = Regex::new(r"1[3-9]\d{9}") {
-        result = re.replace_all(&result, "[手机号]").to_string();
+    // 密钥 / 令牌（含多行 PEM 私钥）
+    for re in SECRET_TOKEN_PATTERNS.iter() {
+        result = re.replace_all(&result, "[密钥]").to_string();
     }
 
-    // 过滤身份证号
-    if let Ok(re) = Regex::new(r"\d{17}[\dXx]") {
-        result = re.replace_all(&result, "[身份证号]").to_string();
+    // 过滤身份证号（18 位，前后不得紧邻数字）——必须先于银行卡（避免末尾带 X 的 17 位被截成银行卡+X）与手机号执行
+    if let Some(re) = ID_CARD_PATTERN.as_ref() {
+        result = replace_with_non_digit_boundary(&result, re, "[身份证号]");
     }
 
-    // 过滤银行卡号（要求独立出现的 16-19 位数字，或 4 位一组以空格/横线分隔）。
-    // 注意：regex crate 不支持 look-around——此前用 (?<!\d)/(?!\d) 会编译失败并被
-    // `if let Ok` 静默吞掉，导致银行卡号从未被过滤。改为匹配候选后手动校验
-    // 前后邻位不是数字（语义与原 look-around 意图一致）。
-    if let Ok(re) = Regex::new(r"\d{4}[\s-]?\d{4}[\s-]?\d{4}[\s-]?\d{4}[\s-]?\d{0,3}") {
-        let mut filtered = String::with_capacity(result.len());
-        let mut last_end = 0;
-        for m in re.find_iter(&result) {
-            let prev_is_digit = result[..m.start()]
-                .chars()
-                .next_back()
-                .is_some_and(|c| c.is_ascii_digit());
-            let next_is_digit = result[m.end()..]
-                .chars()
-                .next()
-                .is_some_and(|c| c.is_ascii_digit());
-            if prev_is_digit || next_is_digit {
-                // 属于更长数字串的一部分（如订单号/流水号），不视为银行卡
-                continue;
-            }
-            filtered.push_str(&result[last_end..m.start()]);
-            filtered.push_str("[银行卡号]");
-            last_end = m.end();
-        }
-        filtered.push_str(&result[last_end..]);
-        result = filtered;
+    // 过滤银行卡号（16-19 位数字）——必须先于手机号执行，避免被 11 位手机号规则从中间截断
+    if let Some(re) = BANK_CARD_PATTERN.as_ref() {
+        result = replace_with_non_digit_boundary(&result, re, "[银行卡号]");
+    }
+
+    // 过滤手机号（11 位独立数字，不误伤 13 位时间戳或长订单号）
+    if let Some(re) = PHONE_PATTERN.as_ref() {
+        result = replace_with_non_digit_boundary(&result, re, "[手机号]");
     }
 
     // 过滤邮箱
-    if let Ok(re) = Regex::new(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}") {
+    if let Some(re) = EMAIL_PATTERN.as_ref() {
         result = re.replace_all(&result, "[邮箱]").to_string();
     }
 
     // 过滤 IP 地址
-    if let Ok(re) = Regex::new(r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b") {
+    if let Some(re) = IPV4_PATTERN.as_ref() {
         result = re.replace_all(&result, "[IP地址]").to_string();
     }
 
     // 过滤密码相关
-    if let Ok(re) = Regex::new(r"(?i)(password|密码|pwd)[:\s=]*\S+") {
+    if let Some(re) = PASSWORD_PATTERN.as_ref() {
         result = re.replace_all(&result, "[密码信息]").to_string();
     }
 
     result
 }
 
+/// OCR 文本入库前的完整脱敏：内置敏感模式（含密钥/令牌格式）+ 隐私过滤器的通用规则
+/// （`api_key|secret|token: 值` 等，与窗口标题同一套）。
+///
+/// 不按"敏感关键词"整段丢弃：默认关键词含 login / password 等常见词，整屏 OCR 几乎必然命中；
+/// 关键词仍只作用于窗口标题（命中即脱敏且不截图、不 OCR）。
+pub fn redact_ocr_for_storage(
+    text: &str,
+    privacy_filter: &work_review_core::privacy::PrivacyFilter,
+) -> String {
+    privacy_filter.filter_text(&filter_sensitive_text(text))
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
-    fn windows_ocr应在单次进程内按引擎上限缩放后识别() {
+    fn windows_ocr应在常驻进程内按引擎上限缩放后识别() {
         // 非 Windows CI 也能检查内嵌脚本，避免 cfg(windows) 隐藏此回归。
         let source = include_str!("ocr.rs");
         let entry = source
@@ -1594,51 +1775,46 @@ mod tests {
         assert!(entry.contains("if self.preferred_engine == OcrEngine::WindowsOCR"));
         assert!(entry.contains("return self.extract_text_once(image_path);"));
 
-        let native = source
-            .split("fn extract_with_windows_ocr(&self")
+        let worker_block = source
+            .split("const WINDOWS_OCR_WORKER_SCRIPT: &str = r#\"")
             .nth(1)
             .unwrap()
-            .split("fn extract_with_vision(&self")
+            .split("struct PaddleWorkerClient")
             .next()
             .unwrap();
-        let limit = native
+        let limit = worker_block
             .find("$maxDimension = [Windows.Media.Ocr.OcrEngine]::MaxImageDimension")
             .unwrap();
-        let decode = native
+        let decode = worker_block
             .find("$bitmap = Await ($decoder.GetSoftwareBitmapAsync(")
             .unwrap();
-        let recognize = native
+        let recognize = worker_block
             .find("$ocrEngine.RecognizeAsync($ocrBitmap)")
             .unwrap();
         assert!(limit < decode && decode < recognize);
-        assert!(native.contains("if ([Math]::Max($sourceWidth, $sourceHeight) -gt $maxDimension)"));
-        assert!(native
+        assert!(worker_block
+            .contains("if ([Math]::Max($sourceWidth, $sourceHeight) -gt $maxDimension)"));
+        assert!(worker_block
             .contains("$scale = [double]$maxDimension / [Math]::Max($sourceWidth, $sourceHeight)"));
         for dimension in ["Width", "Height"] {
-            assert!(native.contains(&format!(
+            assert!(worker_block.contains(&format!(
                 "$transform.Scaled{dimension} = [uint32][Math]::Max(1, [Math]::Floor($source{dimension} * $scale))"
             )));
         }
-        assert!(native.contains("$transform,\n            [Windows.Graphics.Imaging.ExifOrientationMode]::IgnoreExifOrientation"));
-        assert!(native
-            .contains("}} else {{\n        $bitmap = Await ($decoder.GetSoftwareBitmapAsync())"));
-        for (axis, dimension, position) in [("X", "Width", "x"), ("Y", "Height", "y")] {
-            assert!(native.contains(&format!("$boxScale{axis} = 1.0")));
-            assert!(native.contains(&format!(
-                "$boxScale{axis} = [double]$source{dimension} / $transform.Scaled{dimension}"
-            )));
-            assert!(native.contains(&format!(
-                "{position} = [int]($rect.{axis} * $boxScale{axis})"
-            )));
-            assert!(native.contains(&format!(
-                "{} = [int]($rect.{dimension} * $boxScale{axis})",
-                dimension.to_lowercase()
-            )));
-        }
-        assert_eq!(native.matches("RecognizeAsync(").count(), 1);
-        assert_eq!(native.matches("Command::new(").count(), 1);
-        assert!(native.contains("\"-WindowStyle\",\n                    \"Hidden\""));
-        assert!(native.contains(".creation_flags(CREATE_NO_WINDOW)"));
+        assert!(worker_block.contains(
+            "$transform,\n                [Windows.Graphics.Imaging.ExifOrientationMode]::IgnoreExifOrientation"
+        ));
+        assert!(worker_block
+            .contains("} else {\n            $bitmap = Await ($decoder.GetSoftwareBitmapAsync())"));
+        assert!(worker_block.contains("New-Object System.Collections.Generic.List[string]"));
+        assert!(
+            !worker_block.contains("$boxes +="),
+            "不应保留 O(n^2) 数组拼接"
+        );
+        assert_eq!(worker_block.matches("RecognizeAsync(").count(), 1);
+        assert_eq!(worker_block.matches("Command::new(").count(), 1);
+        assert!(worker_block.contains("\"-WindowStyle\",\n                \"Hidden\""));
+        assert!(worker_block.contains(".creation_flags(CREATE_NO_WINDOW)"));
     }
 
     use super::{
@@ -1663,6 +1839,62 @@ mod tests {
             confidence: 0.9,
             boxes: vec![],
         }
+    }
+
+    #[test]
+    fn 内置敏感信息正则必须全部可编译() {
+        // 任何一条编译失败都会被 if let 静默跳过，导致该类信息从未被过滤（银行卡规则曾因此失效）
+        assert_eq!(super::SECRET_TOKEN_PATTERNS.len(), 13);
+        assert!(super::PHONE_PATTERN.is_some());
+        assert!(super::ID_CARD_PATTERN.is_some());
+        assert!(super::BANK_CARD_PATTERN.is_some());
+        assert!(super::EMAIL_PATTERN.is_some());
+        assert!(super::IPV4_PATTERN.is_some());
+        assert!(super::PASSWORD_PATTERN.is_some());
+    }
+
+    #[test]
+    fn 常见密钥与令牌格式应被过滤() {
+        let samples = [
+            "OPENAI_KEY sk-proj-abcdefghijklmnopqrstuvwx1234",
+            "Authorization: Bearer abcdefghijklmnop1234567890",
+            "token ghp_abcdefghijklmnopqrstuvwxyz0123456789",
+            "gitlab glpat-abcdefghij1234567890",
+            "google ya29.a0AfH6SMCdefghijklmnop1234567890",
+            "slack-app xapp-1-A0123456789-abcdef123456",
+            "AKIAABCDEFGHIJKLMNOP is the access key",
+            "slack xoxb-123456789012-abcdefghij",
+            "jwt eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.abcdefghijklmnop",
+            "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEAtestbody\n-----END RSA PRIVATE KEY-----",
+        ];
+        for sample in samples {
+            let masked = super::filter_sensitive_text(sample);
+            assert!(masked.contains("[密钥]"), "未过滤: {sample} -> {masked}");
+            assert!(
+                !masked.contains("MIIEowIBAAKCAQEAtestbody"),
+                "多行 PEM 私钥正文未脱敏: {masked}"
+            );
+        }
+        // 18 位身份证号（前段含 1[3-9] 且末位为 X）必须优先按身份证脱敏，不得被银行卡或手机号截断
+        let id_masked = super::filter_sensitive_text("证件号：13800119900101123X");
+        assert_eq!(id_masked, "证件号：[身份证号]");
+        // 普通代码文本不应被误伤
+        let code = super::filter_sensitive_text("fn login_user(name: &str) -> bool");
+        assert_eq!(code, "fn login_user(name: &str) -> bool");
+    }
+
+    #[test]
+    fn ocr入库脱敏应同时应用窗口标题的通用规则() {
+        let filter = work_review_core::privacy::PrivacyFilter::from_config(
+            &work_review_core::config::PrivacyConfig::default(),
+        );
+        let masked =
+            super::redact_ocr_for_storage("api_key = my-internal-value 其余正常文本", &filter);
+        assert!(!masked.contains("my-internal-value"), "{masked}");
+        assert!(masked.contains("其余正常文本"));
+        // 默认敏感关键词（login 等）不应导致整段 OCR 被丢弃
+        let kept = super::redact_ocr_for_storage("Login 页面 欢迎回来", &filter);
+        assert!(kept.contains("欢迎回来"));
     }
 
     #[test]

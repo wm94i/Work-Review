@@ -12,6 +12,8 @@
     app_rules: AppPrivacyRule[];
     excluded_keywords: string[];
     excluded_domains?: string[];
+    skip_private_windows?: boolean;
+    unknown_url_fallback?: 'record' | 'anonymize' | null;
   }
 
   interface PrivacyConfig {
@@ -204,6 +206,33 @@
 
   function handleDomainKeydown(event: KeyboardEvent) {
     if (event.key === 'Enter') addDomain();
+  }
+
+  type UnknownUrlFallbackChoice = 'auto' | 'anonymize' | 'record';
+
+  const unknownUrlFallbackOptions: { value: UnknownUrlFallbackChoice; labelKey: string }[] = [
+    { value: 'auto', labelKey: 'settingsPrivacy.unknownUrlFallbackAuto' },
+    { value: 'anonymize', labelKey: 'settingsPrivacy.unknownUrlFallbackAnonymize' },
+    { value: 'record', labelKey: 'settingsPrivacy.unknownUrlFallbackRecord' },
+  ];
+
+  $: skipPrivateWindows = config?.privacy?.skip_private_windows !== false;
+  $: unknownUrlFallbackChoice = (
+    config?.privacy?.unknown_url_fallback === 'record'
+      ? 'record'
+      : config?.privacy?.unknown_url_fallback === 'anonymize'
+        ? 'anonymize'
+        : 'auto'
+  ) as UnknownUrlFallbackChoice;
+
+  function toggleSkipPrivateWindows() {
+    config.privacy.skip_private_windows = !skipPrivateWindows;
+    dispatch('change', config);
+  }
+
+  function setUnknownUrlFallback(mode: UnknownUrlFallbackChoice) {
+    config.privacy.unknown_url_fallback = mode === 'auto' ? null : mode;
+    dispatch('change', config);
   }
 </script>
 
@@ -403,6 +432,62 @@
       {:else}
         <p class="settings-empty">{t('settingsPrivacy.noRules')}</p>
       {/if}
+    </section>
+
+    <section
+      class="settings-block settings-privacy-browser-protection"
+      aria-labelledby="settings-privacy-browser-protection-title"
+    >
+      <h4 id="settings-privacy-browser-protection-title" class="settings-text mb-3">
+        {t('settingsPrivacy.browserProtectionTitle')}
+      </h4>
+
+      <div class="settings-row">
+        <div class="min-w-0">
+          <span class="settings-text">{t('settingsPrivacy.skipPrivateWindows')}</span>
+          <p class="settings-muted mt-0.5">{t('settingsPrivacy.skipPrivateWindowsHint')}</p>
+        </div>
+        <button
+          type="button"
+          role="switch"
+          aria-label={t('settingsPrivacy.skipPrivateWindows')}
+          aria-checked={skipPrivateWindows}
+          on:click={toggleSkipPrivateWindows}
+          class="switch-track {skipPrivateWindows ? 'bg-emerald-500' : 'bg-slate-300 dark:bg-[#484f58]'}"
+        >
+          <span class="switch-thumb {skipPrivateWindows ? 'translate-x-5' : 'translate-x-0'}"></span>
+        </button>
+      </div>
+
+      <div class="mt-4 space-y-2">
+        <span id="settings-privacy-unknown-url-label" class="settings-text block">
+          {t('settingsPrivacy.unknownUrlFallback')}
+        </span>
+        <p class="settings-muted">{t('settingsPrivacy.unknownUrlFallbackHint')}</p>
+        <div
+          class="settings-privacy-strategy-segments"
+          role="group"
+          aria-labelledby="settings-privacy-unknown-url-label"
+        >
+          {#each unknownUrlFallbackOptions as opt}
+            <button
+              type="button"
+              aria-pressed={unknownUrlFallbackChoice === opt.value}
+              on:click={() => setUnknownUrlFallback(opt.value)}
+              class="settings-segment-base {unknownUrlFallbackChoice === opt.value ? 'settings-segment-active' : ''}"
+            >
+              {t(opt.labelKey)}
+            </button>
+          {/each}
+        </div>
+        <p class="settings-note">
+          {unknownUrlFallbackChoice === 'auto'
+            ? t('settingsPrivacy.unknownUrlFallbackAutoDesc')
+            : unknownUrlFallbackChoice === 'anonymize'
+              ? t('settingsPrivacy.unknownUrlFallbackAnonymizeDesc')
+              : t('settingsPrivacy.unknownUrlFallbackRecordDesc')}
+        </p>
+      </div>
     </section>
 
     <section

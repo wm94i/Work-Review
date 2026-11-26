@@ -12,7 +12,8 @@ test('应用应暂时保留两个旧摘要路由以兼容历史深链接', async
 test('带日期和不带日期的旧摘要地址都应 replace 到时间线抽屉参数', async () => {
   const source = await readFile(new URL('./Summary.svelte', import.meta.url), 'utf8');
 
-  assert.match(source, /const routeDate = match\?\.\[1\] \?\? \$params\?\.date/);
+  assert.match(source, /const routeParams = router\.params/);
+  assert.match(source, /const routeDate = match\?\.\[1\] \?\? paramDate/);
   assert.match(source, /const date = isValidLocalDateString\(routeDate\) \? routeDate : getLocalDateString\(\)/);
   assert.match(source, /const target = `\/timeline\?date=\$\{date\}&summary=1`/);
   assert.match(source, /replace\(target\)/);

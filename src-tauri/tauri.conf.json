@@ -76,7 +76,7 @@
   },
   "productName": "Work Review",
   "mainBinaryName": "Work_Review",
-  "version": "1.1.4-rc.2",
+  "version": "1.2.0-rc.1",
   "identifier": "com.workreview.app",
   "plugins": {
     "updater": {
@@ -95,6 +95,8 @@
     "macOSPrivateApi": true,
     "windows": [
       {
+        "label": "main",
+        "create": false,
         "title": "Work Review",
         "width": 1000,
         "height": 700,
@@ -112,7 +114,7 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; img-src 'self' data: asset: https://asset.localhost; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self' http://127.0.0.1:* http://localhost:* https://api.github.com https://gh-proxy.cn https://gh-proxy.com"
+      "csp": "default-src 'self'; img-src 'self' data: asset: https://asset.localhost; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self' http://127.0.0.1:* http://localhost:* https://api.github.com https://gh-proxy.cn https://gh-proxy.com; form-action 'none'; base-uri 'self'; object-src 'none'"
     }
   }
 }

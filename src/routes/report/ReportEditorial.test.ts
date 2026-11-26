@@ -13,7 +13,7 @@ test('日报页应渲染纸感成稿容器', async () => {
   assert.match(source, /report-article-card/);
   assert.match(source, /report-sheet-content/);
   assert.match(appCssSource, /\.report-sheet-content\b[\s\S]*margin:\s*0 auto/);
-  assert.match(appCssSource, /\.report-sheet-content\b[\s\S]*max-width:\s*52rem/);
+  assert.match(appCssSource, /\.report-sheet-content\b[\s\S]*max-width:\s*min\(100%,\s*72rem\)/);
 });
 
 test('回退显示昨日报时编辑应写入实际报告日期和缓存键', async () => {

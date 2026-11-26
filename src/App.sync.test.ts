@@ -30,6 +30,7 @@ test('托盘和设置的配置变更应回推到前端缓存与设置页', async
   const rustSource = (
     await Promise.all([
       readCommandsSource(),
+      readFile(new URL('../src-tauri/src/tray.rs', import.meta.url), 'utf8'),
       readFile(new URL('../src-tauri/src/main.rs', import.meta.url), 'utf8'),
     ])
   ).join('\n');

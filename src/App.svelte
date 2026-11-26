@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount, tick, type ComponentType } from 'svelte';
+  import { onMount, tick, type Component } from 'svelte';
   import Router, { push } from 'svelte-spa-router';
   import { wrap } from 'svelte-spa-router/wrap';
   import Sidebar from './lib/components/Sidebar.svelte';
@@ -68,13 +68,9 @@
     style?: string;
   }
 
-  interface AutoReportWorkEnd {
-    hour: number;
-    minute: number;
-  }
-
-  interface AutoReportCandidate extends AutoReportWorkEnd {
-    score: number;
+  interface AutoReportGeneratedPayload {
+    date?: string;
+    locale?: string;
   }
 
   interface BrowserPreviewWindow {
@@ -235,7 +231,7 @@
   const appWindow = getSafeCurrentWebviewWindow();
   const currentWindowLabel = appWindow.label;
   const isAvatarWindow = currentWindowLabel === 'avatar';
-  let AvatarWindowComponent: ComponentType | null = null;
+  let AvatarWindowComponent: Component | null = null;
 
   if (isAvatarWindow) {
     import('./routes/avatar/AvatarWindow.svelte').then((module) => {
@@ -385,15 +381,12 @@
     document.documentElement.dataset.uiVisualStyle = uiVisualStyle;
   }
 
-  async function handleThemeChange(event: CustomEvent<Theme>): Promise<void> {
-    const newTheme = event.detail;
+  async function handleThemeChange(newTheme: Theme): Promise<void> {
     applyTheme(newTheme);
 
     try {
-      const config = await getRuntimeConfig();
-      config.theme = newTheme;
-      await invoke('save_config', { config });
-      cache.setConfig(config);
+      const updated = await invoke<RuntimeConfig>('patch_config', { patch: { theme: newTheme } });
+      cache.setConfig(updated);
     } catch (e) {
       console.error('保存主题配置失败:', e);
     }
@@ -442,45 +435,8 @@
     e.preventDefault();
   }
 
-  function normalizeTimePart(value: unknown, upperBound: number): number {
-    const parsed = Number.parseInt(String(value), 10);
-    if (!Number.isFinite(parsed)) return 0;
-    return Math.min(Math.max(parsed, 0), upperBound);
-  }
-
-  function resolveAutoReportWorkEnd(
-    config: RuntimeConfig | null | undefined,
-  ): AutoReportWorkEnd {
-    // 优先使用用户自定义的日报生成时间
-    const customTime = config?.daily_report_auto_generate_time;
-    if (customTime && typeof customTime === 'string') {
-      const parts = customTime.split(':').map(Number);
-      if (parts.length >= 2 && Number.isFinite(parts[0]) && Number.isFinite(parts[1])) {
-        return { hour: Math.min(Math.max(parts[0], 0), 23), minute: Math.min(Math.max(parts[1], 0), 59) };
-      }
-    }
-
-    const fallbackHour = normalizeTimePart(config?.work_end_hour ?? 18, 23);
-    const fallbackMinute = normalizeTimePart(config?.work_end_minute ?? 0, 59);
-    const segments = Array.isArray(config?.work_time_segments) ? config.work_time_segments : [];
-    if (segments.length === 0) {
-      return { hour: fallbackHour, minute: fallbackMinute };
-    }
-
-    const latest = segments.reduce<AutoReportCandidate | null>((best, segment) => {
-      const hour = normalizeTimePart(segment?.end_hour, 23);
-      const minute = normalizeTimePart(segment?.end_minute, 59);
-      const score = hour * 60 + minute;
-      if (!best || score > best.score) {
-        return { score, hour, minute };
-      }
-      return best;
-    }, null);
-
-    if (!latest) {
-      return { hour: fallbackHour, minute: fallbackMinute };
-    }
-    return { hour: latest.hour, minute: latest.minute };
+  function isAutoReportGeneratedPayload(value: unknown): value is AutoReportGeneratedPayload {
+    return isRecord(value);
   }
 
   onMount(() => {
@@ -690,67 +646,20 @@
       }, 2000);
       pendingCleanup.push(() => clearTimeout(autoUpdateTimer));
 
-      // 日报自动生成检测：每分钟检查一次
-      let lastAutoGenDate: string | null = null;  // 防止同一天重复触发
-      let autoGenRunning = false;  // 防止并发生成
-      let memorySynthRunning = false;  // 防止洞察合成并发
-      const autoReportTimer = setInterval(async () => {
-        if (autoGenRunning) return;  // 上一轮还没完成，跳过
-        const now = new Date();
-        const currentTotalMinutes = now.getHours() * 60 + now.getMinutes();
-        const today = getLocalDate();
-
-        // 检查是否达到或已过工作结束时间
-        const { hour: workEndHour, minute: workEndMinute } =
-          resolveAutoReportWorkEnd(runtimeConfig);
-        const workEndTotalMinutes = workEndHour * 60 + workEndMinute;
-
-        // 条件：当前时间 >= 工作结束时间，且今天未自动生成过
-        if (currentTotalMinutes >= workEndTotalMinutes && lastAutoGenDate !== today) {
-          try {
-            // 检查今日是否已有日报
-            const existingReport = await invoke<unknown>('get_saved_report', { date: today, locale: currentLocale });
-            if (!existingReport) {
-              devLog('工作结束时间到达，自动生成日报...');
-              autoGenRunning = true;
-              try {
-                await invoke('generate_report', { date: today, force: false, locale: currentLocale });
-                cache.invalidate('report', `${today}:${currentLocale}`);
-                lastAutoGenDate = today;
-                devLog('日报自动生成完成');
-              } finally {
-                autoGenRunning = false;
-              }
-            } else {
-              lastAutoGenDate = today;  // 已有日报，标记今天不再触发
-            }
-          } catch (e) {
-            console.warn('日报自动生成失败:', e);
-          }
-        }
-
-        // AI 工作记忆：每天工作结束后自动合成洞察
-        if (currentTotalMinutes >= workEndTotalMinutes && !memorySynthRunning) {
-          try {
-            const config = await getRuntimeConfig();
-            if (config.memory_enabled && config.memory_last_synthesis_date !== today) {
-              memorySynthRunning = true;
-              try {
-                await invoke('synthesize_insights', {});
-                // 合成可能耗时较长，重新拉取最新配置再写入，避免覆盖期间用户改动的其他设置
-                const freshConfig = await getRuntimeConfig();
-                await invoke('save_config', { config: { ...freshConfig, memory_last_synthesis_date: today } });
-                devLog('工作记忆合成完成');
-              } finally {
-                memorySynthRunning = false;
-              }
-            }
-          } catch (e) {
-            console.warn('工作记忆合成失败:', e);
-          }
-        }
-      }, 60000);  // 每分钟检查一次
-      pendingCleanup.push(() => clearInterval(autoReportTimer));
+      // 日报与工作洞察的定时调度已迁至 Rust 后台任务（轻量模式无窗口时同样运行）；
+      // 前端仅监听后端完成事件并失效本地日报缓存。
+      const unlistenAutoReport = await safeListen(
+        'auto-report-generated',
+        isAutoReportGeneratedPayload,
+        (payload) => {
+          const reportDate = payload.date || getLocalDate();
+          const reportLocale = payload.locale || currentLocale;
+          cache.invalidate('report', `${reportDate}:${reportLocale}`);
+          devLog('后端自动日报已生成:', reportDate, reportLocale);
+        },
+      );
+      if (disposed) { try { if (unlistenAutoReport) unlistenAutoReport(); } catch {} return; }
+      pendingCleanup.push(unlistenAutoReport);
 
       const unlisten = await safeListen(
         'screenshot-taken',
@@ -878,7 +787,7 @@
     <!-- 左侧边栏 -->
     <aside class="app-shell-sidebar-frame min-h-0">
       <div class="app-shell-sidebar h-full flex flex-col overflow-hidden">
-        <Sidebar {isRecording} {isPaused} {theme} on:themeChange={handleThemeChange} />
+        <Sidebar {isRecording} {isPaused} {theme} onThemeChange={handleThemeChange} />
       </div>
     </aside>
 

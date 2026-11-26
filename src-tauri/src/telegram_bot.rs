@@ -1,6 +1,7 @@
+#[cfg(test)]
+use crate::bot_common::NON_TEXT_REPLY;
 use crate::bot_common::{
-    build_device_list, handle_cmd, normalize_command, progress_text_for_command, DeviceEndpoint,
-    NON_TEXT_REPLY, OUTPUT_DIVIDER,
+    build_device_list, handle_cmd, normalize_command, DeviceEndpoint, OUTPUT_DIVIDER,
 };
 use crate::AppState;
 use reqwest::{Client, StatusCode};
@@ -34,12 +35,23 @@ struct TgMsg {
 #[derive(Deserialize)]
 struct TgChat {
     id: i64,
+    #[serde(rename = "type", default)]
+    chat_type: Option<String>,
 }
 
 const TELEGRAM_POLL_RETRY_SECONDS: u64 = 3;
 const TELEGRAM_POLL_RETRY_MAX_SECONDS: u64 = 60;
 const BINDING_COMMAND: &str = "start";
 const BIND_COMMAND: &str = "bind";
+const TELEGRAM_BIND_MAX_FAILED_ATTEMPTS: u32 = crate::bot_common::BOT_BIND_MAX_FAILED_ATTEMPTS;
+
+/// 当前有效 Telegram 绑定码的连续错误次数（达 5 次作废，与飞书/钉钉/企微一致）。
+static TELEGRAM_BIND_FAILED_ATTEMPTS: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+
+pub fn reset_telegram_bind_failed_attempts() {
+    TELEGRAM_BIND_FAILED_ATTEMPTS.store(0, std::sync::atomic::Ordering::SeqCst);
+}
 
 #[derive(Default)]
 struct SharedBotStatus {
@@ -48,9 +60,18 @@ struct SharedBotStatus {
     last_error: Option<String>,
 }
 
+#[derive(PartialEq, Eq, Clone)]
+struct TelegramRuntimeIdentity {
+    bot_token: String,
+    proxy: Option<String>,
+    allowed_chat_ids: Vec<i64>,
+    device_urls: Vec<(String, String, String)>,
+}
+
 pub struct TelegramBotRuntime {
     handle: Option<JoinHandle<()>>,
     shared: Arc<std::sync::Mutex<SharedBotStatus>>,
+    identity: Option<TelegramRuntimeIdentity>,
 }
 
 impl Default for TelegramBotRuntime {
@@ -58,6 +79,7 @@ impl Default for TelegramBotRuntime {
         Self {
             handle: None,
             shared: Arc::new(std::sync::Mutex::new(SharedBotStatus::default())),
+            identity: None,
         }
     }
 }
@@ -67,11 +89,17 @@ impl TelegramBotRuntime {
         if let Some(h) = self.handle.take() {
             h.abort();
         }
+        self.identity = None;
         if let Ok(mut s) = self.shared.lock() {
             s.running = false;
             s.starting = false;
             s.last_error = None;
         }
+    }
+
+    fn should_keep(&self, identity: &TelegramRuntimeIdentity) -> bool {
+        self.handle.as_ref().is_some_and(|h| !h.is_finished())
+            && self.identity.as_ref() == Some(identity)
     }
 
     fn start(
@@ -81,8 +109,10 @@ impl TelegramBotRuntime {
         devices: Vec<DeviceEndpoint>,
         proxy: Option<String>,
         allowed_chat_ids: Vec<i64>,
+        identity: TelegramRuntimeIdentity,
     ) {
         self.stop();
+        self.identity = Some(identity);
         if let Ok(mut s) = self.shared.lock() {
             s.starting = true;
             s.running = false;
@@ -155,12 +185,27 @@ pub fn sync_telegram_bot_runtime(state: &Arc<Mutex<AppState>>) -> Result<(), App
         return Ok(());
     }
 
+    let token = bot_token.unwrap();
+    let identity = TelegramRuntimeIdentity {
+        bot_token: token.clone(),
+        proxy: proxy.clone(),
+        allowed_chat_ids: allowed_chat_ids.clone(),
+        device_urls: devices
+            .iter()
+            .map(|d| (d.name.clone(), d.url.clone(), d.token.clone()))
+            .collect(),
+    };
+    if s.telegram_bot_runtime.should_keep(&identity) {
+        return Ok(());
+    }
+
     s.telegram_bot_runtime.start(
         state.clone(),
-        bot_token.unwrap(),
+        token,
         devices,
         proxy,
         allowed_chat_ids,
+        identity,
     );
     log::info!(
         "Telegram Bot 已启动 ({} 台设备)",
@@ -250,6 +295,7 @@ async fn run(
     }
 
     let devices = devices.to_vec();
+    let nl_semaphore = Arc::new(tokio::sync::Semaphore::new(4));
     let mut offset = match consume_pending_updates(&client, bot_token).await {
         Ok(next_offset) => next_offset,
         Err(err) => {
@@ -298,6 +344,21 @@ async fn run(
                             for u in updates {
                                 offset = u.update_id + 1;
                                 if let Some(msg) = u.message {
+                                    // 仅允许私聊（1:1 会话）访问，避免群聊中共享 chat_id 让全群成员读取个人工作日报
+                                    if msg
+                                        .chat
+                                        .chat_type
+                                        .as_deref()
+                                        .is_some_and(|t| t != "private")
+                                        || msg.chat.id < 0
+                                    {
+                                        log::warn!(
+                                            "TG Bot 拒绝非私聊会话: chat_id={}, type={:?}",
+                                            msg.chat.id,
+                                            msg.chat.chat_type
+                                        );
+                                        continue;
+                                    }
                                     let text = msg.text.as_deref();
                                     let cmd = text
                                         .map(|t| t.split_whitespace().next().unwrap_or(""))
@@ -325,31 +386,107 @@ async fn run(
                                         continue;
                                     }
 
-                                    let reply = if let Some(text) = text {
-                                        log::debug!("TG Bot 收到命令: {cmd}");
-                                        if let Some(progress) = progress_text_for_command(&cmd) {
-                                            send_chat_action(
-                                                &client,
-                                                bot_token,
-                                                msg.chat.id,
-                                                "typing",
-                                            )
-                                            .await;
-                                            send_text(&client, bot_token, msg.chat.id, progress)
-                                                .await;
+                                    // 上方已强制仅放行私聊（1:1 会话），chat.id 即该发送者 ID
+                                    let sender_key = msg.chat.id.to_string();
+                                    let update_key = u.update_id.to_string();
+                                    let inbound =
+                                        crate::bot_common::InboundBotMessage::pre_authorized(
+                                            "telegram",
+                                            &update_key,
+                                            &sender_key,
+                                            text.unwrap_or(""),
+                                            text.is_some(),
+                                        );
+                                    let nl_enabled =
+                                        crate::bot_common::is_bot_natural_language_enabled(&state);
+
+                                    let reply = match crate::bot_common::route_inbound_bot_message(
+                                        &state,
+                                        &inbound,
+                                        &nl_semaphore,
+                                        nl_enabled,
+                                        Some(crate::bot_common::EMPTY_TEXT_REPLY),
+                                    ) {
+                                        crate::bot_common::BotPipelineAction::Duplicate => {
+                                            continue;
                                         }
-                                        let generate_timeout = state
-                                            .lock()
-                                            .ok()
-                                            .map(|s| {
-                                                crate::bot_common::report_generate_timeout(
-                                                    &s.config,
+                                        crate::bot_common::BotPipelineAction::ImmediateReply {
+                                            text: reply,
+                                            ..
+                                        } => Some(reply),
+                                        crate::bot_common::BotPipelineAction::NaturalLanguage {
+                                            permit,
+                                            question,
+                                        } => {
+                                            let client_bg = client.clone();
+                                            let token_bg = bot_token.to_string();
+                                            let state_bg = state.clone();
+                                            let chat_id = msg.chat.id;
+                                            tokio::spawn(async move {
+                                                let _permit = permit;
+                                                send_chat_action(
+                                                    &client_bg, &token_bg, chat_id, "typing",
                                                 )
-                                            })
-                                            .unwrap_or_else(|| std::time::Duration::from_secs(120));
-                                        handle_cmd(&client, &devices, text, generate_timeout).await
-                                    } else {
-                                        Some(NON_TEXT_REPLY.to_string())
+                                                .await;
+                                                send_text(
+                                                    &client_bg,
+                                                    &token_bg,
+                                                    chat_id,
+                                                    crate::bot_common::BOT_NL_THINKING_REPLY,
+                                                )
+                                                .await;
+                                                let answer =
+                                                    crate::bot_common::run_bot_natural_language_query(
+                                                        &state_bg,
+                                                        &question,
+                                                        "telegram",
+                                                    )
+                                                    .await;
+                                                send_text(&client_bg, &token_bg, chat_id, &answer)
+                                                    .await;
+                                            });
+                                            continue;
+                                        }
+                                        crate::bot_common::BotPipelineAction::Command {
+                                            text: cmd_text,
+                                            progress_hint,
+                                        } => {
+                                            log::debug!("TG Bot 收到命令: {cmd}");
+                                            if let Some(progress) = progress_hint {
+                                                send_chat_action(
+                                                    &client,
+                                                    bot_token,
+                                                    msg.chat.id,
+                                                    "typing",
+                                                )
+                                                .await;
+                                                send_text(
+                                                    &client,
+                                                    bot_token,
+                                                    msg.chat.id,
+                                                    progress,
+                                                )
+                                                .await;
+                                            }
+                                            let generate_timeout = state
+                                                .lock()
+                                                .ok()
+                                                .map(|s| {
+                                                    crate::bot_common::report_generate_timeout(
+                                                        &s.config,
+                                                    )
+                                                })
+                                                .unwrap_or_else(|| {
+                                                    std::time::Duration::from_secs(120)
+                                                });
+                                            handle_cmd(
+                                                &client,
+                                                &devices,
+                                                &cmd_text,
+                                                generate_timeout,
+                                            )
+                                            .await
+                                        }
                                     };
                                     if let Some(r) = reply {
                                         send_text(&client, bot_token, msg.chat.id, &r).await;
@@ -516,6 +653,8 @@ fn configured_bind_code_status(
     };
 
     match expires_at {
+        // 没有过期时间的绑定码（旧版或手工写入）视为已过期，必须在设置页重新生成。
+        None => BindCodeStatus::Expired,
         Some(expires_at) if expires_at < now_ts => BindCodeStatus::Expired,
         _ => BindCodeStatus::Ready(expected_code.to_ascii_uppercase()),
     }
@@ -592,9 +731,10 @@ fn handle_bind_command(
     let mut state = match state.lock() {
         Ok(state) => state,
         Err(e) => {
+            log::warn!("Telegram Bot 绑定读取配置锁失败: {e}");
             return BindCommandResult::reply(format!(
-                "❌ 绑定失败\n{OUTPUT_DIVIDER}\n无法读取配置：{e}"
-            ))
+                "❌ 绑定失败\n{OUTPUT_DIVIDER}\n服务暂不可用，请稍后重试。"
+            ));
         }
     };
 
@@ -606,25 +746,46 @@ fn handle_bind_command(
             BindCommandResult::reply(bind_not_configured_reply(chat_id))
         }
         BindCodeApplyResult::Expired => {
+            reset_telegram_bind_failed_attempts();
             let config_path = state.config_path.clone();
             if let Err(e) = next_config.save(&config_path) {
                 log::warn!("清理过期 Telegram Bot 绑定码失败: {e}");
-            } else {
-                state.config = next_config;
             }
+            state.config = next_config;
             BindCommandResult::reply(bind_expired_reply(chat_id))
         }
-        BindCodeApplyResult::Invalid => BindCommandResult::reply(bind_invalid_reply(chat_id)),
+        BindCodeApplyResult::Invalid => {
+            let attempts =
+                TELEGRAM_BIND_FAILED_ATTEMPTS.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            if attempts >= TELEGRAM_BIND_MAX_FAILED_ATTEMPTS {
+                clear_bind_code(&mut next_config);
+                reset_telegram_bind_failed_attempts();
+                let config_path = state.config_path.clone();
+                if let Err(e) = next_config.save(&config_path) {
+                    log::warn!("作废 Telegram Bot 绑定码写盘失败: {e}");
+                }
+                state.config = next_config;
+                return BindCommandResult::reply(bind_expired_reply(chat_id));
+            }
+            BindCommandResult::reply(bind_invalid_reply(chat_id))
+        }
         BindCodeApplyResult::Success => {
             let config_path = state.config_path.clone();
             match next_config.save(&config_path) {
                 Ok(_) => {
-                    state.config = next_config;
+                    reset_telegram_bind_failed_attempts();
+                    state.config = next_config.clone();
+                    if let Some(app) = crate::APP_HANDLE.get() {
+                        crate::emit_config_changed(app, &next_config);
+                    }
                     BindCommandResult::success(bind_success_reply(chat_id), chat_id)
                 }
-                Err(e) => BindCommandResult::reply(format!(
-                    "❌ 绑定失败\n{OUTPUT_DIVIDER}\n配置保存失败：{e}"
-                )),
+                Err(e) => {
+                    log::warn!("Telegram Bot 绑定保存配置失败: {e}");
+                    BindCommandResult::reply(format!(
+                        "❌ 绑定失败\n{OUTPUT_DIVIDER}\n配置保存失败，请稍后重试。"
+                    ))
+                }
             }
         }
     }
@@ -819,6 +980,10 @@ mod tests {
         assert_eq!(
             configured_bind_code_status(Some("wr-ab12"), Some(100), 100),
             BindCodeStatus::Ready("WR-AB12".to_string())
+        );
+        assert_eq!(
+            configured_bind_code_status(Some("wr-ab12"), None, 100),
+            BindCodeStatus::Expired
         );
     }
 

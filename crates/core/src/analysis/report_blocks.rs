@@ -24,6 +24,7 @@ pub const BLOCK_LOCAL_OVERVIEW: &str = "LOCAL_OVERVIEW";
 pub const BLOCK_LOCAL_CATEGORY: &str = "LOCAL_CATEGORY";
 pub const BLOCK_LOCAL_APP_USAGE: &str = "LOCAL_APP_USAGE";
 pub const BLOCK_LOCAL_DOMAIN_USAGE: &str = "LOCAL_DOMAIN_USAGE";
+pub const BLOCK_PROJECT_USAGE: &str = "PROJECT_USAGE";
 
 /// 段落积木枚举——每个变体对应一个可独立渲染的统计区块。
 /// 调用方（summary.rs / local.rs）构造 `Vec<StatsBlock>` 传入 `assemble()`，
@@ -49,6 +50,8 @@ pub enum StatsBlock {
     LocalAppUsage,
     /// local 模式：网站访问列表
     LocalDomainUsage,
+    /// summary + local：项目投入分布（未配置项目或无命中时自动跳过）
+    ProjectUsage,
 }
 
 impl StatsBlock {
@@ -63,6 +66,7 @@ impl StatsBlock {
             Self::LocalCategory => BLOCK_LOCAL_CATEGORY,
             Self::LocalAppUsage => BLOCK_LOCAL_APP_USAGE,
             Self::LocalDomainUsage => BLOCK_LOCAL_DOMAIN_USAGE,
+            Self::ProjectUsage => BLOCK_PROJECT_USAGE,
         }
     }
 
@@ -85,6 +89,7 @@ impl StatsBlock {
             Self::LocalDomainUsage => {
                 render_local_domain_usage_list(stats, locale, semantic_overrides)
             }
+            Self::ProjectUsage => render_project_usage_table(stats, locale),
         }
     }
 }
@@ -180,6 +185,7 @@ pub fn parse_block_name(name: &str) -> Option<StatsBlock> {
         "LOCAL_CATEGORY" => Some(StatsBlock::LocalCategory),
         "LOCAL_APP_USAGE" => Some(StatsBlock::LocalAppUsage),
         "LOCAL_DOMAIN_USAGE" => Some(StatsBlock::LocalDomainUsage),
+        "PROJECT_USAGE" => Some(StatsBlock::ProjectUsage),
         _ => None,
     }
 }
@@ -232,6 +238,7 @@ pub fn merge_ai_order(ai_order: &[String], available: &[StatsBlock]) -> Vec<Stat
 pub fn default_summary_order() -> Vec<StatsBlock> {
     vec![
         StatsBlock::CategoryTable,
+        StatsBlock::ProjectUsage,
         StatsBlock::AppUsageTable,
         StatsBlock::HourlySummary,
         StatsBlock::DomainUsageTable,
@@ -243,6 +250,7 @@ pub fn default_local_order() -> Vec<StatsBlock> {
     vec![
         StatsBlock::LocalOverview,
         StatsBlock::LocalCategory,
+        StatsBlock::ProjectUsage,
         StatsBlock::LocalAppUsage,
         StatsBlock::HourlySummary,
         StatsBlock::LocalDomainUsage,
@@ -315,6 +323,11 @@ pub fn render_report_with_live_stats(
         &output,
         BLOCK_LOCAL_DOMAIN_USAGE,
         &render_local_domain_usage_list(stats, locale, semantic_overrides),
+    );
+    output = replace_block(
+        &output,
+        BLOCK_PROJECT_USAGE,
+        &render_project_usage_table(stats, locale),
     );
     output
 }
@@ -611,6 +624,53 @@ pub fn render_domain_usage_table(
     out
 }
 
+pub fn render_project_usage_table(stats: &DailyStats, locale: AppLocale) -> String {
+    let has_named_project = stats
+        .project_usage
+        .iter()
+        .any(|p| p.key != crate::project::UNASSIGNED_PROJECT_KEY && p.duration > 0);
+    if !has_named_project {
+        return String::new();
+    }
+    let mut out = String::new();
+    out.push_str(match locale {
+        AppLocale::ZhCn => "## 项目投入分布\n\n",
+        AppLocale::ZhTw => "## 專案投入分布\n\n",
+        AppLocale::En => "## Project Breakdown\n\n",
+        AppLocale::Ar => "## توزيع المشاريع\n\n",
+    });
+    out.push_str(match locale {
+        AppLocale::ZhCn => "| 项目 | 时长 | 占比 |\n|:--|--:|--:|\n",
+        AppLocale::ZhTw => "| 專案 | 時長 | 佔比 |\n|:--|--:|--:|\n",
+        AppLocale::En => "| Project | Duration | Share |\n|:--|--:|--:|\n",
+        AppLocale::Ar => "| المشروع | المدة | النسبة |\n|:--|--:|--:|\n",
+    });
+    for project in &stats.project_usage {
+        if project.duration <= 0 {
+            continue;
+        }
+        let label = if project.key == crate::project::UNASSIGNED_PROJECT_KEY {
+            match locale {
+                AppLocale::ZhCn => "未归属",
+                AppLocale::ZhTw => "未歸屬",
+                AppLocale::En => "Unassigned",
+                AppLocale::Ar => "غير مصنّف",
+            }
+        } else {
+            project.name.as_str()
+        };
+        let percentage = usage_percentage(project.duration, stats.total_duration);
+        out.push_str(&format!(
+            "| {} | {} | {}% |\n",
+            label,
+            format_duration_for_locale(project.duration, locale),
+            percentage
+        ));
+    }
+    out.push('\n');
+    out
+}
+
 // ─────────── local mode 的块渲染器（与 summary mode 表格风格不同，是列表风格）───────────
 
 pub fn render_local_overview(stats: &DailyStats, locale: AppLocale) -> String {
@@ -776,6 +836,7 @@ mod tests {
             work_time_duration: 3600,
             overtime_duration: 0,
             hourly_activity_distribution: vec![],
+            project_usage: vec![],
         }
     }
 
@@ -834,6 +895,7 @@ mod tests {
                     duration: 3000,
                 },
             ],
+            project_usage: vec![],
         }
     }
 
@@ -892,6 +954,7 @@ mod tests {
             work_time_duration: 0,
             overtime_duration: 0,
             hourly_activity_distribution: vec![],
+            project_usage: vec![],
         };
         assert_eq!(
             render_report_with_live_stats(

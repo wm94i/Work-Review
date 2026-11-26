@@ -96,11 +96,20 @@
     domains: DomainItem[];
   }
 
+  interface ProjectUsage {
+    key: string;
+    name: string;
+    color: string;
+    duration: number;
+    activity_count: number;
+  }
+
   interface DailyStats {
     total_duration: number;
     screenshot_count: number;
     app_usage: AppUsage[];
     category_usage: CategoryUsage[];
+    project_usage?: ProjectUsage[];
     browser_duration: number;
     domain_usage: DomainItem[];
     domain_total_count: number;
@@ -113,6 +122,23 @@
   interface RangeDailyTotal {
     date: string;
     total_duration: number;
+  }
+
+  interface InterrupterStat {
+    appName: string;
+    count: number;
+    totalDuration: number;
+  }
+
+  interface FocusMetrics {
+    focusScore: number;
+    totalDuration: number;
+    longestFocusSeconds: number;
+    averageFocusSeconds: number;
+    deepFocusSessions: number;
+    contextSwitches: number;
+    switchesPerHour: number;
+    topInterrupters: InterrupterStat[];
   }
 
   interface OverviewDomainCollection {
@@ -289,9 +315,22 @@
   let rangeDailyLoading = false;
   let rangeDailyRequestId = 0;
   let hourlyBreakdownRequestId = 0;
-  function getHourlyBreakdownRange() {
+  let focusMetrics: FocusMetrics | null = null;
+  let focusMetricsRangeKey = '';
+  let focusMetricsRequestId = 0;
+  let currentLocalDate = formatIsoDate(currentTime);
+  $: {
+    const nextLocalDate = formatIsoDate(currentTime);
+    if (nextLocalDate !== currentLocalDate) {
+      currentLocalDate = nextLocalDate;
+    }
+  }
+  $: activeOverviewRangeKey = overviewMode === 'date'
+    ? `date|${selectedDateFrom}|${selectedDateTo}`
+    : `${overviewMode}|${currentLocalDate}`;
+  function getHourlyBreakdownRange(localDate: string = currentLocalDate) {
     if (overviewMode === 'week') {
-      return getWeekDateRange(getLocalDateString());
+      return getWeekDateRange(localDate);
     }
     if (overviewMode === 'date') {
       return {
@@ -299,10 +338,9 @@
         dateTo: selectedDateTo,
       };
     }
-    const today = getLocalDateString();
     return {
-      dateFrom: today,
-      dateTo: today,
+      dateFrom: localDate,
+      dateTo: localDate,
     };
   }
 
@@ -329,8 +367,8 @@
       }
     }
   }
-  // 切换日期时刷新 hourly 分类细分
-  $: { overviewMode; selectedDateFrom; selectedDateTo; if (categoryList.length) loadHourlyBreakdown(); }
+  // 切换模式/日期或跨午夜时刷新 hourly 分类细分（不在秒级时钟 tick 上空转）
+  $: { activeOverviewRangeKey; if (categoryList.length) loadHourlyBreakdown(); }
 
   // week/date 模式的「按天投入」数据（today 模式不显示该卡，直接清空）
   async function loadRangeDailyTotals() {
@@ -359,8 +397,39 @@
       }
     }
   }
-  // 切换模式/日期时刷新按天投入
-  $: { overviewMode; selectedDateFrom; selectedDateTo; loadRangeDailyTotals(); }
+  // 切换模式/日期或跨午夜时刷新按天投入
+  $: { activeOverviewRangeKey; loadRangeDailyTotals(); }
+
+  async function loadFocusMetrics() {
+    const mode = overviewMode;
+    const range = getHourlyBreakdownRange();
+    const rangeKey = `${mode}|${range.dateFrom}|${range.dateTo}`;
+    const requestId = ++focusMetricsRequestId;
+    try {
+      const result = await invoke<FocusMetrics>('get_focus_metrics', {
+        mode,
+        date: range.dateTo,
+        dateFrom: range.dateFrom,
+        dateTo: range.dateTo,
+      });
+      if (requestId === focusMetricsRequestId) {
+        focusMetrics = result;
+        focusMetricsRangeKey = rangeKey;
+      }
+    } catch {
+      if (requestId === focusMetricsRequestId) {
+        focusMetrics = null;
+        focusMetricsRangeKey = '';
+      }
+    }
+  }
+  $: { activeOverviewRangeKey; void loadFocusMetrics(); }
+  $: currentFocusRangeKey = overviewMode === 'date'
+    ? `date|${selectedDateFrom}|${selectedDateTo}`
+    : (() => {
+        const range = getHourlyBreakdownRange(currentLocalDate);
+        return `${overviewMode}|${range.dateFrom}|${range.dateTo}`;
+      })();
 
   // today 模式并行拉取「上周同日」基线；绕过 overview 缓存
   // （cache.setOverview 只保存一份"今天"快照，写入 date 模式数据会互相污染），
@@ -503,6 +572,9 @@
   }
 
   $: peakWindow = stats ? computePeakWindow(stats.hourly_activity_distribution) : null;
+  $: projectUsageItems = (stats?.project_usage || []).filter((item) => item.duration > 0);
+  $: hasMatchedProjects = projectUsageItems.some((item) => item.key !== '__unassigned__');
+  $: projectUsageTotalDuration = projectUsageItems.reduce((sum, item) => sum + item.duration, 0);
   $: peakWindowValue = peakWindow
     ? t('overview.peakHoursValue', { from: peakWindow.startHour, to: peakWindow.endHour + 1 })
     : '--';
@@ -1303,7 +1375,11 @@
       clockInterval = setInterval(() => {
         // 界面只展示到分钟：仅分钟变化时才更新状态，避免每秒触发整页响应式重算
         const now = new Date();
-        if (now.getMinutes() !== currentTime.getMinutes() || now.getHours() !== currentTime.getHours()) {
+        if (
+          now.getMinutes() !== currentTime.getMinutes()
+          || now.getHours() !== currentTime.getHours()
+          || now.getDate() !== currentTime.getDate()
+        ) {
           currentTime = now;
         }
         if (!shouldAutoRefreshOverview()) {
@@ -1319,6 +1395,7 @@
       refreshInterval = setInterval(() => {
         if (shouldAutoRefreshOverview()) {
           loadStats();
+          void loadFocusMetrics();
         }
       }, 30000);
     }
@@ -1334,7 +1411,11 @@
         lastCheckDate = currentTime.getDate();
         clockInterval = setInterval(() => {
           const now = new Date();
-          if (now.getMinutes() !== currentTime.getMinutes() || now.getHours() !== currentTime.getHours()) {
+          if (
+            now.getMinutes() !== currentTime.getMinutes()
+            || now.getHours() !== currentTime.getHours()
+            || now.getDate() !== currentTime.getDate()
+          ) {
             currentTime = now;
           }
           if (!shouldAutoRefreshOverview()) {
@@ -1344,14 +1425,17 @@
           if (newDate !== lastCheckDate) {
             lastCheckDate = newDate;
             loadStats(true);
+            void loadFocusMetrics();
           }
         }, 1000);
         refreshInterval = setInterval(() => {
           if (shouldAutoRefreshOverview()) {
             loadStats();
+            void loadFocusMetrics();
           }
         }, 30000);
         loadStats(true);
+        void loadFocusMetrics();
       }
     };
     document.addEventListener('visibilitychange', handleVisibilityChange);
@@ -1360,6 +1444,7 @@
     const un = await safeListen('screenshot-taken', () => {
       if (!document.hidden && shouldAutoRefreshOverview()) {
         loadStats(true);
+        void loadFocusMetrics();
       }
     });
     // 组件可能在 await 期间已销毁，避免监听器泄漏
@@ -1373,6 +1458,7 @@
     handleActivityAdded = () => {
       if (!document.hidden && shouldAutoRefreshOverview()) {
         loadStats(true);
+        void loadFocusMetrics();
       }
     };
     window.addEventListener('activity-added', handleActivityAdded);
@@ -1385,6 +1471,7 @@
   onDestroy(() => {
     componentDestroyed = true;
     hourlyBreakdownRequestId += 1;
+    focusMetricsRequestId += 1;
     if (unlisten) unlisten();
     if (clockInterval) clearInterval(clockInterval);
     if (refreshInterval) clearInterval(refreshInterval);
@@ -1408,7 +1495,7 @@
   }}
 />
 
-<div class="page-shell" data-locale={currentLocale}>
+<div class="page-shell overview-page-shell" data-locale={currentLocale}>
   <!-- 页面标题 -->
   <div class="page-header">
     <div class="page-title-group">
@@ -1434,27 +1521,32 @@
     </div>
     <!-- 改版：原 overview-lead-card 模式切换整卡删除，分段切换（今天/本周/自定义）并入页头右侧一行 -->
     <div class="overview-command-deck">
-      <button
-        type="button"
-        class="page-control-btn {overviewMode === 'today' ? 'page-control-btn-active' : ''}"
-        on:click={() => setOverviewMode('today')}
-      >
-        {t('overview.modeToday')}
-      </button>
-      <button
-        type="button"
-        class="page-control-btn {overviewMode === 'week' ? 'page-control-btn-active' : ''}"
-        on:click={() => setOverviewMode('week')}
-      >
-        {t('overview.modeWeek')}
-      </button>
-      <button
-        type="button"
-        class="page-control-btn {overviewMode === 'date' ? 'page-control-btn-active' : ''}"
-        on:click={() => setOverviewMode('date')}
-      >
-        {t('overview.modeDate')}
-      </button>
+      <div class="ui-segmented-track" role="group" aria-label={t('overview.title')}>
+        <button
+          type="button"
+          class="page-control-btn {overviewMode === 'today' ? 'page-control-btn-active' : ''}"
+          aria-pressed={overviewMode === 'today'}
+          on:click={() => setOverviewMode('today')}
+        >
+          {t('overview.modeToday')}
+        </button>
+        <button
+          type="button"
+          class="page-control-btn {overviewMode === 'week' ? 'page-control-btn-active' : ''}"
+          aria-pressed={overviewMode === 'week'}
+          on:click={() => setOverviewMode('week')}
+        >
+          {t('overview.modeWeek')}
+        </button>
+        <button
+          type="button"
+          class="page-control-btn {overviewMode === 'date' ? 'page-control-btn-active' : ''}"
+          aria-pressed={overviewMode === 'date'}
+          on:click={() => setOverviewMode('date')}
+        >
+          {t('overview.modeDate')}
+        </button>
+      </div>
 
       {#if overviewMode === 'date'}
         <div class="overview-date-bar">
@@ -1507,7 +1599,7 @@
       </span>
       <p class="min-w-0 flex-1 basis-52 text-sm text-slate-600 dark:text-[#adbac7]">{insightSentence}</p>
       <a
-        href="#/report"
+        href="#/report?view=week"
         class="shrink-0 whitespace-nowrap text-[13px] font-semibold text-primary-600 transition-colors hover:text-primary-700 dark:text-primary-400 dark:hover:text-primary-300"
       >
         {t('overview.insightWeekLink')}
@@ -1724,6 +1816,48 @@
           </button>
         </div>
       {/if}
+      {#if focusMetrics && focusMetricsRangeKey === currentFocusRangeKey && focusMetrics.totalDuration > 0}
+        <div class="overview-focus-strip mb-4 rounded-xl border border-slate-200/70 bg-slate-50/70 px-3.5 py-3 dark:border-[#30363d]/80 dark:bg-[#161b22]/40">
+          <div class="grid grid-cols-2 gap-2.5 sm:grid-cols-4">
+            <div class="min-w-0">
+              <p class="text-[11px] text-slate-500 dark:text-[#7d8590]">{t('overview.focusScore')}</p>
+              <p class="mt-0.5 text-sm font-semibold tabular-nums text-slate-800 dark:text-[#e6edf3]">
+                {focusMetrics.focusScore}<span class="ms-0.5 text-[11px] font-normal text-slate-400 dark:text-[#636c76]">/100</span>
+              </p>
+            </div>
+            <div class="min-w-0">
+              <p class="text-[11px] text-slate-500 dark:text-[#7d8590]">{t('overview.focusLongestStreak')}</p>
+              <p class="mt-0.5 text-sm font-semibold tabular-nums text-slate-800 dark:text-[#e6edf3]">
+                {focusMetrics.longestFocusSeconds > 0
+                  ? formatDurationLocalized(focusMetrics.longestFocusSeconds, { compact: true })
+                  : '--'}
+              </p>
+            </div>
+            <div class="min-w-0">
+              <p class="text-[11px] text-slate-500 dark:text-[#7d8590]">{t('overview.focusDeepSessions')}</p>
+              <p class="mt-0.5 text-sm font-semibold tabular-nums text-slate-800 dark:text-[#e6edf3]">
+                {t('overview.focusDeepSessionsValue', { count: focusMetrics.deepFocusSessions })}
+              </p>
+            </div>
+            <div class="min-w-0">
+              <p class="text-[11px] text-slate-500 dark:text-[#7d8590]">{t('overview.focusSwitchRate')}</p>
+              <p class="mt-0.5 text-sm font-semibold tabular-nums text-slate-800 dark:text-[#e6edf3]">
+                {t('overview.focusSwitchRateValue', { rate: focusMetrics.switchesPerHour })}
+              </p>
+            </div>
+          </div>
+          {#if focusMetrics.topInterrupters.length > 0}
+            <div class="mt-2.5 flex flex-wrap items-center gap-1.5 border-t border-slate-200/60 pt-2 text-[11px] text-slate-500 dark:border-[#30363d]/60 dark:text-[#7d8590]">
+              <span>{t('overview.focusInterrupters')}</span>
+              {#each focusMetrics.topInterrupters as item (item.appName)}
+                <span class="rounded-full bg-white px-2 py-0.5 text-slate-600 ring-1 ring-slate-200/70 dark:bg-[#21262d] dark:text-[#adbac7] dark:ring-[#30363d]">
+                  {t('overview.focusInterrupterItem', { app: item.appName, count: item.count })}
+                </span>
+              {/each}
+            </div>
+          {/if}
+        </div>
+      {/if}
       <ActivityHourlyChart
         embedded
         data={stats.hourly_activity_distribution}
@@ -1741,6 +1875,48 @@
       />
     {/if}
   </div>
+
+  {#if !loading && stats && hasMatchedProjects}
+    <section class="page-card overview-panel overview-panel-subtle mb-4">
+      <div class="mb-3 flex items-baseline justify-between gap-3">
+        <h3 class="page-section-title !mb-0">{t('overview.projectUsageTitle')}</h3>
+        <a
+          href="#/settings"
+          class="text-xs font-medium text-primary-600 transition-colors hover:text-primary-700 dark:text-primary-400 dark:hover:text-primary-300"
+        >
+          {t('overview.projectUsageManage')}
+        </a>
+      </div>
+      <div class="space-y-2.5">
+        {#each projectUsageItems as item (item.key)}
+          {@const sharePct = projectUsageTotalDuration > 0 ? Math.round((item.duration / projectUsageTotalDuration) * 100) : 0}
+          <div class="grid grid-cols-[minmax(0,11rem)_minmax(6rem,1fr)_auto] items-center gap-3">
+            <div class="flex min-w-0 items-center gap-2">
+              <span
+                class="h-2.5 w-2.5 shrink-0 rounded-[var(--radius-xs)]"
+                style={`background-color: ${item.color || '#94A3B8'};`}
+              ></span>
+              <span class="truncate text-xs font-medium text-slate-700 dark:text-[#c9d1d9]">
+                {item.key === '__unassigned__' ? t('overview.projectUnassigned') : item.name}
+              </span>
+            </div>
+            <div class="h-2 w-full overflow-hidden rounded-full bg-slate-100 dark:bg-[#30363d]/60">
+              <div
+                class="h-full rounded-full transition-all duration-300"
+                style={`width: ${Math.max(sharePct, 2)}%; background-color: ${item.color || '#94A3B8'};`}
+              ></div>
+            </div>
+            <div class="flex shrink-0 items-center gap-2 text-xs tabular-nums">
+              <span class="font-semibold text-slate-700 dark:text-[#e6edf3]">
+                {formatDurationLocalized(item.duration, { compact: true })}
+              </span>
+              <span class="w-8 text-end text-slate-400 dark:text-[#636c76]">{sharePct}%</span>
+            </div>
+          </div>
+        {/each}
+      </div>
+    </section>
+  {/if}
 
   <div class="overview-section-grid">
     <!-- 常驻网站：domain_usage 前 6，按域名聚合；点击行打开既有浏览器详情弹窗 -->

@@ -5,11 +5,19 @@ use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, State};
+use work_review_core::analysis::obsidian::{render_obsidian_export, ExportFrontmatterMeta};
+use work_review_core::analysis::report_blocks::wrap_block;
 use work_review_core::analysis::AppLocale;
-use work_review_core::config::AppConfig;
-use work_review_core::database::DailyReport;
+use work_review_core::config::{AiTaskKind, AppConfig};
+use work_review_core::database::{Activity, DailyReport, DailyStats};
 use work_review_core::error::AppError;
+use work_review_core::git_commits::{
+    collect_git_commits_for_date, format_git_commits_markdown, format_git_commits_prompt_context,
+    sanitize_git_commits, total_commit_count, GitRepoSummary,
+};
+use work_review_core::privacy::PrivacyFilter;
 
+use super::backup::write_export_file_atomic;
 use super::shared::{collect_privacy_filters, filter_activities_by_privacy, persist_app_config};
 
 fn resolve_saved_report_metadata(
@@ -57,12 +65,94 @@ fn build_daily_report_export_path(export_dir: &Path, date: &str) -> PathBuf {
     export_dir.join(format!("{safe_date}.md"))
 }
 
-fn export_daily_report_markdown(
+fn build_export_frontmatter_meta(
+    date: &str,
+    stats: &DailyStats,
+    activities: &[Activity],
+    git_commit_count: usize,
+) -> ExportFrontmatterMeta {
+    let focus = work_review_core::work_intelligence::compute_focus_metrics(activities);
+    ExportFrontmatterMeta {
+        date: date.to_string(),
+        total_minutes: (stats.total_duration / 60).max(0),
+        work_minutes: (stats.work_time_duration / 60).max(0),
+        focus_score: (focus.total_duration > 0).then_some(focus.focus_score),
+        top_apps: stats
+            .app_usage
+            .iter()
+            .take(5)
+            .map(|app| app.app_name.clone())
+            .collect(),
+        git_commit_count,
+    }
+}
+
+fn insert_git_commits_section(report: &str, git_markdown: &str) -> String {
+    let trimmed_git = git_markdown.trim();
+    if trimmed_git.is_empty() {
+        return report.to_string();
+    }
+    let wrapped = wrap_block("GIT_COMMITS", trimmed_git);
+    if let Some(pos) = report.find("\n<details>\n<summary>") {
+        let before = report[..pos].trim_end();
+        let after = report[pos..].trim_start();
+        format!("{before}\n\n{wrapped}\n{after}")
+    } else {
+        format!("{}\n\n{wrapped}", report.trim_end())
+    }
+}
+
+fn export_daily_report_markdown_with_options(
     export_dir: &Path,
     date: &str,
     content: &str,
+    meta: Option<&ExportFrontmatterMeta>,
+    include_frontmatter: bool,
+    section_heading: Option<&str>,
 ) -> Result<(), AppError> {
     let output_path = build_daily_report_export_path(export_dir, date);
+    if let Ok(file_meta) = std::fs::symlink_metadata(&output_path) {
+        if file_meta.file_type().is_symlink() {
+            return Err(AppError::Config(
+                "导出目标文件为符号链接，已拒绝写入".to_string(),
+            ));
+        }
+    }
+
+    let trimmed_heading = section_heading.map(str::trim).filter(|s| !s.is_empty());
+    let final_content = if include_frontmatter || trimmed_heading.is_some() {
+        let existing = if trimmed_heading.is_some() {
+            match std::fs::read_to_string(&output_path) {
+                Ok(content) => Some(content),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(error.into()),
+            }
+        } else {
+            None
+        };
+        let fallback_meta = ExportFrontmatterMeta {
+            date: date.to_string(),
+            total_minutes: 0,
+            work_minutes: 0,
+            focus_score: None,
+            top_apps: Vec::new(),
+            git_commit_count: 0,
+        };
+        render_obsidian_export(
+            existing.as_deref(),
+            content,
+            meta.unwrap_or(&fallback_meta),
+            include_frontmatter,
+            trimmed_heading,
+        )
+    } else {
+        content.to_string()
+    };
+
+    let file_name = output_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| AppError::Config("日报导出文件名无效".to_string()))?;
     // Retry up to 3 times to handle transient issues (disk busy, antivirus lock, etc.)
     let mut last_err = None;
     for attempt in 0..3 {
@@ -77,12 +167,12 @@ fn export_daily_report_markdown(
         match std::fs::create_dir_all(export_dir) {
             Ok(()) => {}
             Err(e) => {
-                last_err = Some(e);
+                last_err = Some(AppError::Io(e));
                 continue;
             }
         }
-        match std::fs::write(&output_path, content) {
-            Ok(()) => {
+        match write_export_file_atomic(export_dir, file_name, final_content.as_bytes()) {
+            Ok(_) => {
                 log::info!("日报自动导出成功: {}", output_path.display());
                 return Ok(());
             }
@@ -98,6 +188,15 @@ fn export_daily_report_markdown(
             .map(|e| e.to_string())
             .unwrap_or_else(|| "未知错误".to_string())
     )))
+}
+
+#[cfg(test)]
+fn export_daily_report_markdown(
+    export_dir: &Path,
+    date: &str,
+    content: &str,
+) -> Result<(), AppError> {
+    export_daily_report_markdown_with_options(export_dir, date, content, None, false, None)
 }
 
 // JoinHandle 默认在 drop 时分离；父请求取消和超时都必须停止分析器。
@@ -238,6 +337,9 @@ pub(crate) async fn generate_report_inner(
         let raw_activities = state.database.get_timeline(&date, Some(2000), None)?;
         let activities =
             filter_activities_by_privacy(raw_activities, &ignored_apps, &excluded_domains);
+        // 日报上下文可能发给云端模型：采集后才新增的脱敏规则同样作用于历史记录。
+        let activities =
+            super::sanitize_activities_for_external(activities, &state.privacy_filter, true);
         (
             state.config.clone(),
             stats,
@@ -263,15 +365,45 @@ pub(crate) async fn generate_report_inner(
 
     let report_timeout =
         std::time::Duration::from_secs(config.report_generation_timeout_secs.max(60));
+    let report_model = config.resolve_model_for_task(AiTaskKind::Report);
 
-    // 创建分析器（使用 text_model 配置）
+    // 若开启 Git 提交关联，先在阻塞池采集并按当前隐私规则脱敏
+    let git_summaries = if config.git_report_enabled && !config.git_repo_paths.is_empty() {
+        let repo_paths = config.git_repo_paths.clone();
+        let author_filter = config.git_author_filter.clone();
+        let date_for_git = date.clone();
+        let raw = tokio::task::spawn_blocking(move || {
+            collect_git_commits_for_date(&repo_paths, &date_for_git, author_filter.as_deref())
+        })
+        .await
+        .unwrap_or_default();
+        let privacy_filter = PrivacyFilter::from_config(&config.privacy);
+        sanitize_git_commits(raw, &privacy_filter)
+    } else {
+        Vec::new()
+    };
+
+    let git_commit_count = total_commit_count(&git_summaries);
+    let export_meta = build_export_frontmatter_meta(&date, &stats, &activities, git_commit_count);
+    let git_prompt_context = format_git_commits_prompt_context(&git_summaries, report_locale);
+    let effective_custom_prompt = match (
+        config.daily_report_custom_prompt.trim(),
+        git_prompt_context.trim(),
+    ) {
+        ("", "") => String::new(),
+        (custom, "") => custom.to_string(),
+        ("", git_ctx) => git_ctx.to_string(),
+        (custom, git_ctx) => format!("{custom}\n\n{git_ctx}"),
+    };
+
+    // 创建分析器（按日报场景路由模型配置）
     let analyzer = work_review_core::analysis::create_analyzer(
         config.ai_mode,
-        config.text_model.provider,
-        &config.text_model.endpoint,
-        &config.text_model.model,
-        config.text_model.api_key.as_deref(),
-        &config.daily_report_custom_prompt,
+        report_model.provider,
+        &report_model.endpoint,
+        &report_model.model,
+        report_model.api_key.as_deref(),
+        &effective_custom_prompt,
         config.daily_report_system_prompt_override.as_deref(),
         report_locale,
         config.daily_report_pinned_blocks.clone(),
@@ -359,10 +491,11 @@ pub(crate) async fn generate_report_inner(
     }
 
     let generated_report = report_result?;
-    let report = generated_report.content.clone();
+    let git_markdown = format_git_commits_markdown(&git_summaries, report_locale);
+    let report = insert_git_commits_section(&generated_report.content, &git_markdown);
     let (saved_ai_mode, saved_model_name) = resolve_saved_report_metadata(
         &config.ai_mode,
-        &config.text_model.model,
+        &report_model.model,
         generated_report.used_ai,
     );
 
@@ -401,7 +534,17 @@ pub(crate) async fn generate_report_inner(
 
     if config.daily_report_auto_export {
         if let Some(export_dir) = config.daily_report_export_dir.as_deref() {
-            if let Err(e) = export_daily_report_markdown(Path::new(export_dir), &date, &report) {
+            let export_result = validate_export_dir(Path::new(export_dir)).and_then(|dir| {
+                export_daily_report_markdown_with_options(
+                    &dir,
+                    &date,
+                    &report,
+                    Some(&export_meta),
+                    config.daily_report_export_frontmatter,
+                    config.daily_report_export_section_heading.as_deref(),
+                )
+            });
+            if let Err(e) = export_result {
                 log::error!("日报自动导出失败（日报已保存到数据库，仅导出文件失败）: {e:?}");
                 // Do NOT propagate the error — report is already saved in the database.
                 // Export failure should not make the entire generation appear to have failed.
@@ -562,7 +705,9 @@ fn ensure_export_dir_components_safe(canonical: &Path) -> Result<(), AppError> {
     for pair in components.windows(2) {
         let parent = pair[0].to_ascii_lowercase();
         let child = pair[1].to_ascii_lowercase();
-        if parent == "library" && (child == "launchagents" || child == "launchdaemons") {
+        if (parent == "library" && (child == "launchagents" || child == "launchdaemons"))
+            || (parent == "programs" && child == "startup")
+        {
             return Err(AppError::Config(
                 "导出目录位于系统自启动目录，已拒绝写入".to_string(),
             ));
@@ -592,8 +737,17 @@ pub(crate) fn export_report_markdown_inner(
     locale: Option<String>,
     state: &Arc<Mutex<AppState>>,
 ) -> Result<String, AppError> {
+    let date = date.trim().to_string();
+    ensure_iso_date(&date, "日报日期")?;
     let report_locale = AppLocale::from_option(locale.as_deref());
-    let (export_dir, saved_content) = {
+    let (
+        export_dir,
+        saved_content,
+        include_frontmatter,
+        section_heading,
+        frontmatter_source,
+        git_source,
+    ) = {
         let state = state.lock().map_err(|e| AppError::Unknown(e.to_string()))?;
         let requested_export_dir = export_dir
             .as_deref()
@@ -623,15 +777,106 @@ pub(crate) fn export_report_markdown_inner(
                 .ok_or_else(|| AppError::Config("未找到可导出的日报".to_string()))?
                 .content
         };
-        (export_dir, saved_content)
+        let include_frontmatter = state.config.daily_report_export_frontmatter;
+        let section_heading = state.config.daily_report_export_section_heading.clone();
+        let frontmatter_source = if include_frontmatter {
+            let stats =
+                super::stats::load_daily_stats_for_overview(&state, &date).unwrap_or_default();
+            let (ignored_apps, excluded_domains) = collect_privacy_filters(&state);
+            let raw_activities = state
+                .database
+                .get_timeline(&date, Some(2000), None)
+                .unwrap_or_default();
+            let activities =
+                filter_activities_by_privacy(raw_activities, &ignored_apps, &excluded_domains);
+            Some((stats, activities))
+        } else {
+            None
+        };
+        let git_source = if include_frontmatter
+            && state.config.git_report_enabled
+            && !state.config.git_repo_paths.is_empty()
+        {
+            Some((
+                state.config.git_repo_paths.clone(),
+                state.config.git_author_filter.clone(),
+                state.config.privacy.clone(),
+            ))
+        } else {
+            None
+        };
+        (
+            export_dir,
+            saved_content,
+            include_frontmatter,
+            section_heading,
+            frontmatter_source,
+            git_source,
+        )
     };
+
+    let export_meta = frontmatter_source.map(|(stats, activities)| {
+        let git_commit_count = git_source
+            .map(|(paths, author, privacy)| {
+                let raw = collect_git_commits_for_date(&paths, &date, author.as_deref());
+                let filter = PrivacyFilter::from_config(&privacy);
+                total_commit_count(&sanitize_git_commits(raw, &filter))
+            })
+            .unwrap_or(0);
+        build_export_frontmatter_meta(&date, &stats, &activities, git_commit_count)
+    });
 
     // 目录来自请求方/配置，写入前校验（要求已存在，拒绝隐藏/敏感目录）
     let export_dir_path = validate_export_dir(Path::new(&export_dir))?;
-    export_daily_report_markdown(&export_dir_path, &date, &saved_content)?;
+    export_daily_report_markdown_with_options(
+        &export_dir_path,
+        &date,
+        &saved_content,
+        export_meta.as_ref(),
+        include_frontmatter,
+        section_heading.as_deref(),
+    )?;
     Ok(build_daily_report_export_path(&export_dir_path, &date)
         .to_string_lossy()
         .to_string())
+}
+
+/// 获取指定日期的本地 Git 仓库提交（脱敏后返回，供设置页预览与按需核对）
+#[tauri::command]
+pub async fn get_git_commits_for_date(
+    date: String,
+    repo_paths: Option<Vec<String>>,
+    author_filter: Option<String>,
+    state: State<'_, Arc<Mutex<AppState>>>,
+) -> Result<Vec<GitRepoSummary>, AppError> {
+    let date = date.trim().to_string();
+    ensure_iso_date(&date, "Git 提交日期")?;
+    let (paths, author, privacy_config) = {
+        let s = state.lock().map_err(|e| AppError::Unknown(e.to_string()))?;
+        let paths = repo_paths.unwrap_or_else(|| s.config.git_repo_paths.clone());
+        let author = match author_filter {
+            Some(value) => {
+                let trimmed = value.trim();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed.to_string())
+                }
+            }
+            None => s.config.git_author_filter.clone(),
+        };
+        (paths, author, s.config.privacy.clone())
+    };
+    if paths.is_empty() {
+        return Ok(Vec::new());
+    }
+    let raw = tokio::task::spawn_blocking(move || {
+        collect_git_commits_for_date(&paths, &date, author.as_deref())
+    })
+    .await
+    .map_err(|e| AppError::Unknown(format!("读取 Git 提交失败: {e}")))?;
+    let privacy_filter = PrivacyFilter::from_config(&privacy_config);
+    Ok(sanitize_git_commits(raw, &privacy_filter))
 }
 
 #[tauri::command]
@@ -755,14 +1000,83 @@ pub(crate) fn export_reports_range_inner(
         markdown.push_str("\n\n---\n\n");
     }
 
-    let target_path_buf = PathBuf::from(target);
-    if let Some(parent) = target_path_buf.parent() {
-        if !parent.as_os_str().is_empty() && !parent.exists() {
-            std::fs::create_dir_all(parent)?;
+    let target_path_buf = prepare_export_file_target(Path::new(target), &["md", "markdown"])?;
+    std::fs::write(&target_path_buf, markdown)?;
+    Ok((
+        super::config::path_for_display(&target_path_buf),
+        reports.len(),
+    ))
+}
+
+/// 校验并准备用户选择的导出文件路径：
+/// - 必须是绝对路径，扩展名在允许列表内，文件名不得以 `.` 开头；
+/// - 路径中不得出现 `..`；父目录不存在时创建，随后按 [`validate_export_dir`] 校验
+///   （拒绝隐藏目录、LaunchAgents 等敏感位置）。
+pub(crate) fn prepare_export_file_target(
+    target: &Path,
+    allowed_extensions: &[&str],
+) -> Result<PathBuf, AppError> {
+    if !target.is_absolute() {
+        return Err(AppError::Config("导出文件路径必须是绝对路径".to_string()));
+    }
+    if target
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err(AppError::Config("导出文件路径不能包含 ..".to_string()));
+    }
+    let file_name = target
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.trim().is_empty())
+        .ok_or_else(|| AppError::Config("导出文件名无效".to_string()))?;
+    if file_name.starts_with('.') {
+        return Err(AppError::Config("导出文件名不能以 . 开头".to_string()));
+    }
+    let extension_ok = target
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| {
+            allowed_extensions
+                .iter()
+                .any(|allowed| ext.eq_ignore_ascii_case(allowed))
+        })
+        .unwrap_or(false);
+    if !extension_ok {
+        return Err(AppError::Config(format!(
+            "导出文件扩展名应为 {}",
+            allowed_extensions
+                .iter()
+                .map(|ext| format!(".{ext}"))
+                .collect::<Vec<_>>()
+                .join(" / ")
+        )));
+    }
+    let parent = target
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or_else(|| AppError::Config("导出文件路径缺少所在目录".to_string()))?;
+    // 先做不依赖文件系统的组件检查，再规范化最深已存在祖先目录，避免沿符号链接在敏感目录内创建子目录
+    ensure_export_dir_components_safe(parent)?;
+    for ancestor in parent.ancestors() {
+        if ancestor.exists() {
+            validate_export_dir(ancestor)?;
+            break;
         }
     }
-    std::fs::write(&target_path_buf, markdown)?;
-    Ok((target_path_buf.to_string_lossy().to_string(), reports.len()))
+    if !parent.exists() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let canonical_parent = validate_export_dir(parent)?;
+    let final_target = canonical_parent.join(file_name);
+    if let Ok(meta) = std::fs::symlink_metadata(&final_target) {
+        if meta.file_type().is_symlink() {
+            return Err(AppError::Config(
+                "导出目标文件为符号链接，已拒绝写入".to_string(),
+            ));
+        }
+    }
+    Ok(final_target)
 }
 
 #[tauri::command]
@@ -790,6 +1104,30 @@ mod tests {
     use super::*;
     use std::path::{Path, PathBuf};
     use work_review_core::config::AiMode;
+
+    #[test]
+    fn 导出文件路径应校验扩展名隐藏目录与越界() {
+        let base = std::env::temp_dir().join(format!("wr-export-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&base).unwrap();
+
+        let ok = prepare_export_file_target(&base.join("reports.md"), &["md"]).unwrap();
+        assert!(ok.ends_with("reports.md"));
+        // 父目录不存在时创建
+        let nested =
+            prepare_export_file_target(&base.join("sub").join("t.json"), &["json"]).unwrap();
+        assert!(nested.parent().unwrap().is_dir());
+
+        assert!(prepare_export_file_target(&base.join("reports.exe"), &["md"]).is_err());
+        assert!(prepare_export_file_target(&base.join(".bashrc.md"), &["md"]).is_err());
+        assert!(prepare_export_file_target(&base.join(".ssh").join("a.md"), &["md"]).is_err());
+        assert!(!base.join(".ssh").exists(), "被拒绝的路径不应创建目录");
+        assert!(
+            prepare_export_file_target(&base.join("sub").join("..").join("a.md"), &["md"]).is_err()
+        );
+        assert!(prepare_export_file_target(Path::new("relative.md"), &["md"]).is_err());
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     // 只构造内存状态，不启动 Tauri、截图、后台服务或模型请求。
     fn report_test_state() -> Arc<Mutex<AppState>> {
@@ -1060,5 +1398,97 @@ mod tests {
         assert!(
             validate_export_dir(Path::new("/nonexistent-work-review-export-dir-a1b2c3")).is_err()
         );
+    }
+
+    #[test]
+    fn obsidian导出应支持frontmatter与指定标题区块增量更新() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("work-review-obsidian-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let output_path = temp_dir.join("2026-06-22.md");
+        std::fs::write(
+            &output_path,
+            "---\ntags:\n  - daily\n---\n\n# 2026-06-22\n\n## 我的手写笔记\n保留这段内容。\n",
+        )
+        .unwrap();
+
+        let meta = ExportFrontmatterMeta {
+            date: "2026-06-22".to_string(),
+            total_minutes: 320,
+            work_minutes: 280,
+            focus_score: Some(84),
+            top_apps: vec!["VS Code".to_string()],
+            git_commit_count: 3,
+        };
+        export_daily_report_markdown_with_options(
+            &temp_dir,
+            "2026-06-22",
+            "# 工作日报\n\n## 今日总结\n完成功能开发。",
+            Some(&meta),
+            true,
+            Some("## Work Review"),
+        )
+        .expect("Obsidian 增量导出应成功");
+
+        let rendered = std::fs::read_to_string(&output_path).unwrap();
+        assert!(rendered.contains("tags:\n  - daily"));
+        assert!(rendered.contains("work_review_focus_score: 84"));
+        assert!(rendered.contains("work_review_git_commits: 3"));
+        assert!(rendered.contains("## 我的手写笔记\n保留这段内容。"));
+        assert!(rendered.contains("## Work Review"));
+        assert!(rendered.contains("<!-- work-review:start -->"));
+        assert!(rendered.contains("完成功能开发。"));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn obsidian增量导出读取失败时应保留原笔记() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "work-review-obsidian-unreadable-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let output_path = temp_dir.join("2026-06-22.md");
+        let mut original = vec![0xff, 0xfe];
+        for unit in "# 每日笔记\n手写内容必须保留。".encode_utf16() {
+            original.extend_from_slice(&unit.to_le_bytes());
+        }
+        std::fs::write(&output_path, &original).unwrap();
+
+        for include_frontmatter in [false, true] {
+            let result = export_daily_report_markdown_with_options(
+                &temp_dir,
+                "2026-06-22",
+                "# 工作日报\n新生成的正文。",
+                None,
+                include_frontmatter,
+                Some("## Work Review"),
+            );
+            assert!(matches!(
+                result,
+                Err(AppError::Io(error)) if error.kind() == std::io::ErrorKind::InvalidData
+            ));
+            assert_eq!(std::fs::read(&output_path).unwrap(), original);
+            assert_eq!(std::fs::read_dir(&temp_dir).unwrap().count(), 1);
+        }
+        std::fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    #[test]
+    fn git提交区块应插入到折叠时间线之前() {
+        let report = "# 工作日报\n\n## 一、AI 分析\n内容。\n\n<details>\n<summary>活动时间线（2条记录）</summary>\n</details>";
+        let git_md =
+            "## Git 提交产出\n\n### Work_Review (1 commits)\n- `abc1234` feat: add focus metrics";
+        let merged = insert_git_commits_section(report, git_md);
+
+        let git_pos = merged
+            .find("<!-- WR_BLOCK_START:GIT_COMMITS -->")
+            .expect("应包含 GIT_COMMITS 区块标记");
+        let timeline_pos = merged
+            .find("<details>\n<summary>")
+            .expect("应保留折叠活动时间线");
+        assert!(git_pos < timeline_pos);
+        assert!(merged.contains("abc1234"));
     }
 }

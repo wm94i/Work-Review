@@ -39,6 +39,89 @@ fn report_system_prompt(locale: AppLocale) -> &'static str {
     }
 }
 
+fn build_vision_request_body(
+    model: &str,
+    locale: AppLocale,
+    image_base64: &str,
+) -> serde_json::Value {
+    let reasoning_params = crate::generation_params::uses_openai_reasoning_chat_params(
+        crate::config::AiProvider::OpenAI,
+        model,
+    );
+    let limit_field =
+        crate::generation_params::openai_max_tokens_field(crate::config::AiProvider::OpenAI, model);
+    let mut body = json!({
+        "model": model,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": screenshot_prompt(locale)
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": format!("data:image/png;base64,{image_base64}"),
+                            "detail": "low"
+                        }
+                    }
+                ]
+            }
+        ],
+        "stream": false,
+    });
+    // GPT-5/GPT-6/o 系列将隐藏思考 token 计入 max_completion_tokens，100 会耗尽预算导致空正文
+    if reasoning_params {
+        body[limit_field] = json!(2048);
+        body["reasoning_effort"] = json!("low");
+    } else {
+        body[limit_field] = json!(100);
+    }
+    body
+}
+
+fn extract_openai_chat_content(result: &serde_json::Value, empty_error: &str) -> Result<String> {
+    result["choices"][0]["message"]["content"]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string)
+        .ok_or_else(|| AppError::Analysis(empty_error.to_string()))
+}
+
+fn build_report_request_body(model: &str, locale: AppLocale, prompt: &str) -> serde_json::Value {
+    let reasoning_params = crate::generation_params::uses_openai_reasoning_chat_params(
+        crate::config::AiProvider::OpenAI,
+        model,
+    );
+    let limit_field =
+        crate::generation_params::openai_max_tokens_field(crate::config::AiProvider::OpenAI, model);
+    let mut body = json!({
+        "model": model,
+        "messages": [
+            {
+                "role": "system",
+                "content": report_system_prompt(locale)
+            },
+            {
+                "role": "user",
+                "content": prompt
+            }
+        ],
+        "stream": false,
+    });
+    if reasoning_params {
+        body[limit_field] = json!(8192);
+        body["reasoning_effort"] = json!("medium");
+    } else {
+        body[limit_field] = json!(5000);
+        body["temperature"] = json!(0.8);
+    }
+    body
+}
+
 /// 云端视觉分析器
 pub struct CloudAnalyzer {
     api_key: String,
@@ -76,34 +159,12 @@ impl CloudAnalyzer {
     async fn analyze_screenshot(&self, screenshot_path: &Path) -> Result<String> {
         let image_data = tokio::fs::read(screenshot_path).await?;
         let image_base64 = BASE64_STANDARD.encode(&image_data);
-
+        let vision_body = build_vision_request_body(&self.model, self.locale, &image_base64);
         let response = self
             .client
             .post(build_chat_url(&self.endpoint))
             .header("Authorization", format!("Bearer {}", self.api_key))
-            .json(&json!({
-                "model": self.model,
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": screenshot_prompt(self.locale)
-                            },
-                            {
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": format!("data:image/png;base64,{}", image_base64),
-                                    "detail": "low"
-                                }
-                            }
-                        ]
-                    }
-                ],
-                "max_tokens": 100,
-                "stream": false,
-            }))
+            .json(&vision_body)
             .send()
             .await?;
 
@@ -115,10 +176,7 @@ impl CloudAnalyzer {
         }
 
         let result: serde_json::Value = response.json().await?;
-        Ok(result["choices"][0]["message"]["content"]
-            .as_str()
-            .unwrap_or("无法分析")
-            .to_string())
+        extract_openai_chat_content(&result, "OpenAI Vision API 返回空内容")
     }
 
     async fn generate_final_report(
@@ -155,26 +213,12 @@ impl CloudAnalyzer {
         };
         let prompt = append_custom_prompt_for_locale(base_prompt, &self.custom_prompt, self.locale);
 
+        let report_body = build_report_request_body(&self.model, self.locale, &prompt);
         let response = self
             .client
             .post(build_chat_url(&self.endpoint))
             .header("Authorization", format!("Bearer {}", self.api_key))
-            .json(&json!({
-                "model": self.model,
-                "messages": [
-                    {
-                        "role": "system",
-                        "content": report_system_prompt(self.locale)
-                    },
-                    {
-                        "role": "user",
-                        "content": prompt
-                    }
-                ],
-                "max_tokens": 5000,
-                "temperature": 0.8,
-                "stream": false,
-            }))
+            .json(&report_body)
             .send()
             .await?;
 
@@ -184,10 +228,7 @@ impl CloudAnalyzer {
         }
 
         let result: serde_json::Value = response.json().await?;
-        let report = result["choices"][0]["message"]["content"]
-            .as_str()
-            .unwrap_or("")
-            .to_string();
+        let report = extract_openai_chat_content(&result, "OpenAI API 返回空内容")?;
 
         Ok(match self.locale {
             AppLocale::ZhCn => format!("# 工作日报 - {date}\n\n{report}"),
@@ -230,11 +271,15 @@ impl Analyzer for CloudAnalyzer {
                 continue;
             }
 
-            let screenshot_path = screenshots_dir.join(&activity.screenshot_path);
-            if screenshot_path.exists() {
-                match self.analyze_screenshot(&screenshot_path).await {
-                    Ok(insight) => insights.push(format!("[{}] {}", activity.app_name, insight)),
-                    Err(e) => log::warn!("截图分析失败 {}: {e}", activity.screenshot_path),
+            if !activity.screenshot_path.is_empty() {
+                let screenshot_path = screenshots_dir.join(&activity.screenshot_path);
+                if screenshot_path.is_file() {
+                    match self.analyze_screenshot(&screenshot_path).await {
+                        Ok(insight) => {
+                            insights.push(format!("[{}] {}", activity.app_name, insight))
+                        }
+                        Err(e) => log::warn!("截图分析失败 {}: {e}", activity.screenshot_path),
+                    }
                 }
             }
         }
@@ -281,5 +326,53 @@ impl Analyzer for CloudAnalyzer {
             fallback_reason,
             ai_order: None,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn openai推理模型截图与日报载荷应留足预算并移除非默认采样参数() {
+        let vision = build_vision_request_body("gpt-6.2-sol", AppLocale::ZhCn, "AAAA");
+        assert!(vision.get("max_tokens").is_none());
+        assert!(vision["max_completion_tokens"].as_u64().unwrap() >= 2048);
+        assert_eq!(vision["reasoning_effort"], "low");
+
+        let report = build_report_request_body("gpt-6.2-sol", AppLocale::ZhCn, "summary");
+        assert!(report.get("max_tokens").is_none());
+        assert!(report.get("temperature").is_none());
+        assert!(report["max_completion_tokens"].as_u64().unwrap() >= 8192);
+        assert_eq!(report["reasoning_effort"], "medium");
+
+        let legacy_vision = build_vision_request_body("gpt-4o", AppLocale::ZhCn, "AAAA");
+        assert_eq!(legacy_vision["max_tokens"], 100);
+        assert!(legacy_vision.get("max_completion_tokens").is_none());
+
+        let legacy_report = build_report_request_body("gpt-4o", AppLocale::ZhCn, "summary");
+        assert_eq!(legacy_report["max_tokens"], 5000);
+        assert_eq!(legacy_report["temperature"], 0.8);
+    }
+
+    #[test]
+    fn openai响应正文提取应拒绝空字符串空白与缺失内容() {
+        let valid = json!({ "choices": [{ "message": { "content": "  今日完成联调  " } }] });
+        assert_eq!(
+            extract_openai_chat_content(&valid, "empty").unwrap(),
+            "今日完成联调"
+        );
+
+        for invalid in [
+            json!({ "choices": [{ "message": { "content": "" } }] }),
+            json!({ "choices": [{ "message": { "content": "   \n\t  " } }] }),
+            json!({ "choices": [{ "message": { "content": null } }] }),
+            json!({ "choices": [] }),
+        ] {
+            assert!(
+                extract_openai_chat_content(&invalid, "empty").is_err(),
+                "无效响应不应静默返回空正文: {invalid}"
+            );
+        }
     }
 }

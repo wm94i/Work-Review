@@ -3,7 +3,7 @@
 use crate::AppState;
 use std::sync::{Arc, Mutex};
 use tauri::AppHandle;
-use work_review_core::config::{AppConfig, AvatarFollowupItem, PrivacyConfig};
+use work_review_core::config::{AppConfig, AvatarFollowupItem};
 use work_review_core::database::Activity;
 use work_review_core::error::AppError;
 use work_review_core::work_intelligence::TodoExtractionResult;
@@ -40,9 +40,12 @@ pub fn parse_temporal_range(question: &str) -> (Option<String>, Option<String>) 
     }
 
     // 最近N天/近N天/过去N天 — 用 regex 提取所有数字
+    // 天数上限 10 年：过大的 N 会让 chrono 的日期减法溢出 panic。
+    const MAX_RELATIVE_DAYS: i64 = 3650;
     if let Ok(re) = regex::Regex::new(r"(?:最近|近|过去)\s*(\d+)\s*天") {
         for caps in re.captures_iter(&normalized) {
             if let Ok(n) = caps[1].parse::<i64>() {
+                let n = n.clamp(0, MAX_RELATIVE_DAYS);
                 ranges.push((today - chrono::Duration::days(n), today));
             }
         }
@@ -126,6 +129,19 @@ pub fn resolve_single_date(input: Option<&str>) -> String {
     }
 }
 
+/// 是否为合法的 `YYYY-MM-DD` 日期（严格 10 位 ASCII `DDDD-DD-DD`，拒绝 `"+2026-1-01"` 等 chrono 宽松形式）。
+pub(crate) fn is_iso_date(value: &str) -> bool {
+    let value = value.trim();
+    let bytes = value.as_bytes();
+    bytes.len() == 10
+        && bytes[4] == b'-'
+        && bytes[7] == b'-'
+        && bytes[..4].iter().all(u8::is_ascii_digit)
+        && bytes[5..7].iter().all(u8::is_ascii_digit)
+        && bytes[8..10].iter().all(u8::is_ascii_digit)
+        && chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d").is_ok()
+}
+
 /// 校验调用方传入的截图相对路径，防止绝对路径或 `..` 越界访问 data_dir 之外的文件
 pub(crate) fn validate_relative_path(path: &str) -> Result<(), AppError> {
     use std::path::{Component, Path};
@@ -165,24 +181,17 @@ pub(crate) fn filter_activities_by_privacy(
     activities
         .into_iter()
         .filter(|activity| {
-            let app_lower = activity.app_name.to_lowercase();
-            // 单向小写子串匹配，与 privacy::matches_ignored_app 保持一致：
-            // 不做反向包含，避免忽略长名称时误伤短名称应用。
+            // 与统计侧同一套语义：应用名先经 normalize_display_app_name 归一化再做单向子串匹配
+            // （例如 "Tencent Lemon" 规则也能命中 "LEMON.exe"），域名含合并域名兼容匹配。
             if !no_app_filter
-                && ignored_apps
-                    .iter()
-                    .any(|ignored| !ignored.is_empty() && app_lower.contains(ignored))
+                && work_review_core::privacy::matches_ignored_app(&activity.app_name, ignored_apps)
             {
                 return false;
             }
 
             if !no_domain_filter {
                 if let Some(url) = &activity.browser_url {
-                    let domain = PrivacyConfig::extract_domain(url);
-                    if excluded_domains
-                        .iter()
-                        .any(|excluded| PrivacyConfig::domain_matches(&domain, excluded))
-                    {
+                    if work_review_core::privacy::matches_excluded_domain(url, excluded_domains) {
                         return false;
                     }
                 }
@@ -191,6 +200,23 @@ pub(crate) fn filter_activities_by_privacy(
             true
         })
         .collect()
+}
+
+/// 对外输出（本地 API / Agent 工具 / AI 日报上下文）前按当前脱敏规则处理活动。
+/// 调用方须先用 [`filter_activities_by_privacy`] 剔除忽略应用与排除域名。
+pub(crate) fn sanitize_activities_for_external(
+    mut activities: Vec<Activity>,
+    privacy_filter: &work_review_core::privacy::PrivacyFilter,
+    include_ocr: bool,
+) -> Vec<Activity> {
+    for activity in &mut activities {
+        work_review_core::privacy::sanitize_activity_for_external(
+            privacy_filter,
+            activity,
+            include_ocr,
+        );
+    }
+    activities
 }
 
 pub(crate) fn load_filtered_activities_in_range(
@@ -276,15 +302,57 @@ pub(crate) fn merge_manual_followups_into_todos(
     extracted
 }
 
+/// 配置写入来源。`Sync` 表示来自 WebDAV 同步，不重打时间戳、不回推。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConfigWriteSource {
+    Local,
+    Sync,
+}
+
 pub(crate) fn persist_app_config(
-    mut config: AppConfig,
+    config: AppConfig,
     app: AppHandle,
     state: &Arc<Mutex<AppState>>,
 ) -> Result<(), AppError> {
-    config.normalize();
-    let new_embedding_config_fingerprint =
-        super::semantic_memory::embedding_config_fingerprint(&config);
-    let new_privacy_fingerprint = super::semantic_memory::privacy_fingerprint(&config.privacy);
+    persist_app_config_with_source(config, app, state, ConfigWriteSource::Local)
+}
+
+pub(crate) fn persist_app_config_with_source(
+    config: AppConfig,
+    app: AppHandle,
+    state: &Arc<Mutex<AppState>>,
+    source: ConfigWriteSource,
+) -> Result<(), AppError> {
+    // 调用方传入的是此前克隆的整份配置；后端维护的 Bot 发送者绑定与 Telegram 绑定码一律以锁内当前值为准，
+    // 避免期间在聊天中完成的绑定被旧快照覆盖（绑定码"复活"）。
+    update_app_config_with_source(app, state, source, move |current| {
+        let mut config = config;
+        config.bot_sender_bindings = current.bot_sender_bindings.clone();
+        config.telegram_bot_bind_code = current.telegram_bot_bind_code.clone();
+        config.telegram_bot_bind_code_expires_at = current.telegram_bot_bind_code_expires_at;
+        Ok(config)
+    })
+    .map(|_| ())
+}
+
+/// 在**同一把状态锁内**基于当前配置构造并保存新配置，返回保存后的配置。
+///
+/// 用于局部更新（`patch_config`、单条隐私规则、Bot 绑定码等）：避免"加锁读取 → 解锁 →
+/// 再加锁写入"之间其它写入被覆盖（丢失更新）。
+pub(crate) fn update_app_config(
+    app: AppHandle,
+    state: &Arc<Mutex<AppState>>,
+    build: impl FnOnce(&AppConfig) -> Result<AppConfig, AppError>,
+) -> Result<AppConfig, AppError> {
+    update_app_config_with_source(app, state, ConfigWriteSource::Local, build)
+}
+
+pub(crate) fn update_app_config_with_source(
+    app: AppHandle,
+    state: &Arc<Mutex<AppState>>,
+    source: ConfigWriteSource,
+    build: impl FnOnce(&AppConfig) -> Result<AppConfig, AppError>,
+) -> Result<AppConfig, AppError> {
     let (
         previous_avatar_enabled,
         previous_avatar_scale,
@@ -296,31 +364,59 @@ pub(crate) fn persist_app_config(
         previous_avatar_y,
         previous_hide_dock_icon,
         previous_lightweight_mode,
+        should_push_sync,
+        should_pull_sync_first,
         avatar_state,
+        config,
     ) = {
         let mut state = state.lock().map_err(|e| AppError::Unknown(e.to_string()))?;
         let previous_config = state.config.clone();
+        let mut config = build(&previous_config)?;
+        config.normalize();
+        let new_embedding_config_fingerprint =
+            super::semantic_memory::embedding_config_fingerprint(&config);
+        let new_privacy_fingerprint = super::semantic_memory::privacy_fingerprint(&config.privacy);
         let previous_embedding_config_fingerprint =
             super::semantic_memory::embedding_config_fingerprint(&previous_config);
         let previous_privacy_fingerprint =
             super::semantic_memory::privacy_fingerprint(&previous_config.privacy);
 
-        // Embedding 或隐私规则变化时必须先失效旧向量，再保存并启用新配置。
-        // API Key 不参与指纹，因此单纯轮换密钥不会触发无必要的全量重建。
+        // Embedding 或隐私规则变化时必须先失效旧向量；隐私规则变化同时清空摘要与周期复盘缓存。
         if previous_embedding_config_fingerprint != new_embedding_config_fingerprint
             || previous_privacy_fingerprint != new_privacy_fingerprint
         {
             super::semantic_memory::invalidate_semantic_memory_index(&state.database)?;
         }
+        if previous_privacy_fingerprint != new_privacy_fingerprint {
+            state.database.clear_privacy_caches()?;
+        }
+
+        // 仅当同步白名单字段（含隐私规则）实际变化时才刷新时间戳并回推 WebDAV；
+        // 第二台设备首次开启 `sync_app_config` 时先拉取远端合并，不拿本机默认配置覆盖远端。
+        let prev_sync_enabled =
+            crate::remote_upload::should_sync_app_config(&previous_config.remote_storage);
+        let next_sync_enabled =
+            crate::remote_upload::should_sync_app_config(&config.remote_storage);
+        let synced_fields_changed =
+            previous_config.synced_preferences_value() != config.synced_preferences_value();
+        let should_pull_sync_first =
+            source == ConfigWriteSource::Local && !prev_sync_enabled && next_sync_enabled;
+        let should_push_sync = source == ConfigWriteSource::Local
+            && next_sync_enabled
+            && !should_pull_sync_first
+            && synced_fields_changed;
 
         // 先持久化文件；失败时内存配置和运行时隐私过滤器保持旧值。
         let config_path = state.config_path.clone();
-        crate::config_sync::stamp_local_sync(&mut config);
+        if should_push_sync {
+            crate::config_sync::stamp_local_sync(&mut config);
+        }
         config.save(&config_path)?;
 
         state.config = config.clone();
         state.storage_manager.update_config(config.storage.clone());
         state.screenshot_service.update_config(&config.storage);
+        state.screenshot_service.update_privacy(&config.privacy);
         state.privacy_filter.update_config(&config.privacy);
         state.avatar_state = crate::avatar_engine::apply_avatar_visual_settings(
             state.avatar_state.clone(),
@@ -340,7 +436,10 @@ pub(crate) fn persist_app_config(
             previous_config.avatar_y,
             previous_config.hide_dock_icon,
             previous_config.lightweight_mode,
+            should_push_sync,
+            should_pull_sync_first,
             state.avatar_state.clone(),
+            config,
         )
     };
 
@@ -404,11 +503,15 @@ pub(crate) fn persist_app_config(
     crate::localhost_api::sync_localhost_api_runtime(&app, state)?;
     crate::telegram_bot::sync_telegram_bot_runtime(state)?;
     crate::wecom_aibot::sync_wecom_bot_runtime(state)?;
-    crate::config_sync::spawn_push(config.clone());
+    if should_pull_sync_first {
+        crate::config_sync::spawn_pull_on_startup(app.clone(), state.clone());
+    } else if should_push_sync {
+        crate::config_sync::spawn_push(config.clone());
+    }
     crate::emit_config_changed(&app, &config);
 
     log::info!("配置已保存");
-    Ok(())
+    Ok(config)
 }
 
 fn refresh_avatar_state_for_current_window(app: &AppHandle, state: &Arc<Mutex<AppState>>) -> bool {
@@ -458,6 +561,66 @@ mod tests {
     use super::*;
     use work_review_core::database::{BrowserUsage, DailyStats, DomainUsage, UrlDetail, UrlUsage};
     use work_review_core::privacy::apply_excluded_domains_to_stats;
+
+    #[test]
+    fn iso日期校验应拒绝路径与非法日期() {
+        assert!(is_iso_date("2026-11-22"));
+        assert!(is_iso_date(" 2026-02-28 "));
+        assert!(!is_iso_date("2026-02-30"));
+        assert!(!is_iso_date("2026-13-01"));
+        assert!(!is_iso_date("../v1/storage/stats"));
+        assert!(!is_iso_date("C:x"));
+        assert!(!is_iso_date("today"));
+        assert!(!is_iso_date("2026-1-1"));
+    }
+
+    #[test]
+    fn 超大天数的自然语言范围不应panic() {
+        let (from, to) = parse_temporal_range("最近100000000000天做了什么");
+        assert!(from.is_some());
+        assert!(to.is_some());
+    }
+
+    #[test]
+    fn 忽略应用匹配应与统计侧一样先归一化() {
+        let activity = |app: &str| Activity {
+            id: Some(1),
+            timestamp: 0,
+            app_name: app.to_string(),
+            window_title: "title".to_string(),
+            screenshot_path: String::new(),
+            ocr_text: None,
+            category: "other".to_string(),
+            duration: 10,
+            browser_url: Some("https://mail.bank.example/inbox".to_string()),
+            executable_path: None,
+            semantic_category: None,
+            semantic_confidence: None,
+            screenshot_url: None,
+        };
+        let kept = filter_activities_by_privacy(
+            vec![activity("Code"), activity("Chrome")],
+            &[],
+            &["bank.example".to_string()],
+        );
+        assert!(kept.is_empty(), "排除域名的子域名应被过滤");
+        let kept = filter_activities_by_privacy(
+            vec![activity("WeChat"), activity("Code")],
+            &["wechat".to_string()],
+            &[],
+        );
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].app_name, "Code");
+        // 回归点：旧实现直接用原始进程名做子串匹配，"msedge.exe" 不包含 "microsoft edge"，
+        // 会漏过；归一化后两者都是 "Microsoft Edge"，必须被过滤。
+        let kept = filter_activities_by_privacy(
+            vec![activity("msedge.exe"), activity("Code")],
+            &["microsoft edge".to_string()],
+            &[],
+        );
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].app_name, "Code");
+    }
 
     #[test]
     fn 概览统计应过滤排除域名并重算浏览器时长() {
@@ -551,6 +714,7 @@ mod tests {
             work_time_duration: 0,
             overtime_duration: 0,
             hourly_activity_distribution: vec![],
+            project_usage: vec![],
         };
 
         let filtered = apply_excluded_domains_to_stats(stats, &["linux.do".to_string()]);

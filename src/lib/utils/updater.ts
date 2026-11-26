@@ -3,6 +3,7 @@ import { listen as tauriListen } from '@tauri-apps/api/event';
 import { relaunch as relaunchApp } from '@tauri-apps/plugin-process';
 import { open as openExternal } from '@tauri-apps/plugin-shell';
 import { confirm as openConfirm, type ConfirmOptions } from '$lib/stores/confirm.ts';
+import { resolveExternalHref } from '$lib/actions/externalLinks.ts';
 import { showToast as displayToast, type ToastType } from '$lib/stores/toast.ts';
 import { t } from '$lib/i18n/index.ts';
 
@@ -221,7 +222,10 @@ export function createUpdateFlow(dependencies: UpdateFlowDependencies): RunUpdat
           });
 
           if (shouldOpenRelease) {
-            await open(releaseInfo.releaseUrl);
+            const safeReleaseUrl = resolveExternalHref(releaseInfo.releaseUrl);
+            if (safeReleaseUrl && safeReleaseUrl.startsWith('https://')) {
+              await open(releaseInfo.releaseUrl);
+            }
           }
         }
 
