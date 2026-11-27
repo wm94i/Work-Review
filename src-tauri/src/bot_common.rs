@@ -1135,6 +1135,7 @@ pub(crate) fn build_bot_readonly_runtime(
         semantic_search: None,
         cancel: None,
         privacy_filter: Some(privacy_filter),
+        ..Default::default()
     }
 }
 
@@ -1200,7 +1201,10 @@ pub async fn run_bot_natural_language_query(
     let privacy_filter = std::sync::Arc::new(
         work_review_core::privacy::PrivacyFilter::from_config(&privacy_config),
     );
-    let runtime = build_bot_readonly_runtime(avatar_followups, projects, privacy_filter.clone());
+    let mut runtime =
+        build_bot_readonly_runtime(avatar_followups, projects, privacy_filter.clone());
+    runtime.run_source = Some(format!("bot:{platform}"));
+    runtime.artifacts = Some(work_review_agent_harness::context::ArtifactStore::new());
 
     let bounded_question = truncate(trimmed, BOT_NL_MAX_QUESTION_CHARS);
     let deadline =

@@ -106,3 +106,9 @@ test('旧组件超时仍只取消自身请求，不误取消 store 中的后续�
   });
   assert.deepEqual(cancelled, ['old-request']);
 });
+
+test('chat_work_assistant 调用应透传 conversationId 以关联服务端 Agent Run 账本', () => {
+  const invokeBlock = source.match(/invoke<AssistantAnswer>\('chat_work_assistant',\s*\{[\s\S]*?\}\)/)?.[0] ?? '';
+  assert.ok(invokeBlock, '应找到 chat_work_assistant 调用');
+  assert.match(invokeBlock, /\bconversationId:\s*convId\b/, '应透传当前会话 ID 给后端 Harness 账本');
+});

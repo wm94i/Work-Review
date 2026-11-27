@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/core",
+    "crates/agent-harness",
     "crates/mcp-server",
     "crates/skills-engine",
     "src-tauri",

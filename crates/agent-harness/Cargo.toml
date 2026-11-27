@@ -1,0 +1,11 @@
+[package]
+name = "work-review-agent-harness"
+version = "0.1.0"
+edition = "2021"
+description = "Personal Agent Harness runtime primitives (policy, taint, context compaction, artifacts, ledger, progressive skills)"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1.6", features = ["v4", "serde"] }

@@ -310,6 +310,20 @@ pub struct AssistantRuntime {
     pub cancel: Option<tokio::sync::watch::Receiver<bool>>,
     /// 当前隐私规则（脱敏应用/敏感关键词）；Some 时工具结果在发给模型前按规则脱敏。
     pub privacy_filter: Option<Arc<work_review_core::privacy::PrivacyFilter>>,
+    /// 客户端请求标识（仅作元数据记录，绝不作为 `agent_runs.id` 主键，主键一律由服务端生成）。
+    pub client_request_id: Option<String>,
+    pub conversation_id: Option<i64>,
+    pub run_source: Option<String>,
+    /// 本轮 system prompt 是否已注入用户确认的长期记忆（由 commands 层显式标记，避免字符串探测）。
+    pub has_recalled_user_memory: bool,
+    /// 本轮超长工具输出的内存 Artifact 仓库（executor 在运行时自动补齐）。
+    pub artifacts: Option<work_review_agent_harness::context::ArtifactStore>,
+    /// 本机渐进式 `SKILL.md` 技能目录（仅 WorkReview 模式注入目录与 `load_skill` 工具）。
+    pub skill_catalog: Option<Arc<work_review_agent_harness::skills::SkillCatalog>>,
+    /// 外部 HTTP MCP Client 运行时桥接（仅桌面 WorkReview 模式启用，每次调用强审批）。
+    pub mcp_bridge: Option<Arc<super::mcp_bridge::McpToolBridge>>,
+    /// 上下文窗口与压缩预算（None 时使用默认值）。
+    pub context_budget: Option<work_review_agent_harness::context::ContextBudget>,
 }
 
 /// 当前请求允许注册的长期记忆工具。
@@ -347,35 +361,72 @@ fn current_user_memory_tool_capabilities() -> UserMemoryToolCapabilities {
         .unwrap_or_default()
 }
 
-/// 需要用户确认的工具名单（全部写操作）。
-const CONFIRM_REQUIRED_TOOLS: &[&str] = &[
-    "create_todo",
-    "complete_todo",
-    "update_todo",
-    "set_app_category",
-    "pause_recording",
-    "resume_recording",
-    "open_timeline",
-    "generate_daily_report",
-    "remember_user_memory",
-    "update_user_memory",
-    "forget_user_memory",
-];
+/// 单一安全规格源：把每个工具映射到 Personal Agent Harness 的风险等级与数据流属性。
+///
+/// 未知工具默认按高危写操作（fail-closed）处理，确保新增或未知工具不会绕过审批门禁。
+pub fn capability_spec(tool: &str) -> work_review_agent_harness::policy::ToolCapabilitySpec {
+    use work_review_agent_harness::policy::ToolCapabilitySpec;
 
-/// 该工具执行前是否需要用户确认。
+    if work_review_agent_harness::mcp_client::parse_qualified_mcp_tool_name(tool).is_some() {
+        return ToolCapabilitySpec::external_mcp("mcp_external_tool");
+    }
+
+    match tool {
+        "fetch_url" => ToolCapabilitySpec::external_fetch("fetch_url"),
+        "web_search" => ToolCapabilitySpec::external_search("web_search"),
+        "read_run_artifact" => ToolCapabilitySpec::harness_readonly("read_run_artifact"),
+        "load_skill" => ToolCapabilitySpec::harness_readonly("load_skill"),
+        "search_user_memories" => ToolCapabilitySpec::user_memory_readonly("search_user_memories"),
+        "create_todo" => ToolCapabilitySpec::local_write("create_todo", false),
+        "complete_todo" => ToolCapabilitySpec::local_write("complete_todo", false),
+        "update_todo" => ToolCapabilitySpec::local_write("update_todo", false),
+        "set_app_category" => ToolCapabilitySpec::local_write("set_app_category", false),
+        "pause_recording" => ToolCapabilitySpec::local_write("pause_recording", true),
+        "resume_recording" => ToolCapabilitySpec::local_write("resume_recording", false),
+        "open_timeline" => ToolCapabilitySpec::local_write("open_timeline", false),
+        "generate_daily_report" => ToolCapabilitySpec::local_write("generate_daily_report", false),
+        "remember_user_memory" => ToolCapabilitySpec::local_write("remember_user_memory", false),
+        "update_user_memory" => ToolCapabilitySpec::local_write("update_user_memory", false),
+        "forget_user_memory" => ToolCapabilitySpec::local_write("forget_user_memory", true),
+        "search_memory" => ToolCapabilitySpec::local_readonly("search_memory"),
+        "analyze_intents" => ToolCapabilitySpec::local_readonly("analyze_intents"),
+        "aggregate_stats" => ToolCapabilitySpec::local_readonly("aggregate_stats"),
+        "category_search" => ToolCapabilitySpec::local_readonly("category_search"),
+        "trend_comparison" => ToolCapabilitySpec::local_readonly("trend_comparison"),
+        "query_activities" => ToolCapabilitySpec::local_readonly("query_activities"),
+        "get_work_sessions" => ToolCapabilitySpec::local_readonly("get_work_sessions"),
+        "get_insights" => ToolCapabilitySpec::local_readonly("get_insights"),
+        "weekly_review" => ToolCapabilitySpec::local_readonly("weekly_review"),
+        "extract_todos" => ToolCapabilitySpec::local_readonly("extract_todos"),
+        "get_daily_report" => ToolCapabilitySpec::local_readonly("get_daily_report"),
+        "get_current_context" => ToolCapabilitySpec::local_readonly("get_current_context"),
+        "list_todos" => ToolCapabilitySpec::local_readonly("list_todos"),
+        "get_hourly_summaries" => ToolCapabilitySpec::local_readonly("get_hourly_summaries"),
+        "list_reports" => ToolCapabilitySpec::local_readonly("list_reports"),
+        "get_reports_in_range" => ToolCapabilitySpec::local_readonly("get_reports_in_range"),
+        "project_stats" => ToolCapabilitySpec::local_readonly("project_stats"),
+        "semantic_search" => ToolCapabilitySpec::local_readonly("semantic_search"),
+        _ => ToolCapabilitySpec::local_write("unknown_tool", true),
+    }
+}
+
+/// 该工具执行前是否需要用户确认（供旧安全回归单测验证，生产执行统一经 HarnessPolicyEngine）。
+#[cfg(test)]
 pub fn requires_confirmation(tool: &str) -> bool {
-    CONFIRM_REQUIRED_TOOLS.contains(&tool)
+    let spec = capability_spec(tool);
+    spec.requires_explicit_approval
 }
 
 /// 联网工具（结果来自第三方，且请求本身会把参数发往外部）。
 pub fn is_web_tool(tool: &str) -> bool {
-    matches!(tool, "fetch_url" | "web_search")
+    let spec = capability_spec(tool);
+    spec.reads_external_untrusted || spec.sends_external_data
 }
 
-/// 本轮已经读取过本机数据后，`fetch_url` 需要用户确认：URL 是数据外带的直接通道
-/// （例如被注入的网页标题诱导模型访问 `https://evil/?d=<摘要>`）。
+/// 本轮已经读取过本机数据后，`fetch_url` 需要用户确认（供旧安全回归单测验证，生产执行统一经 HarnessPolicyEngine）。
+#[cfg(test)]
 pub fn requires_confirmation_after_local_data(tool: &str, local_data_seen: bool) -> bool {
-    local_data_seen && tool == "fetch_url"
+    local_data_seen && capability_spec(tool).sends_external_data
 }
 
 /// 生成确认卡片中的长期记忆键预览。
@@ -564,7 +615,37 @@ pub fn action_confirm_summary(tool: &str, args: &Value) -> String {
                 .and_then(|value| value.as_i64())
                 .unwrap_or_default()
         ),
-        _ => format!("执行操作 {tool}"),
+        other => {
+            if let Some((server_id, remote_name)) =
+                work_review_agent_harness::mcp_client::parse_qualified_mcp_tool_name(other)
+            {
+                let keys: Vec<String> = args
+                    .as_object()
+                    .map(|obj| {
+                        obj.keys()
+                            .take(6)
+                            .map(|k| {
+                                k.chars()
+                                    .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+                                    .take(32)
+                                    .collect::<String>()
+                            })
+                            .filter(|k| !k.is_empty())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if keys.is_empty() {
+                    format!("调用外部 MCP 工具 {server_id} / {remote_name}（无参数）")
+                } else {
+                    format!(
+                        "调用外部 MCP 工具 {server_id} / {remote_name}（参数字段：{}）",
+                        keys.join(", ")
+                    )
+                }
+            } else {
+                format!("执行操作 {tool}")
+            }
+        }
     }
 }
 
@@ -1483,7 +1564,7 @@ fn fetch_url_parameters() -> Value {
 /// 主机名经 `Url` 解析后再判断，十进制 / 十六进制 / 短写 IPv4（`2130706433`、`0x7f000001`、
 /// `127.1`）与 IPv4 映射 IPv6 都会被规范化为真实地址；域名解析到内网的情况由
 /// [`PublicOnlyResolver`]（直连）与 [`ensure_target_resolves_public`]（请求前预解析）拦截。
-fn ensure_public_http_url(url: &str) -> Result<(), String> {
+pub(crate) fn ensure_public_http_url(url: &str) -> Result<(), String> {
     let parsed = reqwest::Url::parse(url.trim()).map_err(|_| "无效的链接".to_string())?;
     if !matches!(parsed.scheme(), "http" | "https") {
         return Err("仅支持 http/https 链接".to_string());
@@ -3028,6 +3109,48 @@ async fn semantic_search_tool(ctx: &ToolContext<'_>, args: Value) -> Result<Stri
     ))
 }
 
+/// read_run_artifact — 分页读取本轮被 ContextManager 截断存入内存 ArtifactStore 的完整工具输出。
+fn read_run_artifact_execute(ctx: &ToolContext<'_>, args: Value) -> Result<String, String> {
+    let artifact_id = required_str_arg(&args, "artifact_id")?;
+    let offset = args.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+    let limit = args
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(3_000)
+        .clamp(200, 8_000) as usize;
+    let store = ctx
+        .runtime
+        .artifacts
+        .as_ref()
+        .ok_or_else(|| "当前运行未启用 Artifact 产物存储".to_string())?;
+    let slice = store.read_slice(&artifact_id, offset, limit)?;
+    let next_hint = match slice.next_offset {
+        Some(next) => format!("后续仍有内容，可传 offset={next} 继续读取"),
+        None => "已读取到末尾".to_string(),
+    };
+    Ok(format!(
+        "[产物 {} | 来源工具: {} | 字符区间 {}..{} / 总 {} 字 | {}]\n{}",
+        slice.artifact_id,
+        slice.tool_name,
+        slice.offset,
+        slice.offset + slice.returned_chars,
+        slice.total_chars,
+        next_hint,
+        slice.content
+    ))
+}
+
+/// load_skill — 按需加载本机 `<data_dir>/skills/<name>/SKILL.md` 个人技能说明。
+fn load_skill_execute(ctx: &ToolContext<'_>, args: Value) -> Result<String, String> {
+    let name = required_str_arg(&args, "name")?;
+    let catalog = ctx
+        .runtime
+        .skill_catalog
+        .as_ref()
+        .ok_or_else(|| "当前未加载任何个人技能".to_string())?;
+    catalog.load_skill_body(&name)
+}
+
 // ══════════════════════════════════════════════════════════
 // 第五部分：ToolRegistry — 工具注册中心
 // ══════════════════════════════════════════════════════════
@@ -3037,18 +3160,91 @@ async fn semantic_search_tool(ctx: &ToolContext<'_>, args: Value) -> Result<Stri
 /// 负责注册工具、向模型提供定义并执行模型选择的工具。
 pub struct ToolRegistry {
     tools: HashMap<&'static str, ToolDefinition>,
+    dynamic_mcp_tools: HashMap<String, work_review_agent_harness::mcp_client::DiscoveredMcpTool>,
 }
 
 impl ToolRegistry {
-    /// 是否注册了读取本机数据的工具（联网工具以外的任何工具）。
+    /// 是否注册了读取本机工作数据或用户长期记忆的工具。
     pub fn has_local_data_tools(&self) -> bool {
-        self.tools.keys().any(|name| !is_web_tool(name))
+        self.tools.keys().any(|name| {
+            let spec = capability_spec(name);
+            spec.reads_local_data || spec.reads_user_memory
+        })
+    }
+
+    /// 注册外部 HTTP MCP Server 发现的动态工具（严格限定在桌面 WorkReview 模式）。
+    pub fn register_mcp_tools(
+        &mut self,
+        mode: AssistantRequestMode,
+        tools: &[work_review_agent_harness::mcp_client::DiscoveredMcpTool],
+    ) {
+        if mode != AssistantRequestMode::WorkReview {
+            return;
+        }
+        for tool in tools {
+            if work_review_agent_harness::mcp_client::parse_qualified_mcp_tool_name(
+                &tool.qualified_name,
+            )
+            .is_none()
+            {
+                continue;
+            }
+            if self.tools.contains_key(tool.qualified_name.as_str()) {
+                continue;
+            }
+            self.dynamic_mcp_tools
+                .insert(tool.qualified_name.clone(), tool.clone());
+        }
+    }
+
+    /// 按需注册 Harness 级只读工具（Artifact 分页与渐进式个人技能加载）。
+    ///
+    /// - `read_run_artifact`：仅当存在 ArtifactStore 且本轮可能产生长工具输出（WorkReview 或已开联网）时注册；
+    /// - `load_skill`：严格限定在 `WorkReview` 模式且本机实际存在已安装技能时注册，绝不暴露给 `GeneralChat`。
+    pub fn register_harness_tools(
+        &mut self,
+        mode: AssistantRequestMode,
+        has_web_tools: bool,
+        has_artifacts: bool,
+        has_skills: bool,
+    ) {
+        if has_artifacts && (mode == AssistantRequestMode::WorkReview || has_web_tools) {
+            self.register(ToolDefinition {
+                name: "read_run_artifact",
+                description: "分页读取当前轮次中被截断存入运行期产物的长工具输出。仅当工具结果提示 artifact_id 且需要查看更多细节时调用。",
+                parameters_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "artifact_id": { "type": "string", "description": "产物 ID，如 art_1" },
+                        "offset": { "type": "integer", "description": "起始字符偏移量（默认 0）" },
+                        "limit": { "type": "integer", "description": "本次最多读取字符数（200-8000，默认 3000）" }
+                    },
+                    "required": ["artifact_id"]
+                }),
+                executor: ToolExecutor::Sync(read_run_artifact_execute),
+            });
+        }
+        if mode == AssistantRequestMode::WorkReview && has_skills {
+            self.register(ToolDefinition {
+                name: "load_skill",
+                description: "按名称读取用户本机安装的个人技能（SKILL.md）完整流程说明。仅在系统提示词列出的已安装技能匹配当前任务时调用。",
+                parameters_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "name": { "type": "string", "description": "已安装技能的名称" }
+                    },
+                    "required": ["name"]
+                }),
+                executor: ToolExecutor::Sync(load_skill_execute),
+            });
+        }
     }
 
     /// 创建空 Registry。普通聊天从零权限开始，仅按显式配置追加通用联网工具。
     fn empty() -> Self {
         Self {
             tools: HashMap::new(),
+            dynamic_mcp_tools: HashMap::new(),
         }
     }
 
@@ -3488,7 +3684,8 @@ impl ToolRegistry {
     /// 这个方法返回的 JSON 数组，可以直接塞进
     /// OpenAI API 的 tools 参数里。格式完全一致。
     pub fn to_openai_tools(&self) -> Vec<Value> {
-        self.tools
+        let mut defs: Vec<Value> = self
+            .tools
             .values()
             .map(|t| {
                 json!({
@@ -3500,24 +3697,53 @@ impl ToolRegistry {
                     }
                 })
             })
-            .collect()
+            .collect();
+
+        let mut mcp_entries: Vec<&work_review_agent_harness::mcp_client::DiscoveredMcpTool> =
+            self.dynamic_mcp_tools.values().collect();
+        mcp_entries.sort_by(|a, b| a.qualified_name.cmp(&b.qualified_name));
+        for tool in mcp_entries {
+            defs.push(json!({
+                "type": "function",
+                "function": {
+                    "name": tool.qualified_name,
+                    "description": format!("[外部 MCP: {}] {}", tool.server_name, tool.description),
+                    "parameters": tool.input_schema,
+                }
+            }));
+        }
+        defs
     }
 
-    /// 执行 LLM 选择的工具（同步工具直接调，异步工具 await）。
+    /// 执行 LLM 选择的工具（同步工具直接调，异步工具 await，外部 MCP 工具经桥接执行并包裹外部边界）。
     pub async fn execute(
         &self,
         tool_name: &str,
         arguments: Value,
         ctx: &ToolContext<'_>,
     ) -> Result<String, String> {
-        let tool = self
-            .tools
-            .get(tool_name)
-            .ok_or_else(|| format!("未知的工具: {tool_name}"))?;
-        match tool.executor {
-            ToolExecutor::Sync(f) => f(ctx, arguments),
-            ToolExecutor::Async(f) => f(ctx, arguments).await,
+        if let Some(tool) = self.tools.get(tool_name) {
+            return match tool.executor {
+                ToolExecutor::Sync(f) => f(ctx, arguments),
+                ToolExecutor::Async(f) => f(ctx, arguments).await,
+            };
         }
+        if let Some(mcp_tool) = self.dynamic_mcp_tools.get(tool_name) {
+            let Some(bridge) = ctx.runtime.mcp_bridge.as_ref() else {
+                return Err("当前通道未启用外部 MCP 桥接".to_string());
+            };
+            let raw = bridge
+                .call_qualified_tool(&mcp_tool.qualified_name, arguments)
+                .await?;
+            return Ok(wrap_untrusted_content(
+                &format!(
+                    "外部 MCP 工具 {}/{}",
+                    mcp_tool.server_id, mcp_tool.remote_name
+                ),
+                &raw,
+            ));
+        }
+        Err(format!("未知的工具: {tool_name}"))
     }
 }
 
@@ -4297,6 +4523,41 @@ mod tests {
         assert!(is_web_tool("web_search"));
         assert!(!is_web_tool("query_activities"));
         assert!(ToolRegistry::new().has_local_data_tools());
+
+        // 外部 MCP 工具必须始终归类为外部风险并要求显式确认，且普通聊天绝不注册
+        let mcp_name = "mcp__obsidian__search_notes";
+        let mcp_spec = capability_spec(mcp_name);
+        assert!(mcp_spec.requires_explicit_approval);
+        assert!(mcp_spec.sends_external_data);
+        assert!(mcp_spec.reads_external_untrusted);
+        assert!(is_web_tool(mcp_name));
+
+        let fake_tool = work_review_agent_harness::mcp_client::DiscoveredMcpTool {
+            server_id: "obsidian".to_string(),
+            server_name: "Obsidian".to_string(),
+            remote_name: "search_notes".to_string(),
+            qualified_name: mcp_name.to_string(),
+            description: "Search notes".to_string(),
+            input_schema: json!({"type": "object"}),
+        };
+        let mut general_reg = ToolRegistry::empty();
+        general_reg.register_mcp_tools(
+            AssistantRequestMode::GeneralChat,
+            std::slice::from_ref(&fake_tool),
+        );
+        assert!(general_reg.to_openai_tools().is_empty());
+
+        let mut work_reg = ToolRegistry::empty();
+        work_reg.register_mcp_tools(
+            AssistantRequestMode::WorkReview,
+            std::slice::from_ref(&fake_tool),
+        );
+        assert_eq!(work_reg.to_openai_tools().len(), 1);
+        let confirm =
+            action_confirm_summary(mcp_name, &json!({"query": "secret_value_not_echoed"}));
+        assert!(confirm.contains("obsidian"));
+        assert!(confirm.contains("search_notes"));
+        assert!(!confirm.contains("secret_value_not_echoed"));
     }
 
     /// HTML 提取：剥 script/style/注释/标签，解实体，压空白，可截断。

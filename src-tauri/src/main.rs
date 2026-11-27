@@ -729,6 +729,14 @@ async fn main() {
                 }
             });
 
+            let state_for_routines = state.inner().clone();
+            spawn_supervised_task("agent_routine_scheduler_task", None, move || {
+                let s = state_for_routines.clone();
+                async move {
+                    agent::routine_runner::agent_routine_scheduler_task(s).await;
+                }
+            });
+
             sync_effective_dock_visibility(app.handle());
 
             // 注: macOS Dock 点击恢复窗口通过系统托盘 LeftClick 事件处理

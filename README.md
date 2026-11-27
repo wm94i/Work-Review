@@ -13,11 +13,11 @@
 </p>
 
 <p align="center">
-  All data is stored locally by default and never uploaded to any server. AI features are entirely optional; the app works fine with them turned off.
+  Work records are stored locally by default. Enabling cloud models, web tools, external MCP, or remote storage / sync sends the relevant content to the services you configure. AI remains optional.
 </p>
 
 <p align="center">
-  <strong>🔒 For personal use only — all data stays on your device.</strong>
+  <strong>🔒 For personal use only — local records, optional services you configure.</strong>
 </p>
 
 <p align="center">
@@ -29,7 +29,7 @@
     <img src="https://img.shields.io/github/v/release/wm94i/Work-Review?style=flat-square&color=blue" alt="Release">
   </a>
   <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Windows%20%7C%20Linux-blue?style=flat-square" alt="Platform">
-  <img src="https://img.shields.io/badge/%F0%9F%94%92%20all%20data%20local-green?style=flat-square" alt="All Data Local">
+  <img src="https://img.shields.io/badge/%F0%9F%94%92%20local%20storage-green?style=flat-square" alt="Local Storage">
   <img src="https://img.shields.io/github/license/wm94i/Work-Review?style=flat-square" alt="License">
 </p>
 
@@ -54,7 +54,8 @@ The focus is not "monitoring". It is helping you **recall, organize, and review*
 - **Automatic work context recording** — Records foreground apps, browser pages, window titles, usage time, optional screenshots, and OCR text, reducing manual note-taking
 - **Unified timeline and statistics** — Overview, timeline, work assistant, and daily report share the same local records, so you can inspect trends and drill into context
 - **Questions over local records** — Use the basic template or your configured model to answer "What did I do today?", "How long did this task take?", and "What have I been focused on?"
-- **Daily report generation and export** — Generate structured daily reports with Markdown export, auto-export, paragraph editing, pin/hide controls, and cached AI section ordering
+- **Daily and periodic reviews** — Generate daily, weekly, and monthly reports with Markdown / Obsidian section exports and paragraph management
+- **Personal Agent workflows** — Inspect runs and approvals, maintain personal skills, schedule read-only routines, and approve each external MCP tool call
 - **Privacy-first and locally controllable** — Data is stored in local SQLite by default; AI is optional, and model calls use your own API key without third-party relay
 - **Desktop Avatar Beta** — Shows work status through a desktop avatar and is gradually expanding toward proactive reminders and context assistance
 - **Multilingual UI** — Available in Simplified Chinese, English, Traditional Chinese, and Arabic (with RTL layout)
@@ -176,6 +177,7 @@ You can control the recording scope as needed:
 - Overview with answer-first insights: one-sentence summary, KPI cards with week-over-week deltas, and a "today rhythm" visual card (category composition bar + per-day investment chart)
 - Top websites aggregated by domain with browser sources, page counts, duration, inline expansion, and editable semantic categorization
 - Duration statistics, category filtering, trend comparison, natural-language time ranges, and hourly activity across Today, Week, Date, and Range views
+- Project time attribution by application, window title, domain, and path rules, plus focus, context-switch, and interruption metrics
 - Fragments grouped into continuous work sessions
 - Built-in categorization knowledge base (~140 domains + 70 apps) with AI auto-learning that backfills history
 
@@ -188,6 +190,17 @@ You can control the recording scope as needed:
 - AI-enhanced prompt attachments and custom model settings
 - Website semantic categorization: changing a domain category automatically backfills history
 - Multi-segment work time: e.g. morning + afternoon, break time excluded
+
+### Personal Agent Workflows
+
+Open **Work Assistant → Harness & Skills** to manage:
+
+- **Run Trace:** inspect status, tool approvals, data boundaries, and context compaction events; input and error previews redact common credentials
+- **Personal Skills:** create or edit local `skills/<name>/SKILL.md` workflows, loaded on demand in work-review mode
+- **Routines:** daily, interval, or manual triggers while the app is running; read-only execution uses local statistics or a local model by default, with explicit cloud-model opt-in for each routine
+- **MCP Extensions:** connect HTTP MCP services with approval for every tool call; public endpoints require HTTPS and loopback endpoints require explicit permission. General chat, bots, and background routines do not use them
+
+Use **Settings → Storage** for CSV / JSON export, backup, and restore. Back up the complete data directory before upgrading; 1.2.0 automatically migrates the database to schema 4. In-app backups exclude personal skills, routines, and MCP configuration: separately secure `skills/`, `agent_routines.json`, and `mcp_clients.json`. Restore preserves these files on the destination machine.
 
 ---
 
@@ -228,9 +241,9 @@ Supported providers: Ollama (local) / LM Studio (local) / OpenAI compatible / De
 - To update, download the portable ZIP, exit, replace the EXE and preserve `Data`; do not run the installer. External data locations cannot be selected in portable mode. After exiting and backing up, moving `Data` away restores this PC's normal data location.
 - WebView2 cache, autostart registration and user-selected external export paths remain system-managed. `Data` may contain API keys: never share it publicly.
 
-**Available for testing in [v1.2.0-rc.1](https://github.com/wm94i/Work-Review/releases/tag/v1.2.0-rc.1); `v1.1.4-rc.1` and earlier releases do not include this support.**
+**[v1.2.0 stable](https://github.com/wm94i/Work-Review/releases/tag/v1.2.0) includes the Windows installer and portable ZIP. See the [changelog](./CHANGELOG.md#120---2026-11-27) for upgrade and compatibility details.**
 
-> **Windows 11 Smart App Control**: If Windows shows "Smart App Control blocked this app from running", it's because Work Review is signed with a self-signed certificate (not a commercial EV certificate). You can turn off Smart App Control in "Windows Security → App & browser control → Smart App Control". See [#139](https://github.com/wm94i/Work-Review/issues/139).
+> **Windows 11 Smart App Control:** Windows packages currently have no commercial Authenticode signing, so Windows may block startup. Download from the official release page; follow administrator policy on managed devices. See [#139](https://github.com/wm94i/Work-Review/issues/139).
 
 **Linux:** Screenshots and window tracking depend on the current session type and toolchain. <details><summary>Dependency details</summary>
 
@@ -317,6 +330,7 @@ Or via query parameter: `?token=<token>`
 | GET | `/v1/device` | Device info |
 | GET | `/v1/timeline/{date}` | Timeline (`date` format `YYYY-MM-DD`, supports `?limit=&offset=&include_ocr=`; default 500, max 2000 rows; OCR text only when `localhost_api_include_ocr` is enabled in config.json and the request sets `include_ocr=true`) |
 | GET | `/v1/activities/{date}` | Activity list (supports `?limit=&include_ocr=`; same limits and OCR rule as the timeline) |
+| GET | `/v1/stats/projects` | Project time (`?date_from=&date_to=`; privacy rules take priority) |
 | GET | `/v1/stats/today` | Today's stats |
 | GET | `/v1/stats/overview` | Overview stats (`?mode=today|date|week|range`) |
 | GET | `/v1/stats/focus` | Focus & fragmentation metrics (`?mode=today|date|week|range`) |
@@ -331,6 +345,7 @@ Or via query parameter: `?token=<token>`
 | GET | `/v1/categories/semantic` | Semantic category list |
 | GET | `/v1/hourly-summaries/{date}` | Hourly summary |
 | GET | `/v1/hourly-app-breakdown/{date}` | Hourly app breakdown |
+| GET | `/v1/period-review` | Weekly / monthly review (`?type=month&key=2026-11&locale=en&force=true`; week keys use `2026-W47`) |
 | GET | `/v1/weekly-review` | Weekly review (`?date_from=&date_to=&limit=`) |
 | GET | `/v1/storage/stats` | Storage stats |
 | POST | `/v1/screenshots/capture` | Capture the active screen immediately and return JPEG Base64 (requires screenshots enabled) |

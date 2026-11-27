@@ -1,6 +1,6 @@
 [package]
 name = "work-review"
-version = "1.2.0-rc.1"
+version = "1.2.0"
 description = "个人工作回顾与AI日报助手"
 authors = ["WorkReview Team"]
 edition = "2021"
@@ -12,6 +12,7 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 # 内部共享库
 work-review-core = { path = "../crates/core" }
+work-review-agent-harness = { path = "../crates/agent-harness" }
 
 # Tauri 核心
 tauri = { version = "2.9", features = ["macos-private-api", "tray-icon"] }

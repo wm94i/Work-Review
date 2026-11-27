@@ -6,6 +6,7 @@
 use super::deadline::Deadline;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::OnceLock;
 use std::time::Duration;
 use work_review_core::config::{AiProvider, ModelConfig};
@@ -38,6 +39,51 @@ fn stream_client() -> Result<&'static reqwest::Client, AppError> {
         .build()
         .map_err(|e| AppError::Unknown(e.to_string()))?;
     Ok(STREAM_CLIENT.get_or_init(|| built))
+}
+
+fn local_model_target(endpoint: &str) -> Option<(String, u16)> {
+    let parsed = reqwest::Url::parse(endpoint.trim()).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+    {
+        return None;
+    }
+    let host = parsed.host_str()?;
+    let clean = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .trim_end_matches('.');
+    let is_loopback = clean == "localhost"
+        || clean.ends_with(".localhost")
+        || clean
+            .parse::<IpAddr>()
+            .is_ok_and(|ip| work_review_agent_harness::mcp_client::normalize_ip(ip).is_loopback());
+    let port = parsed.port_or_known_default()?;
+    is_loopback.then(|| (host.to_string(), port))
+}
+
+pub(crate) fn is_local_only_model_endpoint(endpoint: &str) -> bool {
+    local_model_target(endpoint).is_some()
+}
+
+fn local_model_client(endpoint: &str) -> Result<Option<reqwest::Client>, AppError> {
+    let Some((host, port)) = local_model_target(endpoint) else {
+        return Ok(None);
+    };
+    // localhost（含子域）固定到回环，禁止 DNS、代理和重定向绕过本地模型授权。
+    let addrs = [
+        SocketAddr::new(Ipv4Addr::LOCALHOST.into(), port),
+        SocketAddr::new(Ipv6Addr::LOCALHOST.into(), port),
+    ];
+    reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .resolve_to_addrs(&host, &addrs)
+        .connect_timeout(Duration::from_secs(10))
+        .build()
+        .map(Some)
+        .map_err(|e| AppError::Unknown(e.to_string()))
 }
 
 async fn send_until(
@@ -219,7 +265,11 @@ pub async fn chat_with_tools(
     tools: &[Value],
     deadline: Deadline,
 ) -> Result<LlmResponse, AppError> {
-    let client = chat_client()?;
+    let local_client = local_model_client(&model_config.endpoint)?;
+    let client = match local_client.as_ref() {
+        Some(client) => client,
+        None => chat_client()?,
+    };
 
     // 构造完整的 messages 数组：system + 用户对话历史
     let mut full_messages = vec![json!({
@@ -797,7 +847,11 @@ pub async fn chat_with_tools_streaming(
     deadline: Deadline,
 ) -> Result<LlmResponse, AppError> {
     // 流式客户端复用连接池；发送时设置剩余 deadline，读取另有逐块 idle 超时。
-    let client = stream_client()?;
+    let local_client = local_model_client(&model_config.endpoint)?;
+    let client = match local_client.as_ref() {
+        Some(client) => client,
+        None => stream_client()?,
+    };
 
     let mut full_messages = vec![json!({
         "role": "system",
@@ -1627,6 +1681,15 @@ mod tests {
             headers.push(socket.read_u8().await.unwrap());
             assert!(headers.len() <= 8192, "本地测试请求头过大");
         }
+        let content_len = String::from_utf8(headers)
+            .unwrap()
+            .lines()
+            .filter_map(|line| line.split_once(':'))
+            .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+            .map(|(_, value)| value.trim().parse::<usize>().unwrap())
+            .unwrap_or(0);
+        assert!(content_len < 64 * 1024);
+        socket.read_exact(&mut vec![0; content_len]).await.unwrap();
     }
 
     /// 只绑定回环地址；响应头及部分 body 发完后保持连接，不结束响应体。
@@ -1712,6 +1775,119 @@ mod tests {
         server.abort();
         result.expect("重试后的响应体不能重新获得完整预算");
         assert!(deadline.is_expired());
+    }
+
+    #[tokio::test]
+    async fn 本地模型流式与非流式请求都不得跟随重定向() {
+        let destination = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let gateway = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", gateway.local_addr().unwrap());
+        let location = format!("http://{}/collect", destination.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            // 非流式一次，流式一次及其非流式回退一次。
+            for _ in 0..3 {
+                let (mut socket, _) = gateway.accept().await.unwrap();
+                read_test_headers(&mut socket).await;
+                let response = format!(
+                    "HTTP/1.1 307 Temporary Redirect\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let model = ModelConfig {
+            provider: AiProvider::OpenAI,
+            endpoint,
+            model: "local-test".into(),
+            ..ModelConfig::default_text()
+        };
+        assert!(is_local_only_model_endpoint(&model.endpoint));
+        let messages = [Message::user("private-local-record")];
+        let result = chat_with_tools(
+            &model,
+            "local only",
+            &messages,
+            &[],
+            Deadline::after(Duration::from_secs(2)),
+        )
+        .await;
+        assert!(result.is_err());
+        let result = chat_with_tools_streaming(
+            &model,
+            "local only",
+            &messages,
+            &[],
+            &mut |_| {},
+            Deadline::after(Duration::from_secs(2)),
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), destination.accept())
+                .await
+                .is_err(),
+            "不得向重定向目的地发送任何请求"
+        );
+        server.abort();
+    }
+
+    #[test]
+    fn 本地模型请求应固定localhost解析并绕过环境代理() {
+        const CHILD: &str = "WORK_REVIEW_LOCAL_MODEL_PROXY_TEST";
+        if std::env::var_os(CHILD).is_none() {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "agent::model::tests::本地模型请求应固定localhost解析并绕过环境代理",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1");
+            for key in [
+                "HTTP_PROXY",
+                "HTTPS_PROXY",
+                "ALL_PROXY",
+                "http_proxy",
+                "https_proxy",
+                "all_proxy",
+            ] {
+                command.env(key, "http://127.0.0.1:9");
+            }
+            command.env("NO_PROXY", "").env("no_proxy", "");
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        }
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                read_test_headers(&mut socket).await;
+                let body = r#"{"choices":[{"message":{"content":"local-ok"},"finish_reason":"stop"}]}"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            });
+            let model = ModelConfig {
+                provider: AiProvider::OpenAI,
+                endpoint: format!("http://private-gateway.localhost.:{port}"),
+                model: "local-test".into(),
+                ..ModelConfig::default_text()
+            };
+            let response = chat_with_tools(
+                &model, "local only", &[Message::user("private-local-record")], &[],
+                Deadline::after(Duration::from_secs(2)),
+            ).await.unwrap();
+            assert_eq!(response.content.as_deref(), Some("local-ok"));
+            server.await.unwrap();
+        });
     }
 
     #[test]

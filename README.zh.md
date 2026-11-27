@@ -13,11 +13,11 @@
 </p>
 
 <p align="center">
-  所有数据默认仅保存在本地设备，不上传任何服务器。AI 功能完全可选；关闭后照常使用。
+  工作记录默认保存在本机。启用云模型、联网工具、外部 MCP 或远程存储 / 同步后，相关内容会按配置发送到对应服务；AI 功能完全可选。
 </p>
 
 <p align="center">
-  <strong>🔒 仅供个人使用 —— 所有数据只存在你的设备上。</strong>
+  <strong>🔒 仅供个人使用 —— 本地记录，外部服务由你配置。</strong>
 </p>
 
 <p align="center">
@@ -29,7 +29,7 @@
     <img src="https://img.shields.io/github/v/release/wm94i/Work-Review?style=flat-square&color=blue" alt="Release">
   </a>
   <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Windows%20%7C%20Linux-blue?style=flat-square" alt="Platform">
-  <img src="https://img.shields.io/badge/%F0%9F%94%92%20all%20data%20local-green?style=flat-square" alt="All Data Local">
+  <img src="https://img.shields.io/badge/%F0%9F%94%92%20local%20storage-green?style=flat-square" alt="Local Storage">
   <img src="https://img.shields.io/github/license/wm94i/Work-Review?style=flat-square" alt="License">
 </p>
 
@@ -54,7 +54,8 @@ Work Review 面向个人工作复盘，适合用来回答这些问题：
 - **自动记录工作上下文** — 记录前台应用、浏览器页面、窗口标题、使用时长、可选截图和 OCR 文本，减少手动补记
 - **统一时间线和统计** — 概览、时间线、工作助手、日报共用同一份本地记录，既能看趋势，也能追到具体上下文
 - **本地记录问答** — 用基础模板或你配置的模型回答“今天做了什么”“某个任务花了多久”“最近在推进什么”等问题
-- **日报生成与导出** — 生成结构化日报，支持 Markdown 导出、自动导出、段落编辑、钉选/隐藏和 AI 编排顺序
+- **日报与周期复盘** — 生成日 / 周 / 月报告，支持 Markdown 与 Obsidian 增量导出、段落编辑及管理
+- **个人 Agent 工作流** — 查看运行与审批轨迹、维护个人技能、配置只读自主任务，并经逐次确认调用外部 MCP 工具
 - **隐私优先，本地可控** — 数据默认保存在本地 SQLite；AI 可不启用，模型调用使用你自己的 API Key，不经第三方中转
 - **桌面化身 Beta** — 用桌面化身反馈工作状态，并逐步扩展到主动提醒和上下文辅助
 - **多语言界面** — 支持简体中文、English、繁體中文、العربية（阿拉伯语，RTL 布局）
@@ -176,6 +177,7 @@ Work Review 从设计上面向个人使用，不适用于：员工监控 · 团�
 - 概览页答案优先：一句话洞察总结、KPI 卡带较上周同日对比、「今日节奏」主视觉卡（分类构成条 + 按天投入柱状图）
 - 常驻网站按域名聚合，展示浏览器来源、页面数和时长，支持卡片内展开全部网站并编辑语义分类
 - 支持时长统计、分类筛选、趋势对比、自然语言时间范围，并可按今日、本周、指定日期、日期范围查看小时活跃度
+- 本地记录通过应用名、窗口标题、域名和路径规则归集项目工时，并提供专注、上下文切换与打断指标
 - 碎片活动聚合为连续工作 Session
 - 内置分类知识库（约 140 个域名 + 70 个应用）+ AI 自动学习归类，并回溯修正历史
 
@@ -188,6 +190,17 @@ Work Review 从设计上面向个人使用，不适用于：员工监控 · 团�
 - AI 增强下的附加提示词和自定义模型
 - 网站语义分类：修改域名分类后自动回填历史
 - 多段工作时间：如上午 + 下午，休息时间不计入
+
+### 个人 Agent 工作流
+
+在「工作助手 → 引擎与技能」管理：
+
+- **运行追踪**：查看状态、工具审批、数据边界及上下文压缩事件；输入与错误摘要会清洗常见凭证
+- **个人技能**：创建或编辑本机 `skills/<name>/SKILL.md`，在工作复盘模式按需加载复用步骤
+- **自主任务**：支持每日、间隔或手动触发，需应用保持运行；只读执行，默认使用本机统计或本地模型，调用云模型需对单条任务明确开启
+- **MCP 扩展**：接入 HTTP MCP 服务，每次工具调用均需确认；公网使用 HTTPS，回环端点需显式允许，普通聊天、Bot 和后台任务不接入
+
+在「设置 → 存储」可导出 CSV / JSON、备份与恢复。升级前请备份完整数据目录；1.2.0 自动迁移数据库至 Schema 4。应用内备份不包含个人技能、自主任务和 MCP 配置，请另行安全备份 `skills/`、`agent_routines.json`、`mcp_clients.json`；恢复会保留目标机器的这些文件。
 
 ---
 
@@ -228,9 +241,9 @@ Work Review 的核心始终是**本地记录**。AI 的作用是让记录更容�
 - 更新需下载便携 ZIP，退出后替换 EXE 并保留原 `Data`，不运行安装版更新器。便携模式不能切换到外部数据目录；退出并备份、移走 `Data` 后可恢复本机原有目录。
 - WebView2 缓存、自启动注册和用户选择的外部导出路径仍由系统管理；`Data` 可能含 API Key，请勿公开分享。
 
-**可通过 [v1.2.0-rc.1 测试版](https://github.com/wm94i/Work-Review/releases/tag/v1.2.0-rc.1) 试用；`v1.1.4-rc.1` 及更早版本不包含这项支持。**
+**[v1.2.0 正式版](https://github.com/wm94i/Work-Review/releases/tag/v1.2.0) 提供 Windows 安装包与便携 ZIP；升级内容及兼容说明见 [变更记录](./CHANGELOG.md#120---2026-11-27)。**
 
-> **Windows 11 智能应用控制**：若系统提示「智能应用控制阻止了程序启动」，是因为本应用使用自签名证书（非 EV 商业证书）。可在「Windows 安全中心 → 应用和浏览器控制 → 智能应用控制」中将其关闭后运行。详见 [#139](https://github.com/wm94i/Work-Review/issues/139)。
+> **Windows 11 智能应用控制**：当前 Windows 包未配置商业 Authenticode 签名，系统可能拦截启动。请从官方发布页下载；受管理设备请遵循管理员策略。详见 [#139](https://github.com/wm94i/Work-Review/issues/139)。
 
 **Linux：** 截图和窗口追踪依赖当前会话类型与工具链。<details><summary>依赖说明</summary>
 
@@ -317,6 +330,7 @@ Authorization: Bearer <token>
 | GET | `/v1/device` | 设备信息 |
 | GET | `/v1/timeline/{date}` | 时间线（`date` 格式 `YYYY-MM-DD`，支持 `?limit=&offset=&include_ocr=`；默认 500 条、上限 2000 条；需在 config.json 开启 `localhost_api_include_ocr` 且请求带 `include_ocr=true` 才返回 OCR 文本） |
 | GET | `/v1/activities/{date}` | 活动列表（支持 `?limit=&include_ocr=`；条数上限与 OCR 规则同时间线） |
+| GET | `/v1/stats/projects` | 项目工时（`?date_from=&date_to=`，隐私规则优先） |
 | GET | `/v1/stats/today` | 今日统计 |
 | GET | `/v1/stats/overview` | 综合统计（`?mode=today|date|week|range`） |
 | GET | `/v1/stats/focus` | 专注度与上下文切换/打断指标（`?mode=today|date|week|range`） |
@@ -331,6 +345,7 @@ Authorization: Bearer <token>
 | GET | `/v1/categories/semantic` | 语义分类列表 |
 | GET | `/v1/hourly-summaries/{date}` | 按小时汇总 |
 | GET | `/v1/hourly-app-breakdown/{date}` | 按小时应用分布 |
+| GET | `/v1/period-review` | 周 / 月复盘（`?type=month&key=2026-11&locale=zh-CN&force=true`；周 key 如 `2026-W47`） |
 | GET | `/v1/weekly-review` | 周报（`?date_from=&date_to=&limit=`） |
 | GET | `/v1/storage/stats` | 存储统计 |
 | POST | `/v1/screenshots/capture` | 立即截取当前活动界面并返回 JPEG Base64（需已启用截图） |

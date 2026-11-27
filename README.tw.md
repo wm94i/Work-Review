@@ -13,11 +13,11 @@
 </p>
 
 <p align="center">
-  所有數據默認僅保存在本地設備，不上傳任何伺服器。AI 功能完全可選；關閉後照常使用。
+  工作記錄預設儲存在本機。啟用雲端模型、聯網工具、外部 MCP 或遠端儲存 / 同步後，相關內容會依設定傳送至對應服務；AI 功能完全可選。
 </p>
 
 <p align="center">
-  <strong>🔒 僅供個人使用 —— 所有資料只存在你的裝置上。</strong>
+  <strong>🔒 僅供個人使用 —— 本機記錄，外部服務由你設定。</strong>
 </p>
 
 <p align="center">
@@ -29,7 +29,7 @@
     <img src="https://img.shields.io/github/v/release/wm94i/Work-Review?style=flat-square&color=blue" alt="Release">
   </a>
   <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Windows%20%7C%20Linux-blue?style=flat-square" alt="Platform">
-  <img src="https://img.shields.io/badge/%F0%9F%94%92%20all%20data%20local-green?style=flat-square" alt="All Data Local">
+  <img src="https://img.shields.io/badge/%F0%9F%94%92%20local%20storage-green?style=flat-square" alt="Local Storage">
   <img src="https://img.shields.io/github/license/wm94i/Work-Review?style=flat-square" alt="License">
 </p>
 
@@ -54,7 +54,8 @@ Work Review 面向個人工作復盤，適合用來回答這些問題：
 - **自動記錄工作上下文** — 記錄前台應用、瀏覽器頁面、窗口標題、使用時長、可選截圖和 OCR 文本，減少手動補記
 - **統一時間線和統計** — 概覽、時間線、工作助手、日報共用同一份本地記錄，既能看趨勢，也能追到具體上下文
 - **本地記錄問答** — 用基礎模板或你配置的模型回答「今天做了什麼」「某個任務花了多久」「最近在推進什麼」等問題
-- **日報生成與匯出** — 生成結構化日報，支援 Markdown 匯出、自動匯出、段落編輯、釘選/隱藏和 AI 編排順序
+- **日報與週期復盤** — 產生日／週／月報告，支援 Markdown 與 Obsidian 區塊增量匯出及段落管理
+- **個人 Agent 工作流程** — 查看執行與審批軌跡、維護個人技能、設定唯讀自主任務，並逐次確認外部 MCP 工具呼叫
 - **隱私優先，本地可控** — 數據默認保存在本地 SQLite；AI 可不啟用，模型調用使用你自己的 API Key，不經第三方中轉
 - **桌面化身 Beta** — 用桌面化身反饋工作狀態，並逐步擴展到主動提醒和上下文輔助
 - **多語言界面** — 支援简体中文、English、繁體中文、العربية（阿拉伯文，RTL 佈局）
@@ -176,6 +177,7 @@ Work Review 從設計上面向個人使用，不適用於：員工監控 · 團�
 - 概覽頁答案優先：一句話洞察總結、KPI 卡帶較上週同日對比、「今日節奏」主視覺卡（分類構成條 + 按天投入柱狀圖）
 - 常駐網站按網域聚合，展示瀏覽器來源、頁面數和時長，支援在卡片內展開全部網站並編輯語義分類
 - 支援時長統計、分類篩選、趨勢對比、自然語言時間範圍，並可按今日、本週、指定日期、日期範圍查看小時活躍度
+- 依應用程式、視窗標題、網域與路徑規則歸集專案工時，並提供專注、上下文切換與打斷指標
 - 碎片活動聚合為連續工作 Session
 - 內建分類知識庫（約 140 個域名 + 70 個應用）+ AI 自動學習歸類，並回溯修正歷史
 
@@ -188,6 +190,17 @@ Work Review 從設計上面向個人使用，不適用於：員工監控 · 團�
 - AI 增強下的附加提示詞和自定義模型
 - 網站語義分類：修改域名分類後自動回填歷史
 - 多段工作時間：如上午 + 下午，休息時間不計入
+
+### 個人 Agent 工作流程
+
+在「工作助手 → 引擎與技能」管理：
+
+- **執行追蹤**：查看狀態、工具審批、資料邊界與上下文壓縮事件；輸入與錯誤摘要會清除常見憑證
+- **個人技能**：建立或編輯本機 `skills/<name>/SKILL.md`，於工作復盤模式按需載入重用步驟
+- **自主任務**：支援每日、間隔或手動觸發，需要應用程式持續執行；唯讀執行，預設使用本機統計或本機模型，雲端模型需針對單一任務明確啟用
+- **MCP 擴充**：連接 HTTP MCP 服務，每次工具呼叫均需確認；公網使用 HTTPS，回環端點需明確允許，一般聊天、Bot 與背景任務不使用
+
+在「設定 → 儲存」可匯出 CSV / JSON、備份與還原。升級前請備份完整資料目錄；1.2.0 自動遷移資料庫至 Schema 4。應用程式內備份不包含個人技能、自主任務與 MCP 設定，請另行安全備份 `skills/`、`agent_routines.json`、`mcp_clients.json`；還原會保留目標機器上的這些檔案。
 
 ---
 
@@ -228,9 +241,9 @@ Work Review 的核心始終是**本地記錄**。AI 的作用是讓記錄更容�
 - 更新請下載便攜 ZIP，退出後替換 EXE 並保留原 `Data`，不要執行安裝版更新程式。便攜模式不能切換至外部資料目錄；退出並備份、移走 `Data` 後可恢復本機原有目錄。
 - WebView2 快取、自動啟動註冊及使用者選擇的外部匯出路徑仍由系統管理；`Data` 可能含 API Key，請勿公開分享。
 
-**可透過 [v1.2.0-rc.1 測試版](https://github.com/wm94i/Work-Review/releases/tag/v1.2.0-rc.1) 試用；`v1.1.4-rc.1` 及更早版本不包含此支援。**
+**[v1.2.0 正式版](https://github.com/wm94i/Work-Review/releases/tag/v1.2.0) 提供 Windows 安裝包與便攜 ZIP；升級內容及相容說明見[變更記錄](./CHANGELOG.md#120---2026-11-27)。**
 
-> **Windows 11 智慧型應用程式控制**：若系統提示「智慧型應用程式控制已封鎖應用程式」，是因為本應用使用自簽憑證（非 EV 商業憑證）。可在「Windows 安全性 → 應用程式與瀏覽器控制 → 智慧型應用程式控制」中關閉後執行。詳見 [#139](https://github.com/wm94i/Work-Review/issues/139)。
+> **Windows 11 智慧型應用程式控制**：目前 Windows 套件未設定商業 Authenticode 簽章，系統可能封鎖啟動。請從官方發布頁下載；受管理裝置請遵循管理員政策。詳見 [#139](https://github.com/wm94i/Work-Review/issues/139)。
 
 **Linux：** 截圖和窗口追蹤依賴當前會話類型與工具鏈。<details><summary>依賴說明</summary>
 
@@ -317,6 +330,7 @@ Authorization: Bearer <token>
 | GET | `/v1/device` | 設備資訊 |
 | GET | `/v1/timeline/{date}` | 時間線（`date` 格式 `YYYY-MM-DD`，支援 `?limit=&offset=&include_ocr=`；預設 500 筆、上限 2000 筆；需在 config.json 開啟 `localhost_api_include_ocr` 且請求帶 `include_ocr=true` 才回傳 OCR 文字） |
 | GET | `/v1/activities/{date}` | 活動列表（支援 `?limit=&include_ocr=`；筆數上限與 OCR 規則同時間線） |
+| GET | `/v1/stats/projects` | 專案工時（`?date_from=&date_to=`，隱私規則優先） |
 | GET | `/v1/stats/today` | 今日統計 |
 | GET | `/v1/stats/overview` | 綜合統計（`?mode=today|date|week|range`） |
 | GET | `/v1/stats/focus` | 專注度與上下文切換/打斷指標（`?mode=today|date|week|range`） |
@@ -331,6 +345,7 @@ Authorization: Bearer <token>
 | GET | `/v1/categories/semantic` | 語義分類列表 |
 | GET | `/v1/hourly-summaries/{date}` | 每小時彙總 |
 | GET | `/v1/hourly-app-breakdown/{date}` | 每小時應用分佈 |
+| GET | `/v1/period-review` | 週／月復盤（`?type=month&key=2026-11&locale=zh-TW&force=true`；週 key 如 `2026-W47`） |
 | GET | `/v1/weekly-review` | 週報（`?date_from=&date_to=&limit=`） |
 | GET | `/v1/storage/stats` | 儲存統計 |
 | POST | `/v1/screenshots/capture` | 立即擷取目前活動介面並回傳 JPEG Base64（需已啟用截圖） |

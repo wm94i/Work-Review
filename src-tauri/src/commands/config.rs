@@ -44,6 +44,10 @@ pub(crate) fn try_acquire_data_maintenance_lock() -> Result<DataMaintenanceGuard
         .map_err(|_| AppError::Config("当前正在执行数据目录迁移或备份恢复，请稍候再试".to_string()))
 }
 
+/// 受管本机数据目录条目（用于 `change_data_dir` 目录迁移与旧目录清理）。
+///
+/// 注：可移植备份包（`commands/backup.rs`）使用独立白名单（仅 `workreview.db` 与脱敏后的
+/// `config.json`），不会把含明文 Bearer Token 的 `mcp_clients.json` 导出到备份归档中。
 const MANAGED_DATA_ENTRIES: &[&str] = &[
     "config.json",
     "config.json.bak",
@@ -52,6 +56,9 @@ const MANAGED_DATA_ENTRIES: &[&str] = &[
     "ocr_logs",
     "background.jpg",
     "update_settings.json",
+    "skills",
+    "agent_routines.json",
+    "mcp_clients.json",
 ];
 
 const LIVE_DATABASE_FILES: &[&str] = &["workreview.db", "workreview.db-shm", "workreview.db-wal"];
@@ -531,21 +538,29 @@ fn restore_migration_entries(
     Ok(())
 }
 
-pub(crate) fn commit_migration_stage(stage_dir: &Path, target_dir: &Path) -> Result<(), AppError> {
+pub(crate) fn commit_migration_stage(
+    stage_dir: &Path,
+    target_dir: &Path,
+    preserved_entries: &[&str],
+) -> Result<(), AppError> {
+    let entry_names: Vec<_> = migration_entry_names()
+        .into_iter()
+        .filter(|name| !preserved_entries.contains(name))
+        .collect();
     let backup_dir = migration_sibling_path(target_dir, "migration-backup")?;
     std::fs::create_dir_all(&backup_dir)?;
     let mut moved_entries = Vec::new();
     let mut installed_entries = Vec::new();
 
     let committed: Result<(), AppError> = (|| {
-        for entry_name in migration_entry_names() {
+        for &entry_name in &entry_names {
             let source = target_dir.join(entry_name);
             if source.exists() {
                 std::fs::rename(&source, backup_dir.join(entry_name))?;
                 moved_entries.push(entry_name.to_string());
             }
         }
-        for entry_name in migration_entry_names() {
+        for &entry_name in &entry_names {
             let source = stage_dir.join(entry_name);
             if source.exists() {
                 std::fs::rename(&source, target_dir.join(entry_name))?;
@@ -728,7 +743,7 @@ pub async fn change_data_dir(
         }
     };
 
-    commit_migration_stage(&staging_dir, &target_dir)?;
+    commit_migration_stage(&staging_dir, &target_dir, &[])?;
     let config_path = target_dir.join("config.json");
     let preference_warning = match crate::save_data_dir_preference(&target_dir) {
         Ok(()) => None,
@@ -936,7 +951,7 @@ mod tests {
         let stage = migration_sibling_path(&target, "test-stage").unwrap();
         std::fs::create_dir_all(&stage).unwrap();
         std::fs::write(stage.join("config.json"), b"new-config").unwrap();
-        commit_migration_stage(&stage, &target).unwrap();
+        commit_migration_stage(&stage, &target, &[]).unwrap();
 
         assert_eq!(
             std::fs::read(target.join("config.json")).unwrap(),
@@ -948,6 +963,35 @@ mod tests {
         );
         assert!(!stage.exists());
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn 数据目录迁移应包含个人技能自主任务与mcp配置() {
+        let root = std::env::temp_dir().join(format!(
+            "work-review-harness-migration-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let src = root.join("src");
+        let dst = root.join("dst");
+        std::fs::create_dir_all(src.join("skills").join("weekly-brief")).unwrap();
+        std::fs::write(
+            src.join("skills").join("weekly-brief").join("SKILL.md"),
+            "# weekly",
+        )
+        .unwrap();
+        std::fs::write(src.join("agent_routines.json"), "[]").unwrap();
+        std::fs::write(src.join("mcp_clients.json"), "[]").unwrap();
+
+        super::copy_managed_data_without_live_db(&src, &dst).unwrap();
+        assert!(dst
+            .join("skills")
+            .join("weekly-brief")
+            .join("SKILL.md")
+            .is_file());
+        assert!(dst.join("agent_routines.json").is_file());
+        assert!(dst.join("mcp_clients.json").is_file());
+
+        let _ = std::fs::remove_dir_all(root);
     }
 }
 

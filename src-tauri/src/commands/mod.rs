@@ -5,6 +5,7 @@
 //! 使 `main.rs` 的 `generate_handler![...]` 注册与 `localhost_api` / `agent` / `bot`
 //! 对内部 helper 的引用完全无需改动。
 
+mod agent_harness;
 mod ai;
 mod ask;
 mod assistant_history;
@@ -27,6 +28,7 @@ mod updater;
 mod user_memory;
 
 // 所有 pub command + DTO（main.rs generate_handler 的 commands::xxx 不变）
+pub use agent_harness::*;
 pub use ai::*;
 pub use ask::*;
 pub use assistant_history::*;
@@ -153,6 +155,21 @@ pub(crate) fn handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Sen
         chat_work_assistant,
         cancel_assistant_request,
         confirm_assistant_action,
+        list_agent_runs,
+        get_agent_run_trace,
+        list_personal_skills,
+        get_personal_skill,
+        save_personal_skill,
+        delete_personal_skill,
+        open_personal_skills_dir,
+        list_agent_routines,
+        save_agent_routine,
+        delete_agent_routine,
+        run_agent_routine_now,
+        list_mcp_client_servers,
+        save_mcp_client_server,
+        delete_mcp_client_server,
+        test_mcp_client_server,
         list_assistant_conversations,
         create_assistant_conversation,
         get_assistant_messages,

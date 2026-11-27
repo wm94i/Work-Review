@@ -6,8 +6,10 @@
 pub mod deadline;
 pub mod events;
 pub mod executor;
+pub mod mcp_bridge;
 pub mod model;
 pub mod orchestrator;
+pub mod routine_runner;
 pub mod tools;
 
 /// 助手请求的能力边界。

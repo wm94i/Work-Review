@@ -7,14 +7,22 @@ use super::deadline::Deadline;
 use super::events::{default_tool_label, StreamEvent, StreamEventSender};
 use super::model::{self, Message, StopReason};
 use super::tools::{
-    action_confirm_summary, is_web_tool, requires_confirmation,
-    requires_confirmation_after_local_data, wrap_local_record_content, AssistantRuntime,
-    ConfirmDecision, ToolRegistry, WebToolsConfig,
+    action_confirm_summary, capability_spec, is_web_tool, wrap_local_record_content,
+    AssistantRuntime, ConfirmDecision, ToolRegistry, WebToolsConfig,
 };
 use super::AssistantRequestMode;
 use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use work_review_agent_harness::context::{
+    plan_compaction, ArtifactStore, CompactionItem, ContextBudget,
+};
+use work_review_agent_harness::ledger::{
+    new_run_id, redact_secrets, scrub_preview, HarnessEventKind, RunStatus,
+};
+use work_review_agent_harness::policy::{
+    ChannelCapabilities, DataTaint, HarnessPolicyEngine, PolicyDecision,
+};
 use work_review_core::config::ModelConfig;
 use work_review_core::database::Database;
 use work_review_core::database::MemorySearchItem;
@@ -250,6 +258,357 @@ fn build_executor_system_prompt(
     }
 }
 
+/// 运行期账本记录器：仅当调用方传入 `run_source` 时落盘 SQLite，失败仅打日志不阻断主流程。
+///
+/// 实现 `Drop` 兜底：若执行中途因 `?` 提前返回（如前端通道断开），自动以 `cancelled` 终态
+/// 落盘，防止 `agent_runs` 长期滞留在 `running` / `waiting_approval`。
+struct RunLedgerRecorder<'a> {
+    database: &'a Database,
+    privacy_filter: Option<Arc<work_review_core::privacy::PrivacyFilter>>,
+    run_id: Option<String>,
+    seq: i64,
+    compaction_count: usize,
+    tool_call_count: usize,
+    last_taint: DataTaint,
+    finished: bool,
+}
+
+impl<'a> RunLedgerRecorder<'a> {
+    fn sanitize_text(
+        privacy_filter: Option<&work_review_core::privacy::PrivacyFilter>,
+        raw: &str,
+        max_chars: usize,
+    ) -> String {
+        if let Some(filter) = privacy_filter {
+            if filter.check_privacy("", raw) != work_review_core::privacy::PrivacyAction::Record {
+                return work_review_core::privacy::ANONYMIZED_TITLE_PLACEHOLDER.to_string();
+            }
+            return scrub_preview(&filter.filter_text(&redact_secrets(raw)), max_chars);
+        }
+        scrub_preview(raw, max_chars)
+    }
+
+    fn start(
+        database: &'a Database,
+        runtime: &AssistantRuntime,
+        mode: AssistantRequestMode,
+        model_name: &str,
+        question: &str,
+    ) -> Self {
+        let Some(source) = runtime.run_source.as_deref() else {
+            return Self {
+                database,
+                privacy_filter: None,
+                run_id: None,
+                seq: 0,
+                compaction_count: 0,
+                tool_call_count: 0,
+                last_taint: DataTaint::default(),
+                finished: true,
+            };
+        };
+
+        // 始终由服务端生成唯一 run_id，不信任客户端传入的 request_id 作为主键，防止碰撞或伪造。
+        let run_id = new_run_id();
+        let mode_str = match mode {
+            AssistantRequestMode::WorkReview => "work_review",
+            AssistantRequestMode::GeneralChat => "general_chat",
+        };
+        let input_preview = Self::sanitize_text(runtime.privacy_filter.as_deref(), question, 120);
+        if let Err(err) = database.create_agent_run(
+            &run_id,
+            runtime.conversation_id,
+            source,
+            mode_str,
+            Some(model_name),
+            &input_preview,
+        ) {
+            log::warn!("创建 Agent Run 账本失败（降级为非持久化）: {err}");
+            return Self {
+                database,
+                privacy_filter: None,
+                run_id: None,
+                seq: 0,
+                compaction_count: 0,
+                tool_call_count: 0,
+                last_taint: DataTaint::default(),
+                finished: true,
+            };
+        }
+
+        let mut recorder = Self {
+            database,
+            privacy_filter: runtime.privacy_filter.clone(),
+            run_id: Some(run_id),
+            seq: 0,
+            compaction_count: 0,
+            tool_call_count: 0,
+            last_taint: DataTaint::default(),
+            finished: false,
+        };
+        let client_req_meta = runtime
+            .client_request_id
+            .as_deref()
+            .map(|id| scrub_preview(id, 64))
+            .filter(|id| !id.is_empty());
+        recorder.event(
+            HarnessEventKind::RunStarted,
+            None,
+            serde_json::json!({
+                "mode": mode_str,
+                "source": source,
+                "clientRequestId": client_req_meta,
+            }),
+        );
+        recorder
+    }
+
+    fn event(
+        &mut self,
+        kind: HarnessEventKind,
+        tool_name: Option<&str>,
+        payload: serde_json::Value,
+    ) {
+        let Some(run_id) = self.run_id.as_deref() else {
+            return;
+        };
+        self.seq += 1;
+        let payload_json = payload.to_string();
+        if let Err(err) = self.database.append_agent_run_event(
+            run_id,
+            self.seq,
+            kind.as_str(),
+            tool_name,
+            &payload_json,
+        ) {
+            log::debug!("写入 Agent Run 事件失败 ({run_id}): {err}");
+        }
+    }
+
+    fn set_status(&mut self, status: RunStatus, taint: DataTaint) {
+        self.last_taint = taint;
+        let Some(run_id) = self.run_id.as_deref() else {
+            return;
+        };
+        let flags = taint.to_flag_string();
+        if let Err(err) = self
+            .database
+            .update_agent_run_status(run_id, status.as_str(), &flags)
+        {
+            log::debug!("更新 Agent Run 状态失败 ({run_id}): {err}");
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_audit(
+        &mut self,
+        tool_name: &str,
+        risk_tier: &str,
+        decision: &str,
+        taint: DataTaint,
+        ok: bool,
+        duration_ms: i64,
+        reason: Option<&str>,
+    ) {
+        self.last_taint = taint;
+        let Some(run_id) = self.run_id.as_deref() else {
+            return;
+        };
+        let flags = taint.to_flag_string();
+        if let Err(err) = self.database.record_agent_tool_audit(
+            run_id,
+            tool_name,
+            risk_tier,
+            decision,
+            &flags,
+            ok,
+            duration_ms,
+            reason,
+        ) {
+            log::debug!("写入 Agent 工具审计失败 ({run_id}): {err}");
+        }
+    }
+
+    fn record_unregistered_tool_denial(&mut self, taint: DataTaint, duration_ms: i64) {
+        self.last_taint = taint;
+        self.tool_call_count += 1;
+        self.event(
+            HarnessEventKind::PolicyEvaluated,
+            Some("<unregistered>"),
+            serde_json::json!({
+                "riskTier": "destructive",
+                "decision": "deny",
+                "taint": taint.to_flag_string(),
+            }),
+        );
+        self.record_audit(
+            "<unregistered>",
+            "destructive",
+            "deny",
+            taint,
+            false,
+            duration_ms,
+            Some("请求了未注册的工具"),
+        );
+        self.event(
+            HarnessEventKind::ToolCompleted,
+            Some("<unregistered>"),
+            serde_json::json!({
+                "ok": false,
+                "durationMs": duration_ms,
+                "taint": taint.to_flag_string(),
+            }),
+        );
+    }
+
+    fn finish(
+        &mut self,
+        status: RunStatus,
+        answer: Option<&str>,
+        taint: DataTaint,
+        error_message: Option<&str>,
+    ) {
+        self.finish_with_meta(status, answer, taint, error_message, false);
+    }
+
+    fn finish_with_meta(
+        &mut self,
+        status: RunStatus,
+        answer: Option<&str>,
+        taint: DataTaint,
+        error_message: Option<&str>,
+        truncated: bool,
+    ) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        self.last_taint = taint;
+        let Some(run_id) = self.run_id.clone() else {
+            return;
+        };
+        let kind = match status {
+            RunStatus::Cancelled => HarnessEventKind::RunCancelled,
+            RunStatus::Failed | RunStatus::TimedOut => HarnessEventKind::RunFailed,
+            _ => HarnessEventKind::RunCompleted,
+        };
+        self.event(
+            kind,
+            None,
+            serde_json::json!({
+                "status": status.as_str(),
+                "toolCalls": self.tool_call_count,
+                "compactions": self.compaction_count,
+                "truncated": truncated,
+            }),
+        );
+        // Run 账本默认不重复落盘模型回答正文（完整对话已存于 assistant_messages），
+        // 仅保留脱敏后的状态、污点、工具计数与脱敏错误信息，避免隐私内容冗余进入账本与备份。
+        let _ = answer;
+        let scrubbed_error =
+            error_message.map(|msg| Self::sanitize_text(self.privacy_filter.as_deref(), msg, 240));
+        let flags = taint.to_flag_string();
+        if let Err(err) = self.database.finish_agent_run(
+            &run_id,
+            status.as_str(),
+            None,
+            &flags,
+            self.compaction_count,
+            self.tool_call_count,
+            scrubbed_error.as_deref(),
+        ) {
+            log::debug!("结束 Agent Run 账本失败 ({run_id}): {err}");
+        }
+    }
+}
+
+impl Drop for RunLedgerRecorder<'_> {
+    fn drop(&mut self) {
+        if !self.finished && self.run_id.is_some() {
+            self.finish_with_meta(
+                RunStatus::Cancelled,
+                None,
+                self.last_taint,
+                Some("执行提前中止"),
+                false,
+            );
+        }
+    }
+}
+
+/// 将上下文压缩规划应用到 `messages`，保持跨模型（含 Claude/Gemini）的严格角色交替。
+fn apply_context_compaction(
+    messages: &mut Vec<Message>,
+    system_prompt: &str,
+    budget: &ContextBudget,
+) -> Option<(usize, usize, usize)> {
+    let items: Vec<CompactionItem> = messages
+        .iter()
+        .map(|msg| CompactionItem {
+            role: msg.role.clone(),
+            text: msg
+                .content
+                .clone()
+                .or_else(|| msg.tool_calls.as_ref().map(|v| v.to_string()))
+                .unwrap_or_default(),
+            is_tool_call: msg.role == "assistant" && msg.tool_calls.is_some(),
+            is_tool_result: msg.role == "tool",
+        })
+        .collect();
+
+    let plan = plan_compaction(&items, system_prompt, budget)?;
+    let drop_count = plan.drop_prefix_count.min(messages.len());
+    if drop_count == 0 {
+        return None;
+    }
+
+    let tail = messages.split_off(drop_count);
+    messages.clear();
+
+    if let Some(first_kept) = tail.first() {
+        if first_kept.role == "user" && first_kept.tool_call_id.is_none() {
+            let mut merged_tail = tail;
+            let existing = merged_tail[0].content.clone().unwrap_or_default();
+            merged_tail[0].content = Some(format!("{}\n\n{}", plan.summary_text, existing));
+            messages.extend(merged_tail);
+        } else {
+            messages.push(Message::user(&plan.summary_text));
+            messages.extend(tail);
+        }
+    } else {
+        messages.push(Message::user(&plan.summary_text));
+    }
+
+    Some((
+        drop_count,
+        plan.estimated_tokens_before,
+        plan.estimated_tokens_after,
+    ))
+}
+
+/// 在模型调用（含收束 wrap_up）前按需执行确定性上下文压缩，并写入运行账本事件。
+fn maybe_compact_messages(
+    messages: &mut Vec<Message>,
+    system_prompt: &str,
+    budget: &ContextBudget,
+    ledger: &mut RunLedgerRecorder<'_>,
+) {
+    if let Some((dropped, tokens_before, tokens_after)) =
+        apply_context_compaction(messages, system_prompt, budget)
+    {
+        ledger.compaction_count += 1;
+        ledger.event(
+            HarnessEventKind::ContextCompacted,
+            None,
+            serde_json::json!({
+                "droppedMessages": dropped,
+                "tokensBefore": tokens_before,
+                "tokensAfter": tokens_after,
+            }),
+        );
+    }
+}
+
 /// Agent 执行器
 pub struct AgentExecutor;
 
@@ -264,7 +623,25 @@ impl AgentExecutor {
         let semantic_ready = runtime.semantic_search.is_some();
         let (actions_enabled, semantic_enabled) =
             resolve_executor_capabilities(request_mode, actions_ready, semantic_ready);
-        ToolRegistry::for_request(request_mode, web_tools, actions_enabled, semantic_enabled)
+        let mut registry =
+            ToolRegistry::for_request(request_mode, web_tools, actions_enabled, semantic_enabled);
+        let has_skills = runtime
+            .skill_catalog
+            .as_ref()
+            .is_some_and(|catalog| !catalog.is_empty());
+        registry.register_harness_tools(
+            request_mode,
+            web_tools.is_some(),
+            runtime.artifacts.is_some(),
+            has_skills,
+        );
+        // 外部 MCP 工具仅在桌面工作复盘模式且具备交互审批桥时注册，彻底阻断无确认通道与普通聊天暴露。
+        if request_mode == AssistantRequestMode::WorkReview && runtime.confirm.is_some() {
+            if let Some(bridge) = runtime.mcp_bridge.as_ref() {
+                registry.register_mcp_tools(request_mode, bridge.discovered_tools());
+            }
+        }
+        registry
     }
 
     /// 运行 Agent 循环
@@ -292,30 +669,56 @@ impl AgentExecutor {
         ignored_apps: Vec<String>,
         excluded_domains: Vec<String>,
         web_tools: Option<WebToolsConfig>,
-        runtime: AssistantRuntime,
+        mut runtime: AssistantRuntime,
         event_tx: Option<StreamEventSender>,
         deadline: Deadline,
     ) -> Result<AgentResult, AgentRunError> {
+        // 确保本轮具备内存 Artifact 存储与上下文预算，供长工具输出截断与分页读取使用。
+        let artifact_store = runtime
+            .artifacts
+            .get_or_insert_with(ArtifactStore::new)
+            .clone();
+        let context_budget = runtime.context_budget.unwrap_or_default();
+
         // 行动能力：需要 ActionBridge + ConfirmBridge 同时就绪（缺确认桥时宁可不注册，
         // 保证"写操作必须用户确认"的承诺不被绕过）。
         let actions_ready = runtime.actions.is_some() && runtime.confirm.is_some();
         let semantic_ready = runtime.semantic_search.is_some();
         let (actions_enabled, semantic_enabled) =
             resolve_executor_capabilities(request_mode, actions_ready, semantic_ready);
-        let sys = build_executor_system_prompt(
+        let mut sys = build_executor_system_prompt(
             request_mode,
             system_prompt.unwrap_or_else(|| default_system_prompt(request_mode)),
             web_tools.is_some(),
             actions_enabled,
             semantic_enabled,
         );
+        // 渐进式个人技能目录仅注入工作复盘模式；普通聊天严禁感知或加载本机技能。
+        if request_mode == AssistantRequestMode::WorkReview {
+            if let Some(catalog) = runtime.skill_catalog.as_ref() {
+                if let Some(catalog_prompt) = catalog.build_catalog_prompt() {
+                    sys.push_str(&catalog_prompt);
+                }
+            }
+        }
         let max_iter = max_iterations.unwrap_or(DEFAULT_MAX_ITERATIONS);
+
+        // 启动持久化运行账本（仅当调用方设置 run_source 时落盘）。
+        let mut ledger = RunLedgerRecorder::start(
+            database,
+            &runtime,
+            request_mode,
+            &model_config.model,
+            question,
+        );
 
         // 从模式对应的最小权限工具集开始注册，避免普通聊天先获得本机工具再删除。
         let registry =
             Self::build_tool_registry_for_runtime(request_mode, web_tools.as_ref(), &runtime);
         let tools = registry.to_openai_tools();
         let mut cancel_rx = runtime.cancel.clone();
+        let channel_caps =
+            ChannelCapabilities::desktop(runtime.confirm.is_some(), runtime.actions.is_some());
         let tool_context = super::tools::ToolContext {
             database,
             ignored_apps,
@@ -331,17 +734,25 @@ impl AgentExecutor {
 
         let mut tool_labels = Vec::new();
         let wrap_reserve = Deadline::wrap_up_reserve(deadline.remaining());
-        // 本轮上下文是否已包含本机数据。工作复盘模式的系统提示词本身就可能带有实时上下文
-        // （前台窗口标题、今日应用用时）与长期记忆，因此只要注册了本机工具就视为已含本机数据，
-        // fetch_url 一律需要用户确认，避免被注入内容诱导把数据拼进外部链接。
-        let mut local_data_seen = registry.has_local_data_tools();
+        // 单次 Run 数据污点状态：工作复盘模式的系统提示词可能已包含实时上下文与长期记忆，
+        // 只要注册了本机工具即视为已含本机敏感数据，任何外发工具均经策略引擎强制审批或拒绝。
+        let mut taint = DataTaint {
+            local_work_data: registry.has_local_data_tools(),
+            user_memory: request_mode == AssistantRequestMode::WorkReview
+                && tool_context.runtime.has_recalled_user_memory,
+            external_untrusted: false,
+        };
 
         for _ in 0..max_iter {
-            ensure_event_receiver_open(&event_tx)?;
+            if let Err(err) = ensure_event_receiver_open(&event_tx) {
+                ledger.finish(RunStatus::Cancelled, None, taint, Some("事件接收端已关闭"));
+                return Err(err);
+            }
 
             // 用户主动停止：在新一轮开始前收束（模型/工具在途时由 select 提前打断）。
             if is_cancelled(&cancel_rx) {
                 let references = tool_context.take_all_references();
+                ledger.finish(RunStatus::Cancelled, Some(CANCELLED_ANSWER), taint, None);
                 emit_done(&event_tx, CANCELLED_ANSWER, &references, &tool_labels).await?;
                 return Ok(AgentResult {
                     answer: CANCELLED_ANSWER.to_string(),
@@ -351,9 +762,10 @@ impl AgentExecutor {
             }
 
             // 时长预算：只在新一轮开始前检查。剩余时间进入收束预留后，
-            // 走无工具的最后一次模型调用，把已有工具结果收成答案。
+            // 先按需压缩上下文，再走无工具的最后一次模型调用，把已有工具结果收成答案。
             if deadline.remaining() <= wrap_reserve {
-                return Self::wrap_up(
+                maybe_compact_messages(&mut messages, &sys, &context_budget, &mut ledger);
+                let result = Self::wrap_up(
                     model_config,
                     &sys,
                     &mut messages,
@@ -364,12 +776,29 @@ impl AgentExecutor {
                     deadline,
                 )
                 .await;
+                match &result {
+                    Ok(res) => {
+                        let status = if res.answer == CANCELLED_ANSWER {
+                            RunStatus::Cancelled
+                        } else {
+                            RunStatus::Completed
+                        };
+                        ledger.finish(status, Some(&res.answer), taint, None);
+                    }
+                    Err(err) => {
+                        ledger.finish(RunStatus::Failed, None, taint, Some(&format!("{err:?}")));
+                    }
+                }
+                return result;
             }
+
+            // 上下文预算检查与确定性压缩（保持 tool_call/tool_result 成对及角色交替）。
+            maybe_compact_messages(&mut messages, &sys, &context_budget, &mut ledger);
 
             // ── 第 1 步：调用 LLM（Stage 2） ──
             // 有事件通道时走 token 流式（文本增量实时推给前端，批量合并降低
             // IPC 频率）；无通道（单测/非流式调用方）保持原非流式路径。
-            let response_result = await_or_cancelled(&event_tx, &mut cancel_rx, async {
+            let response_result = match await_or_cancelled(&event_tx, &mut cancel_rx, async {
                 if event_tx.is_some() {
                     let mut batcher = TokenBatcher::new();
                     let result = {
@@ -390,13 +819,21 @@ impl AgentExecutor {
                     model::chat_with_tools(model_config, &sys, &messages, &tools, deadline).await
                 }
             })
-            .await?;
+            .await
+            {
+                Ok(outcome) => outcome,
+                Err(err) => {
+                    ledger.finish(RunStatus::Cancelled, None, taint, Some("事件接收端已关闭"));
+                    return Err(err);
+                }
+            };
 
             // 模型调用期间被用户停止 → 立即收束
             let response_result = match response_result {
                 AwaitOutcome::Done(r) => r,
                 AwaitOutcome::Cancelled => {
                     let references = tool_context.take_all_references();
+                    ledger.finish(RunStatus::Cancelled, Some(CANCELLED_ANSWER), taint, None);
                     emit_done(&event_tx, CANCELLED_ANSWER, &references, &tool_labels).await?;
                     return Ok(AgentResult {
                         answer: CANCELLED_ANSWER.to_string(),
@@ -408,10 +845,18 @@ impl AgentExecutor {
 
             // 若模型执行期间前端已离开，关闭原因优先于模型结果：不能把它误判为
             // 模型失败后继续进入 FastPath 降级，也不能继续执行模型返回的工具调用。
-            ensure_event_receiver_open(&event_tx)?;
-            let response = response_result.map_err(|e| {
-                AgentRunError::Execution(AppError::Analysis(format!("Agent 调用失败: {e}")))
-            })?;
+            if let Err(err) = ensure_event_receiver_open(&event_tx) {
+                ledger.finish(RunStatus::Cancelled, None, taint, Some("事件接收端已关闭"));
+                return Err(err);
+            }
+            let response = match response_result {
+                Ok(r) => r,
+                Err(e) => {
+                    let msg = format!("Agent 调用失败: {e}");
+                    ledger.finish(RunStatus::Failed, None, taint, Some(&msg));
+                    return Err(AgentRunError::Execution(AppError::Analysis(msg)));
+                }
+            };
 
             // ── 第 2 步：判断 LLM 的意图 ──
             match response.stop_reason {
@@ -419,6 +864,7 @@ impl AgentExecutor {
                     // LLM 给出最终回答 → 循环结束
                     let content = response.content.unwrap_or_default();
                     let references = tool_context.take_all_references();
+                    ledger.finish(RunStatus::Completed, Some(&content), taint, None);
                     emit_done(&event_tx, &content, &references, &tool_labels).await?;
                     return Ok(AgentResult {
                         answer: content,
@@ -440,6 +886,7 @@ impl AgentExecutor {
                             "模型未返回可执行的工具调用，请稍后重试。".to_string()
                         });
                         let references = tool_context.take_all_references();
+                        ledger.finish(RunStatus::Completed, Some(&content), taint, None);
                         emit_done(&event_tx, &content, &references, &tool_labels).await?;
                         return Ok(AgentResult {
                             answer: content,
@@ -476,41 +923,90 @@ impl AgentExecutor {
                                 .await?;
                             }
                             let ref_base = tool_context.references_len();
+                            let tool_started = Instant::now();
 
-                            // 行动工具：先请求用户确认，被拒绝/超时则不执行。
-                            // 读取过本机数据后的 fetch_url 同样需要确认；无确认通道（如 Bot）时直接拒绝。
+                            // 统一经 HarnessPolicyEngine 执行权限与污点评估。
                             let mut denied_result: Option<String> = None;
-                            if let Some((tool, _)) = &trusted_metadata {
-                                let guarded_fetch =
-                                    requires_confirmation_after_local_data(tool, local_data_seen);
-                                if guarded_fetch && tool_context.runtime.confirm.is_none() {
-                                    denied_result = Some(
-                                        "本轮已读取本机工作记录，出于隐私保护，未经用户确认不能访问外部链接。请直接基于已有信息回答。"
-                                            .to_string(),
-                                    );
-                                } else if requires_confirmation(tool) || guarded_fetch {
-                                    match Self::request_confirmation(
-                                        tool,
-                                        &tc.arguments,
-                                        &tool_context,
-                                        &event_tx,
-                                        &mut cancel_rx,
-                                        deadline,
-                                    )
-                                    .await?
-                                    {
-                                        ConfirmDecision::Approved => {}
-                                        ConfirmDecision::Denied => {
-                                            denied_result = Some(
-                                                "用户拒绝了该操作。不要重试，也不要换个说法再次发起，直接继续对话。"
-                                                    .to_string(),
-                                            );
-                                        }
-                                        ConfirmDecision::TimedOut => {
-                                            denied_result = Some(
-                                                "确认请求超时，用户未批准该操作。不要重试，直接继续对话。"
-                                                    .to_string(),
-                                            );
+                            let mut policy_decision_label = "allow";
+                            let mut policy_reason: Option<String> = None;
+                            let tool_spec = trusted_metadata
+                                .as_ref()
+                                .map(|(tool, _)| capability_spec(tool));
+
+                            if let (Some((tool, _)), Some(spec)) = (&trusted_metadata, tool_spec) {
+                                ledger.tool_call_count += 1;
+                                let decision =
+                                    HarnessPolicyEngine::evaluate(&spec, taint, channel_caps);
+                                policy_decision_label = decision.as_str();
+                                ledger.event(
+                                    HarnessEventKind::PolicyEvaluated,
+                                    Some(tool),
+                                    serde_json::json!({
+                                        "riskTier": spec.risk_tier.as_str(),
+                                        "decision": policy_decision_label,
+                                        "taint": taint.to_flag_string(),
+                                    }),
+                                );
+                                match decision {
+                                    PolicyDecision::Allow => {}
+                                    PolicyDecision::Deny { reason } => {
+                                        policy_reason = Some(reason.clone());
+                                        denied_result = Some(reason);
+                                    }
+                                    PolicyDecision::RequireApproval {
+                                        reason,
+                                        taint_triggered,
+                                    } => {
+                                        ledger.set_status(RunStatus::WaitingApproval, taint);
+                                        ledger.event(
+                                            HarnessEventKind::ApprovalRequested,
+                                            Some(tool),
+                                            serde_json::json!({
+                                                "taintTriggered": taint_triggered,
+                                                "reason": reason,
+                                            }),
+                                        );
+                                        let confirm_outcome = Self::request_confirmation(
+                                            tool,
+                                            &tc.arguments,
+                                            &tool_context,
+                                            &event_tx,
+                                            &mut cancel_rx,
+                                            deadline,
+                                        )
+                                        .await?;
+                                        ledger.set_status(RunStatus::Running, taint);
+                                        let outcome_label = match confirm_outcome {
+                                            ConfirmDecision::Approved => "approved",
+                                            ConfirmDecision::Denied => "denied",
+                                            ConfirmDecision::TimedOut => "timed_out",
+                                        };
+                                        ledger.event(
+                                            HarnessEventKind::ApprovalResolved,
+                                            Some(tool),
+                                            serde_json::json!({ "outcome": outcome_label }),
+                                        );
+                                        match confirm_outcome {
+                                            ConfirmDecision::Approved => {
+                                                policy_decision_label = "approved";
+                                                policy_reason = None;
+                                            }
+                                            ConfirmDecision::Denied => {
+                                                policy_decision_label = "denied";
+                                                policy_reason = Some("用户拒绝".to_string());
+                                                denied_result = Some(
+                                                    "用户拒绝了该操作。不要重试，也不要换个说法再次发起，直接继续对话。"
+                                                        .to_string(),
+                                                );
+                                            }
+                                            ConfirmDecision::TimedOut => {
+                                                policy_decision_label = "timed_out";
+                                                policy_reason = Some("确认超时".to_string());
+                                                denied_result = Some(
+                                                    "确认请求超时，用户未批准该操作。不要重试，直接继续对话。"
+                                                        .to_string(),
+                                                );
+                                            }
                                         }
                                     }
                                 }
@@ -535,6 +1031,12 @@ impl AgentExecutor {
                                     }
                                     AwaitOutcome::Cancelled => {
                                         let references = tool_context.take_all_references();
+                                        ledger.finish(
+                                            RunStatus::Cancelled,
+                                            Some(CANCELLED_ANSWER),
+                                            taint,
+                                            None,
+                                        );
                                         emit_done(
                                             &event_tx,
                                             CANCELLED_ANSWER,
@@ -553,6 +1055,33 @@ impl AgentExecutor {
                                 ("工具执行失败: 请求了未注册的工具。".to_string(), false)
                             };
 
+                            let duration_ms = tool_started.elapsed().as_millis() as i64;
+                            if let (Some((tool, _)), Some(spec)) = (&trusted_metadata, tool_spec) {
+                                HarnessPolicyEngine::propagate_taint(&mut taint, &spec, ok);
+                                ledger.record_audit(
+                                    tool,
+                                    spec.risk_tier.as_str(),
+                                    policy_decision_label,
+                                    taint,
+                                    ok,
+                                    duration_ms,
+                                    policy_reason.as_deref(),
+                                );
+                                ledger.event(
+                                    HarnessEventKind::ToolCompleted,
+                                    Some(tool),
+                                    serde_json::json!({
+                                        "ok": ok,
+                                        "durationMs": duration_ms,
+                                        "taint": taint.to_flag_string(),
+                                    }),
+                                );
+                            } else {
+                                // 未注册/被撤销的工具名可能是提示词注入探测：fail-closed 拒绝并落盘固定占位审计，
+                                // 绝不将模型输出的原始未注册工具名写入 SQLite。
+                                ledger.record_unregistered_tool_denial(taint, duration_ms);
+                            }
+
                             // 步骤结束：推送 StepResult（携带本轮新增引用与可信状态元数据）。
                             // digest 会被前端持久化，因此禁止放入任何工具返回正文。
                             let new_refs = tool_context.drain_from(ref_base);
@@ -570,18 +1099,43 @@ impl AgentExecutor {
                                 .await?;
                             }
 
-                            // ③ 追加工具结果到对话历史（携带工具名，Gemini 需要）
-                            // 本机工具输出含采集到的标题 / OCR / 网址（可能混入第三方网页文本），
-                            // 包进数据边界，提示模型其中任何"指令"都只是数据。
+                            // ③ 超长输出截断并落入本轮内存 ArtifactStore（read_run_artifact 除外防二次截断）
+                            let result = if ok {
+                                if let Some((tool, _)) = &trusted_metadata {
+                                    if tool != "read_run_artifact" {
+                                        let (clipped, artifact_id) = artifact_store
+                                            .truncate_tool_output(
+                                                tool,
+                                                &result,
+                                                context_budget.max_tool_result_chars,
+                                            );
+                                        if let Some(art_id) = artifact_id {
+                                            ledger.event(
+                                                HarnessEventKind::ArtifactStored,
+                                                Some(tool),
+                                                serde_json::json!({ "artifactId": art_id }),
+                                            );
+                                        }
+                                        clipped
+                                    } else {
+                                        result
+                                    }
+                                } else {
+                                    result
+                                }
+                            } else {
+                                result
+                            };
+
+                            // ④ 追加工具结果到对话历史（携带工具名，Gemini 需要）
+                            // 本机工具与 Artifact 切片可能含第三方网页文本，包进数据边界防提示词注入。
                             let is_local_tool = trusted_metadata
                                 .as_ref()
                                 .is_some_and(|(tool, _)| !is_web_tool(tool));
-                            if ok && is_local_tool {
-                                local_data_seen = true;
-                            }
-                            let already_wrapped = trusted_metadata
-                                .as_ref()
-                                .is_some_and(|(tool, _)| tool == "semantic_search");
+                            let already_wrapped =
+                                trusted_metadata.as_ref().is_some_and(|(tool, _)| {
+                                    tool == "semantic_search" || tool == "load_skill"
+                                });
                             let result = if ok && is_local_tool && !already_wrapped {
                                 wrap_local_record_content(&result)
                             } else {
@@ -598,11 +1152,18 @@ impl AgentExecutor {
                 }
 
                 StopReason::MaxTokens => {
-                    // Token 用完了，用已有内容回答
+                    // Token 用完了，用已有内容回答（事件中显式标记 truncated: true 供 Trace 区分）
                     let content = response
                         .content
                         .unwrap_or_else(|| "回答被截断，请尝试缩短问题。".to_string());
                     let references = tool_context.take_all_references();
+                    ledger.finish_with_meta(
+                        RunStatus::Completed,
+                        Some(&content),
+                        taint,
+                        None,
+                        true,
+                    );
                     emit_done(&event_tx, &content, &references, &tool_labels).await?;
                     return Ok(AgentResult {
                         answer: content,
@@ -615,8 +1176,9 @@ impl AgentExecutor {
             // 时长预算检查已上移到每轮开始处（超预算走 wrap_up 收束而非硬报超时）
         }
 
-        // ── 超过最大迭代次数：同样走收束路径，把已有工具结果转成答案 ──
-        Self::wrap_up(
+        // ── 超过最大迭代次数：先按需压缩上下文，再走收束路径，把已有工具结果转成答案 ──
+        maybe_compact_messages(&mut messages, &sys, &context_budget, &mut ledger);
+        let result = Self::wrap_up(
             model_config,
             &sys,
             &mut messages,
@@ -626,7 +1188,21 @@ impl AgentExecutor {
             &mut cancel_rx,
             deadline,
         )
-        .await
+        .await;
+        match &result {
+            Ok(res) => {
+                let status = if res.answer == CANCELLED_ANSWER {
+                    RunStatus::Cancelled
+                } else {
+                    RunStatus::Completed
+                };
+                ledger.finish(status, Some(&res.answer), taint, None);
+            }
+            Err(err) => {
+                ledger.finish(RunStatus::Failed, None, taint, Some(&format!("{err:?}")));
+            }
+        }
+        result
     }
 
     /// 收束路径：预算（时长/轮数）耗尽时，禁用工具做最后一次模型调用，
@@ -1339,5 +1915,297 @@ mod tests {
             suffix.contains("亚日级") || suffix.contains("暂不支持"),
             "suffix 应说明亚日级粒度限制，实际: {suffix}"
         );
+    }
+
+    #[test]
+    fn 普通聊天绝不注册load_skill而工作复盘按需注册技能与artifact工具() {
+        let root = std::env::temp_dir().join(format!("wr-exec-skill-{}", uuid::Uuid::new_v4()));
+        let skill_dir = root.join("daily-brief");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: daily-brief\ndescription: 晨间复盘\n---\n1. 查看昨日日报\n",
+        )
+        .unwrap();
+        let catalog =
+            Arc::new(work_review_agent_harness::skills::SkillCatalog::load_from_dir(&root));
+        let runtime = AssistantRuntime {
+            artifacts: Some(ArtifactStore::new()),
+            skill_catalog: Some(catalog),
+            ..Default::default()
+        };
+
+        let general_registry = AgentExecutor::build_tool_registry_for_runtime(
+            AssistantRequestMode::GeneralChat,
+            None,
+            &runtime,
+        );
+        let general_names: Vec<String> = general_registry
+            .to_openai_tools()
+            .into_iter()
+            .filter_map(|v| v["function"]["name"].as_str().map(str::to_string))
+            .collect();
+        assert!(!general_names.contains(&"load_skill".to_string()));
+        assert!(!general_names.contains(&"read_run_artifact".to_string()));
+        assert!(!general_registry.has_local_data_tools());
+
+        let work_registry = AgentExecutor::build_tool_registry_for_runtime(
+            AssistantRequestMode::WorkReview,
+            None,
+            &runtime,
+        );
+        let work_names: Vec<String> = work_registry
+            .to_openai_tools()
+            .into_iter()
+            .filter_map(|v| v["function"]["name"].as_str().map(str::to_string))
+            .collect();
+        assert!(work_names.contains(&"load_skill".to_string()));
+        assert!(work_names.contains(&"read_run_artifact".to_string()));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn 上下文压缩应保持角色交替且不拆散工具调用对() {
+        let big = "这是一段用于触发上下文压缩的长对话文本。".repeat(35);
+        let tc = ToolCall {
+            id: "call_1".to_string(),
+            name: "query_activities".to_string(),
+            arguments: serde_json::json!({}),
+        };
+        let mut messages = vec![
+            Message::user(&big),
+            Message::assistant(&big),
+            Message::user(&big),
+            Message::assistant_with_tool_calls(&[tc]),
+            Message::tool_result_named("call_1", &big, Some("query_activities")),
+            Message::user("请基于以上信息给出最终总结"),
+        ];
+        let budget = ContextBudget {
+            max_context_tokens: 700,
+            compaction_trigger_ratio: 0.5,
+            max_tool_result_chars: 1000,
+            preserve_recent_messages: 2,
+            max_compacted_summary_chars: 600,
+        };
+
+        let stats =
+            apply_context_compaction(&mut messages, "system", &budget).expect("超预算时应执行压缩");
+        assert_eq!(stats.0, 3);
+        assert!(stats.2 < stats.1);
+        assert_eq!(messages[0].role, "user");
+        assert!(messages[0]
+            .content
+            .as_deref()
+            .unwrap_or_default()
+            .contains("早期上下文压缩摘要"));
+        assert_eq!(messages[1].role, "assistant");
+        assert!(messages[1].tool_calls.is_some());
+        assert_eq!(messages[2].role, "tool");
+    }
+
+    #[test]
+    fn run账本应由服务端生成独立run_id且未注册工具应写入fail_closed拒绝审计() {
+        let db = Database::new(std::path::Path::new(":memory:")).expect("创建内存库失败");
+        let runtime = AssistantRuntime {
+            client_request_id: Some("dup-client-req-1".to_string()),
+            run_source: Some("desktop".to_string()),
+            ..Default::default()
+        };
+
+        let mut rec1 = RunLedgerRecorder::start(
+            &db,
+            &runtime,
+            AssistantRequestMode::GeneralChat,
+            "gpt-test",
+            "第一条请求",
+        );
+        let mut rec2 = RunLedgerRecorder::start(
+            &db,
+            &runtime,
+            AssistantRequestMode::GeneralChat,
+            "gpt-test",
+            "第二条同 client_request_id 请求",
+        );
+
+        let id1 = rec1.run_id.clone().expect("应生成首个服务端 run_id");
+        let id2 = rec2.run_id.clone().expect("应生成第二个服务端 run_id");
+        assert_ne!(id1, id2, "重复的客户端 request_id 不得碰撞服务端 run_id");
+        assert_ne!(id1, "dup-client-req-1");
+
+        rec1.record_unregistered_tool_denial(DataTaint::default(), 3);
+        rec1.finish(
+            RunStatus::Completed,
+            Some("完成"),
+            DataTaint::default(),
+            None,
+        );
+        rec2.finish(
+            RunStatus::Completed,
+            Some("完成"),
+            DataTaint::default(),
+            None,
+        );
+
+        let trace = db
+            .get_agent_run_trace(&id1)
+            .expect("读取 trace 失败")
+            .expect("应存在 trace");
+        assert_eq!(trace.run.tool_call_count, 1);
+        assert_eq!(trace.audits.len(), 1);
+        assert_eq!(trace.audits[0].tool_name, "<unregistered>");
+        assert_eq!(trace.audits[0].risk_tier, "destructive");
+        assert_eq!(trace.audits[0].decision, "deny");
+        assert!(!trace.audits[0].ok);
+    }
+
+    #[test]
+    fn 未显式结束的run账本在drop时应自动收束避免滞留running() {
+        let db = Database::new(std::path::Path::new(":memory:")).expect("创建内存库失败");
+        let runtime = AssistantRuntime {
+            run_source: Some("desktop".to_string()),
+            ..Default::default()
+        };
+        let run_id = {
+            let mut rec = RunLedgerRecorder::start(
+                &db,
+                &runtime,
+                AssistantRequestMode::WorkReview,
+                "gpt-test",
+                "中途断开测试",
+            );
+            rec.set_status(
+                RunStatus::WaitingApproval,
+                DataTaint {
+                    local_work_data: true,
+                    ..Default::default()
+                },
+            );
+            rec.run_id.clone().expect("应存在 run_id")
+            // 模拟 `?` 提前返回，未调用 finish
+        };
+
+        let trace = db
+            .get_agent_run_trace(&run_id)
+            .expect("读取 trace 失败")
+            .expect("应存在 trace");
+        assert_eq!(trace.run.status, "cancelled");
+        assert!(trace.run.finished_at.is_some());
+        assert_eq!(trace.run.taint_flags, "local_work_data");
+    }
+
+    #[test]
+    fn run账本输入和错误落盘不得残留多词口令() {
+        let db = Database::new(std::path::Path::new(":memory:")).unwrap();
+        let runtime = AssistantRuntime {
+            run_source: Some("desktop".into()),
+            privacy_filter: Some(Arc::new(
+                work_review_core::privacy::PrivacyFilter::from_config(
+                    &work_review_core::config::PrivacyConfig::default(),
+                ),
+            )),
+            ..Default::default()
+        };
+        for raw in [
+            r#"{"passcode":"purple horse battery staple"}"#,
+            r#"{"token":"alpha beta gamma"}"#,
+            r#"{"client_secret":"purple horse battery staple"}"#,
+        ] {
+            let mut recorder = RunLedgerRecorder::start(
+                &db,
+                &runtime,
+                AssistantRequestMode::WorkReview,
+                "local-test",
+                raw,
+            );
+            let run_id = recorder.run_id.clone().unwrap();
+            recorder.finish(RunStatus::Failed, None, DataTaint::default(), Some(raw));
+            let trace = db.get_agent_run_trace(&run_id).unwrap().unwrap();
+            for preview in [
+                &trace.run.input_preview,
+                trace.run.error_message.as_ref().unwrap(),
+            ] {
+                for word in [
+                    "purple", "horse", "battery", "staple", "alpha", "beta", "gamma",
+                ] {
+                    assert!(!preview.contains(word), "账本残留口令: {preview}");
+                }
+            }
+            assert!(trace.run.answer_preview.is_none());
+        }
+    }
+
+    #[test]
+    fn run账本落盘应对敏感词与凭证脱敏且不重复存储回答正文() {
+        let db = Database::new(std::path::Path::new(":memory:")).expect("创建内存库失败");
+        let mut privacy = work_review_core::config::PrivacyConfig::default();
+        privacy
+            .excluded_keywords
+            .push("TopSecretProject".to_string());
+        let runtime = AssistantRuntime {
+            run_source: Some("desktop".to_string()),
+            privacy_filter: Some(Arc::new(
+                work_review_core::privacy::PrivacyFilter::from_config(&privacy),
+            )),
+            ..Default::default()
+        };
+
+        // 场景 1：命中用户配置的 excluded_keywords 时整段预览按统一策略脱敏，不泄露敏感词与周边令牌
+        let mut rec1 = RunLedgerRecorder::start(
+            &db,
+            &runtime,
+            AssistantRequestMode::WorkReview,
+            "gpt-test",
+            "帮我查 TopSecretProject 和 Bearer secret_tok_999 的进度",
+        );
+        let run_id1 = rec1.run_id.clone().expect("应存在 run_id");
+        rec1.finish(
+            RunStatus::Failed,
+            Some("模型回答正文不应重复写入账本"),
+            DataTaint::default(),
+            Some("连接失败: api_key=sk-proj-1234567890abcdef TopSecretProject"),
+        );
+
+        let trace1 = db
+            .get_agent_run_trace(&run_id1)
+            .expect("读取 trace 失败")
+            .expect("应存在 trace");
+        assert_eq!(
+            trace1.run.input_preview,
+            work_review_core::privacy::ANONYMIZED_TITLE_PLACEHOLDER
+        );
+        assert!(trace1.run.answer_preview.is_none());
+        assert_eq!(
+            trace1.run.error_message.as_deref(),
+            Some(work_review_core::privacy::ANONYMIZED_TITLE_PLACEHOLDER)
+        );
+
+        // 场景 2：未命中 excluded_keywords 时保留正常语义并精准遮蔽手机号、Bearer 与 API Key
+        let mut rec2 = RunLedgerRecorder::start(
+            &db,
+            &runtime,
+            AssistantRequestMode::WorkReview,
+            "gpt-test",
+            "今天项目复盘 联系 13812345678 令牌 Bearer secret_tok_999",
+        );
+        let run_id2 = rec2.run_id.clone().expect("应存在 run_id");
+        rec2.finish(
+            RunStatus::Failed,
+            Some("回答正文同样不重复落盘"),
+            DataTaint::default(),
+            Some("网关报错: api_key=sk-proj-1234567890abcdef 超时"),
+        );
+
+        let trace2 = db
+            .get_agent_run_trace(&run_id2)
+            .expect("读取 trace 失败")
+            .expect("应存在 trace");
+        assert!(trace2.run.input_preview.contains("今天项目复盘"));
+        assert!(!trace2.run.input_preview.contains("13812345678"));
+        assert!(!trace2.run.input_preview.contains("secret_tok_999"));
+        assert!(trace2.run.answer_preview.is_none());
+        let err_msg2 = trace2.run.error_message.as_deref().unwrap_or("");
+        assert!(err_msg2.contains("网关报错"));
+        assert!(!err_msg2.contains("sk-proj-1234567890abcdef"));
     }
 }

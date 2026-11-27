@@ -2387,6 +2387,7 @@ pub async fn chat_work_assistant(
     date_from: Option<String>,
     date_to: Option<String>,
     request_id: Option<String>,
+    conversation_id: Option<i64>,
     on_event: tauri::ipc::Channel<crate::agent::StreamEvent>,
     app: tauri::AppHandle,
     state: State<'_, Arc<Mutex<AppState>>>,
@@ -2436,6 +2437,7 @@ pub async fn chat_work_assistant(
     // 从 AppState 中 clone Database + 收集隐私过滤器（Arc 引用计数 +1，可跨 await）
     let (
         database,
+        data_dir,
         ignored_apps,
         excluded_domains,
         web_tools,
@@ -2456,6 +2458,7 @@ pub async fn chat_work_assistant(
         };
         (
             s.database.clone(),
+            s.data_dir.clone(),
             ignored_apps,
             excluded_domains,
             web_tools,
@@ -2537,6 +2540,32 @@ pub async fn chat_work_assistant(
     } else {
         None
     };
+    let (skill_catalog, mcp_bridge) = if work_review_mode {
+        let skills_dir = data_dir.join("skills");
+        let self_api_port = {
+            let guard = state_arc.lock().ok();
+            guard.map(|s| s.config.localhost_api_port)
+        };
+        let skills_fut = async move {
+            tokio::task::spawn_blocking(move || {
+                let catalog =
+                    work_review_agent_harness::skills::SkillCatalog::load_from_dir(&skills_dir);
+                (!catalog.is_empty()).then(|| std::sync::Arc::new(catalog))
+            })
+            .await
+            .ok()
+            .flatten()
+        };
+        let mcp_fut = async {
+            crate::agent::mcp_bridge::McpToolBridge::discover_for_data_dir(&data_dir, self_api_port)
+                .await
+                .map(std::sync::Arc::new)
+        };
+        tokio::join!(skills_fut, mcp_fut)
+    } else {
+        (None, None)
+    };
+
     let runtime = if work_review_mode {
         let context_state = state_arc.clone();
         let (privacy_filter, projects) = {
@@ -2566,10 +2595,24 @@ pub async fn chat_work_assistant(
             semantic_search,
             cancel: cancel_rx,
             privacy_filter,
+            client_request_id: request_id.clone(),
+            conversation_id,
+            run_source: Some("desktop".to_string()),
+            has_recalled_user_memory: !recalled_user_memories.is_empty(),
+            artifacts: Some(work_review_agent_harness::context::ArtifactStore::new()),
+            skill_catalog,
+            mcp_bridge,
+            context_budget: None,
         }
     } else {
         crate::agent::AssistantRuntime {
             cancel: cancel_rx,
+            client_request_id: request_id.clone(),
+            conversation_id,
+            run_source: Some("desktop".to_string()),
+            artifacts: web_tools
+                .is_some()
+                .then(work_review_agent_harness::context::ArtifactStore::new),
             ..Default::default()
         }
     };

@@ -149,6 +149,9 @@ pub fn default_tool_label(tool: &str) -> &'static str {
         "resume_recording" => "恢复记录",
         "open_timeline" => "打开时间线",
         "generate_daily_report" => "生成日报",
+        "read_run_artifact" => "读取产物片段",
+        "load_skill" => "加载个人技能",
+        other if other.starts_with("mcp__") => "调用外部 MCP 工具",
         _ => "处理中",
     }
 }

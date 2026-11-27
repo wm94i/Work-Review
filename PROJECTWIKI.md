@@ -146,4 +146,4 @@ flowchart LR
 
 ## 12. 变更日志
 
-- 参见 [CHANGELOG.md](./CHANGELOG.md)（本节与该文件双向关联；条目按 Keep a Changelog 维护）。当前稳定版本：[1.1.3](./CHANGELOG.md#113---2026-10-20)，当前开发候选版本：[1.2.0-rc.1](./CHANGELOG.md#120-rc1---2026-11-26)。本次候选版本见 [1.2.0-rc.1 发布记录](./CHANGELOG.md#120-rc1---2026-11-26)（隐私与安全加固 M1：配置同步 v2、对外脱敏、截图遮罩、Bot 发送者授权等，对应 ADR-20261122-01～03；效率扩展功能：专注指标、Git 提交关联、Obsidian Vault 导出、模型按场景分流；正确性与性能优化 M2：SQLite 范围查询与 WAL 只读连接、全局锁瘦身、计时完整性与监督重启、Windows 常驻 OCR 与 UIA 缓存、截图管线与 Rust 自动日报调度等；新功能 M3：项目工时归集、CSV/JSON 导出与一键备份恢复、无痕窗口跳过与未知 URL 降级、Agent 工具补齐、增量语义索引与后台自动索引、四语周报/月报周期复盘、四端 Bot 自然语言只读问答，对应 ADR-20261124-01～03；以及工程化与重构 M4：`main.rs` 模块化拆分与 `commands::handler()`、四端 Bot 统一入站管线、Svelte 5 + `svelte-spa-router@5` + `marked@18` 渐进迁移、Vitest + `@testing-library/svelte` + `mockIPC` 行为测试与 AST 安全不变量门禁，对应 ADR-20261124-04）。后续变更见 [Unreleased](./CHANGELOG.md#unreleased)。
+- 参见 [CHANGELOG.md](./CHANGELOG.md)。当前稳定版本：[1.2.0](./CHANGELOG.md#120---2026-11-27)，历史候选版 [1.2.0-rc.1](./CHANGELOG.md#120-rc1---2026-11-26) 保留。1.2.0 汇总 M1–M4、效率洞察与个人 Agent 工作流（运行追踪、个人技能、自主任务、外部 HTTP MCP）；SQLite Schema 为 4，升级、备份范围及已知验收边界见正式版记录。后续变更见 [Unreleased](./CHANGELOG.md#unreleased)。

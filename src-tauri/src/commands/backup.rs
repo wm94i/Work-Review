@@ -26,6 +26,14 @@ use super::shared::{collect_privacy_filters, filter_activities_by_privacy, is_is
 const BACKUP_FORMAT_VERSION: u32 = 1;
 const MAX_EXPORT_RANGE_DAYS: i64 = 3650;
 const EXPORT_ACTIVITY_PAGE_SIZE: usize = 5_000;
+// 恢复只替换备份支持的数据，本机技能、任务和凭证在切换及回滚时都留在原位。
+const RESTORE_PRESERVED_ENTRIES: &[&str] = &[
+    "localhost_api_token.txt",
+    "update_settings.json",
+    "skills",
+    "agent_routines.json",
+    "mcp_clients.json",
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -1130,15 +1138,6 @@ fn prepare_restore_backup_stage(
                 copy_regular_dir_files_recursive(&current_shots, &stage_dir.join("screenshots"))?;
             }
         }
-        // 保留其他本机非数据库受管文件（仅复制非符号链接常规文件）
-        for keep_file in ["localhost_api_token.txt", "update_settings.json"] {
-            let src = live_canonical.join(keep_file);
-            if let Ok(meta) = std::fs::symlink_metadata(&src) {
-                if !meta.file_type().is_symlink() && meta.file_type().is_file() {
-                    std::fs::copy(&src, stage_dir.join(keep_file))?;
-                }
-            }
-        }
 
         // 切换前先在暂存目录实际打开并初始化目标 SQLite 数据库，确保可正常打开与迁移后再动线上数据
         let staged_db_path = stage_dir.join("workreview.db");
@@ -1203,21 +1202,13 @@ fn rollback_live_data_dir_from_safety(
                 copy_regular_dir_files_recursive(&live_shots, &rollback_stage.join("screenshots"))?;
             }
         }
-        for keep_file in ["localhost_api_token.txt", "update_settings.json"] {
-            let src = live_canonical.join(keep_file);
-            if let Ok(meta) = std::fs::symlink_metadata(&src) {
-                if !meta.file_type().is_symlink() && meta.file_type().is_file() {
-                    std::fs::copy(&src, rollback_stage.join(keep_file))?;
-                }
-            }
-        }
         Ok(())
     })();
     if let Err(e) = prep {
         let _ = remove_migration_path(&rollback_stage);
         return Err(e);
     }
-    commit_migration_stage(&rollback_stage, live_canonical)
+    commit_migration_stage(&rollback_stage, live_canonical, RESTORE_PRESERVED_ENTRIES)
 }
 
 /// 纯文件系统与状态级恢复流程（便于单元/集成测试，不触发重启）。
@@ -1232,7 +1223,11 @@ pub(crate) fn restore_backup_into_data_dir(
         prepare_restore_backup_stage(backup_dir, live_data_dir, live_database, live_config)?;
 
     live_database.release_file_handles()?;
-    commit_migration_stage(&prepared.stage_dir, &prepared.live_canonical)?;
+    commit_migration_stage(
+        &prepared.stage_dir,
+        &prepared.live_canonical,
+        RESTORE_PRESERVED_ENTRIES,
+    )?;
 
     Ok((
         RestoreBackupResult {
@@ -1309,7 +1304,11 @@ pub async fn restore_backup(
         let mut guard = state.lock().map_err(|e| AppError::Unknown(e.to_string()))?;
         guard.database.release_file_handles()?;
 
-        if let Err(err) = commit_migration_stage(&prepared.stage_dir, &prepared.live_canonical) {
+        if let Err(err) = commit_migration_stage(
+            &prepared.stage_dir,
+            &prepared.live_canonical,
+            RESTORE_PRESERVED_ENTRIES,
+        ) {
             if let Ok(reopened) = Database::new(&prepared.live_canonical.join("workreview.db")) {
                 guard.database = reopened;
             }
@@ -1557,6 +1556,63 @@ mod tests {
         drop(db);
         drop(reopened);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn 恢复与回滚应原位保留个人技能自主任务及mcp凭证() {
+        let root = temp_test_dir("preserve-harness");
+        let live = root.join("live");
+        let source = root.join("source");
+        let backups = root.join("backups");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&backups).unwrap();
+        std::fs::create_dir_all(live.join("skills/weekly/assets/empty")).unwrap();
+        let files = [
+            ("skills/weekly/SKILL.md", "# 私人技能"),
+            ("skills/weekly/assets/.private", "hidden skill asset"),
+            ("agent_routines.json", r#"[{"id":"local-routine"}]"#),
+            ("mcp_clients.json", r#"[{"authToken":"local-only-token"}]"#),
+            ("localhost_api_token.txt", "local-api-token"),
+            ("update_settings.json", r#"{"channel":"rc"}"#),
+        ];
+        for (name, content) in files {
+            std::fs::write(live.join(name), content).unwrap();
+        }
+        let source_db = Database::new(&source.join("workreview.db")).unwrap();
+        let source_cfg = AppConfig {
+            theme: "dark".into(),
+            ..Default::default()
+        };
+        let backup =
+            create_backup_from_parts(&source_db, &source_cfg, &source, &backups, false, true)
+                .unwrap();
+        let live_db = Database::new(&live.join("workreview.db")).unwrap();
+        let live_cfg = AppConfig {
+            theme: "light".into(),
+            ..Default::default()
+        };
+        live_cfg.save(&live.join("config.json")).unwrap();
+        let (restored, cfg) =
+            restore_backup_into_data_dir(Path::new(&backup.backup_dir), &live, &live_db, &live_cfg)
+                .unwrap();
+        assert_eq!(cfg.theme, "dark");
+        for (name, content) in files {
+            assert_eq!(std::fs::read_to_string(live.join(name)).unwrap(), content);
+            assert!(!Path::new(&backup.backup_dir).join(name).exists());
+        }
+        assert!(live.join("skills/weekly/assets/empty").is_dir());
+
+        rollback_live_data_dir_from_safety(Path::new(&restored.safety_backup_dir), &live).unwrap();
+        let rolled_back: AppConfig =
+            serde_json::from_slice(&std::fs::read(live.join("config.json")).unwrap()).unwrap();
+        assert_eq!(rolled_back.theme, "light");
+        for (name, content) in files {
+            assert_eq!(std::fs::read_to_string(live.join(name)).unwrap(), content);
+        }
+        assert!(live.join("skills/weekly/assets/empty").is_dir());
+        drop(source_db);
+        drop(live_db);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

@@ -757,7 +757,7 @@ fn execute_add_column_if_missing(conn: &Connection, sql: &str) -> Result<()> {
 }
 
 /// 当前数据库 schema 版本（PRAGMA user_version）
-pub const CURRENT_SCHEMA_VERSION: i32 = 3;
+pub const CURRENT_SCHEMA_VERSION: i32 = 4;
 
 /// 以只读模式打开外部 SQLite 备份文件，校验完整性并返回其 `PRAGMA user_version`。
 pub fn inspect_sqlite_backup_schema_version(db_path: &Path) -> Result<i32> {
@@ -1166,6 +1166,70 @@ impl Database {
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_assistant_user_memories_policy_updated
              ON assistant_user_memories (recall_policy, updated_at DESC)",
+            [],
+        )?;
+
+        // === Personal Agent Harness 运行账本与工具审计（Schema v4） ===
+        // 严禁落盘原始 OCR / 完整工具正文，仅持久化脱敏短摘要与结构化元数据。
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS agent_runs (
+                id TEXT PRIMARY KEY,
+                conversation_id INTEGER,
+                source TEXT NOT NULL,
+                request_mode TEXT NOT NULL,
+                status TEXT NOT NULL,
+                model_name TEXT,
+                input_preview TEXT NOT NULL,
+                answer_preview TEXT,
+                taint_flags TEXT NOT NULL DEFAULT '',
+                compaction_count INTEGER NOT NULL DEFAULT 0,
+                tool_call_count INTEGER NOT NULL DEFAULT 0,
+                error_message TEXT,
+                started_at INTEGER NOT NULL,
+                finished_at INTEGER
+            )",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_agent_runs_conversation_started
+             ON agent_runs (conversation_id, started_at DESC)",
+            [],
+        )?;
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS agent_run_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id TEXT NOT NULL,
+                seq INTEGER NOT NULL,
+                event_kind TEXT NOT NULL,
+                tool_name TEXT,
+                payload_json TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            )",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_agent_run_events_run_seq
+             ON agent_run_events (run_id, seq)",
+            [],
+        )?;
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS agent_tool_audit (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id TEXT NOT NULL,
+                tool_name TEXT NOT NULL,
+                risk_tier TEXT NOT NULL,
+                decision TEXT NOT NULL,
+                taint_flags TEXT NOT NULL,
+                ok INTEGER NOT NULL,
+                duration_ms INTEGER NOT NULL,
+                reason TEXT,
+                created_at INTEGER NOT NULL
+            )",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_agent_tool_audit_run_id
+             ON agent_tool_audit (run_id, id)",
             [],
         )?;
 
@@ -4472,30 +4536,57 @@ impl Database {
 
     /// 新建助手会话，返回会话 id。同时清理最旧的超额会话（保留最近 100 个）。
     pub fn create_assistant_conversation(&self, title: &str) -> Result<i64> {
-        let conn = self.conn.lock().map_err(|e| {
+        let mut conn = self.conn.lock().map_err(|e| {
             AppError::Database(rusqlite::Error::InvalidParameterName(e.to_string()))
         })?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let now = chrono::Utc::now().timestamp();
-        conn.execute(
+        tx.execute(
             "INSERT INTO assistant_conversations (title, created_at, updated_at) VALUES (?1, ?2, ?2)",
             params![title, now],
         )?;
-        let id = conn.last_insert_rowid();
-        // 超额清理：删除最旧的会话及其消息
-        conn.execute(
+        let id = tx.last_insert_rowid();
+        // 超额清理：原子删除最旧的会话及其消息与关联 Agent Run 记录
+        tx.execute(
+            "DELETE FROM agent_run_events WHERE run_id IN (
+                SELECT id FROM agent_runs WHERE conversation_id IN (
+                    SELECT id FROM assistant_conversations
+                    ORDER BY updated_at DESC LIMIT -1 OFFSET 100
+                )
+            )",
+            [],
+        )?;
+        tx.execute(
+            "DELETE FROM agent_tool_audit WHERE run_id IN (
+                SELECT id FROM agent_runs WHERE conversation_id IN (
+                    SELECT id FROM assistant_conversations
+                    ORDER BY updated_at DESC LIMIT -1 OFFSET 100
+                )
+            )",
+            [],
+        )?;
+        tx.execute(
+            "DELETE FROM agent_runs WHERE conversation_id IN (
+                SELECT id FROM assistant_conversations
+                ORDER BY updated_at DESC LIMIT -1 OFFSET 100
+            )",
+            [],
+        )?;
+        tx.execute(
             "DELETE FROM assistant_messages WHERE conversation_id IN (
                 SELECT id FROM assistant_conversations
                 ORDER BY updated_at DESC LIMIT -1 OFFSET 100
             )",
             [],
         )?;
-        conn.execute(
+        tx.execute(
             "DELETE FROM assistant_conversations WHERE id IN (
                 SELECT id FROM assistant_conversations
                 ORDER BY updated_at DESC LIMIT -1 OFFSET 100
             )",
             [],
         )?;
+        tx.commit()?;
         Ok(id)
     }
 
@@ -4576,20 +4667,367 @@ impl Database {
         Ok(id)
     }
 
-    /// 删除会话及其全部消息。
+    /// 删除会话及其全部消息与关联的 Agent Run 记录（原子事务）。
     pub fn delete_assistant_conversation(&self, conversation_id: i64) -> Result<()> {
+        let mut conn = self.conn.lock().map_err(|e| {
+            AppError::Database(rusqlite::Error::InvalidParameterName(e.to_string()))
+        })?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        tx.execute(
+            "DELETE FROM agent_run_events WHERE run_id IN (
+                SELECT id FROM agent_runs WHERE conversation_id = ?1
+            )",
+            params![conversation_id],
+        )?;
+        tx.execute(
+            "DELETE FROM agent_tool_audit WHERE run_id IN (
+                SELECT id FROM agent_runs WHERE conversation_id = ?1
+            )",
+            params![conversation_id],
+        )?;
+        tx.execute(
+            "DELETE FROM agent_runs WHERE conversation_id = ?1",
+            params![conversation_id],
+        )?;
+        tx.execute(
+            "DELETE FROM assistant_messages WHERE conversation_id = ?1",
+            params![conversation_id],
+        )?;
+        tx.execute(
+            "DELETE FROM assistant_conversations WHERE id = ?1",
+            params![conversation_id],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    // ══════════════════════════════════════════════════════════
+    // Personal Agent Harness 运行账本与工具审计
+    // ══════════════════════════════════════════════════════════
+
+    /// 记录一次新的 Agent Run 启动，并在同一事务内裁剪超出 200 条的已结束历史运行账本。
+    ///
+    /// - 在库边界强制对 `input_preview` 做 `scrub_preview` 清洗与长度上限控制（256 字）。
+    /// - 保留裁剪只清理非活跃状态（排除 `running` / `waiting_approval`），避免并发长任务被误删。
+    pub fn create_agent_run(
+        &self,
+        id: &str,
+        conversation_id: Option<i64>,
+        source: &str,
+        request_mode: &str,
+        model_name: Option<&str>,
+        input_preview: &str,
+    ) -> Result<()> {
+        let mut conn = self.conn.lock().map_err(|e| {
+            AppError::Database(rusqlite::Error::InvalidParameterName(e.to_string()))
+        })?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let now = chrono::Utc::now().timestamp();
+        let safe_preview = work_review_agent_harness::ledger::scrub_preview(input_preview, 256);
+        tx.execute(
+            "INSERT INTO agent_runs (
+                id, conversation_id, source, request_mode, status, model_name,
+                input_preview, taint_flags, compaction_count, tool_call_count, started_at
+            ) VALUES (?1, ?2, ?3, ?4, 'running', ?5, ?6, '', 0, 0, ?7)",
+            params![
+                id,
+                conversation_id,
+                source,
+                request_mode,
+                model_name,
+                safe_preview,
+                now
+            ],
+        )?;
+        tx.execute(
+            "DELETE FROM agent_run_events WHERE run_id IN (
+                SELECT id FROM agent_runs
+                WHERE status NOT IN ('running', 'waiting_approval')
+                ORDER BY started_at DESC, rowid DESC LIMIT -1 OFFSET 200
+            )",
+            [],
+        )?;
+        tx.execute(
+            "DELETE FROM agent_tool_audit WHERE run_id IN (
+                SELECT id FROM agent_runs
+                WHERE status NOT IN ('running', 'waiting_approval')
+                ORDER BY started_at DESC, rowid DESC LIMIT -1 OFFSET 200
+            )",
+            [],
+        )?;
+        tx.execute(
+            "DELETE FROM agent_runs WHERE id IN (
+                SELECT id FROM agent_runs
+                WHERE status NOT IN ('running', 'waiting_approval')
+                ORDER BY started_at DESC, rowid DESC LIMIT -1 OFFSET 200
+            )",
+            [],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// 更新进行中的 Run 状态与污点标记（如切入/离开 `waiting_approval`）。
+    pub fn update_agent_run_status(&self, id: &str, status: &str, taint_flags: &str) -> Result<()> {
         let conn = self.conn.lock().map_err(|e| {
             AppError::Database(rusqlite::Error::InvalidParameterName(e.to_string()))
         })?;
         conn.execute(
-            "DELETE FROM assistant_messages WHERE conversation_id = ?1",
-            params![conversation_id],
-        )?;
-        conn.execute(
-            "DELETE FROM assistant_conversations WHERE id = ?1",
-            params![conversation_id],
+            "UPDATE agent_runs SET status = ?1, taint_flags = ?2 WHERE id = ?3",
+            params![status, taint_flags, id],
         )?;
         Ok(())
+    }
+
+    /// 结束一次 Agent Run 并落盘最终统计与脱敏摘要。
+    #[allow(clippy::too_many_arguments)]
+    pub fn finish_agent_run(
+        &self,
+        id: &str,
+        status: &str,
+        answer_preview: Option<&str>,
+        taint_flags: &str,
+        compaction_count: usize,
+        tool_call_count: usize,
+        error_message: Option<&str>,
+    ) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| {
+            AppError::Database(rusqlite::Error::InvalidParameterName(e.to_string()))
+        })?;
+        let now = chrono::Utc::now().timestamp();
+        let safe_answer =
+            answer_preview.map(|s| work_review_agent_harness::ledger::scrub_preview(s, 256));
+        let safe_error =
+            error_message.map(|s| work_review_agent_harness::ledger::scrub_preview(s, 512));
+        conn.execute(
+            "UPDATE agent_runs
+             SET status = ?1,
+                 answer_preview = ?2,
+                 taint_flags = ?3,
+                 compaction_count = ?4,
+                 tool_call_count = ?5,
+                 error_message = ?6,
+                 finished_at = ?7
+             WHERE id = ?8",
+            params![
+                status,
+                safe_answer,
+                taint_flags,
+                compaction_count as i64,
+                tool_call_count as i64,
+                safe_error,
+                now,
+                id
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// 追加单条 Run 事件（仅写入可信元数据 JSON，库边界强制 4096 字符上限）。
+    pub fn append_agent_run_event(
+        &self,
+        run_id: &str,
+        seq: i64,
+        event_kind: &str,
+        tool_name: Option<&str>,
+        payload_json: &str,
+    ) -> Result<i64> {
+        let conn = self.conn.lock().map_err(|e| {
+            AppError::Database(rusqlite::Error::InvalidParameterName(e.to_string()))
+        })?;
+        let now = chrono::Utc::now().timestamp();
+        let bounded_payload = if payload_json.chars().count() > 4096 {
+            r#"{"truncated":true}"#
+        } else {
+            payload_json
+        };
+        conn.execute(
+            "INSERT INTO agent_run_events (run_id, seq, event_kind, tool_name, payload_json, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![run_id, seq, event_kind, tool_name, bounded_payload, now],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// 记录工具权限裁决与执行审计条目。
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_agent_tool_audit(
+        &self,
+        run_id: &str,
+        tool_name: &str,
+        risk_tier: &str,
+        decision: &str,
+        taint_flags: &str,
+        ok: bool,
+        duration_ms: i64,
+        reason: Option<&str>,
+    ) -> Result<i64> {
+        let conn = self.conn.lock().map_err(|e| {
+            AppError::Database(rusqlite::Error::InvalidParameterName(e.to_string()))
+        })?;
+        let now = chrono::Utc::now().timestamp();
+        let safe_reason = reason.map(|s| work_review_agent_harness::ledger::scrub_preview(s, 256));
+        conn.execute(
+            "INSERT INTO agent_tool_audit (
+                run_id, tool_name, risk_tier, decision, taint_flags, ok, duration_ms, reason, created_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                run_id,
+                tool_name,
+                risk_tier,
+                decision,
+                taint_flags,
+                if ok { 1i64 } else { 0i64 },
+                duration_ms.max(0),
+                safe_reason,
+                now
+            ],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// 按最近时间列出 Agent Run（可选按会话 ID 过滤）。
+    pub fn list_agent_runs(
+        &self,
+        conversation_id: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<work_review_agent_harness::ledger::AgentRunSummary>> {
+        let conn = self.conn.lock().map_err(|e| {
+            AppError::Database(rusqlite::Error::InvalidParameterName(e.to_string()))
+        })?;
+        let capped = limit.clamp(1, 200) as i64;
+        let map_row = |row: &rusqlite::Row<'_>| {
+            Ok(work_review_agent_harness::ledger::AgentRunSummary {
+                id: row.get(0)?,
+                conversation_id: row.get(1)?,
+                source: row.get(2)?,
+                request_mode: row.get(3)?,
+                status: row.get(4)?,
+                model_name: row.get(5)?,
+                input_preview: row.get(6)?,
+                answer_preview: row.get(7)?,
+                taint_flags: row.get(8)?,
+                compaction_count: row.get::<_, i64>(9)?.max(0) as usize,
+                tool_call_count: row.get::<_, i64>(10)?.max(0) as usize,
+                error_message: row.get(11)?,
+                started_at: row.get(12)?,
+                finished_at: row.get(13)?,
+            })
+        };
+
+        if let Some(conv_id) = conversation_id {
+            let mut stmt = conn.prepare(
+                "SELECT id, conversation_id, source, request_mode, status, model_name,
+                        input_preview, answer_preview, taint_flags, compaction_count,
+                        tool_call_count, error_message, started_at, finished_at
+                 FROM agent_runs
+                 WHERE conversation_id = ?1
+                 ORDER BY started_at DESC, rowid DESC
+                 LIMIT ?2",
+            )?;
+            let rows = stmt.query_map(params![conv_id, capped], map_row)?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(AppError::Database)
+        } else {
+            let mut stmt = conn.prepare(
+                "SELECT id, conversation_id, source, request_mode, status, model_name,
+                        input_preview, answer_preview, taint_flags, compaction_count,
+                        tool_call_count, error_message, started_at, finished_at
+                 FROM agent_runs
+                 ORDER BY started_at DESC, rowid DESC
+                 LIMIT ?1",
+            )?;
+            let rows = stmt.query_map(params![capped], map_row)?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(AppError::Database)
+        }
+    }
+
+    /// 读取单次 Agent Run 的完整 Trace（概要 + 事件流 + 工具审计）。
+    pub fn get_agent_run_trace(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<work_review_agent_harness::ledger::AgentRunTrace>> {
+        let conn = self.conn.lock().map_err(|e| {
+            AppError::Database(rusqlite::Error::InvalidParameterName(e.to_string()))
+        })?;
+        let run = conn
+            .query_row(
+                "SELECT id, conversation_id, source, request_mode, status, model_name,
+                        input_preview, answer_preview, taint_flags, compaction_count,
+                        tool_call_count, error_message, started_at, finished_at
+                 FROM agent_runs WHERE id = ?1",
+                params![run_id],
+                |row| {
+                    Ok(work_review_agent_harness::ledger::AgentRunSummary {
+                        id: row.get(0)?,
+                        conversation_id: row.get(1)?,
+                        source: row.get(2)?,
+                        request_mode: row.get(3)?,
+                        status: row.get(4)?,
+                        model_name: row.get(5)?,
+                        input_preview: row.get(6)?,
+                        answer_preview: row.get(7)?,
+                        taint_flags: row.get(8)?,
+                        compaction_count: row.get::<_, i64>(9)?.max(0) as usize,
+                        tool_call_count: row.get::<_, i64>(10)?.max(0) as usize,
+                        error_message: row.get(11)?,
+                        started_at: row.get(12)?,
+                        finished_at: row.get(13)?,
+                    })
+                },
+            )
+            .optional()?;
+        let Some(run) = run else {
+            return Ok(None);
+        };
+
+        let mut ev_stmt = conn.prepare(
+            "SELECT id, run_id, seq, event_kind, tool_name, payload_json, created_at
+             FROM agent_run_events WHERE run_id = ?1 ORDER BY seq ASC, id ASC",
+        )?;
+        let events = ev_stmt
+            .query_map(params![run_id], |row| {
+                Ok(work_review_agent_harness::ledger::AgentRunEvent {
+                    id: row.get(0)?,
+                    run_id: row.get(1)?,
+                    seq: row.get(2)?,
+                    event_kind: row.get(3)?,
+                    tool_name: row.get(4)?,
+                    payload_json: row.get(5)?,
+                    created_at: row.get(6)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(AppError::Database)?;
+
+        let mut audit_stmt = conn.prepare(
+            "SELECT id, run_id, tool_name, risk_tier, decision, taint_flags, ok, duration_ms, reason, created_at
+             FROM agent_tool_audit WHERE run_id = ?1 ORDER BY id ASC",
+        )?;
+        let audits = audit_stmt
+            .query_map(params![run_id], |row| {
+                Ok(work_review_agent_harness::ledger::AgentToolAuditEntry {
+                    id: row.get(0)?,
+                    run_id: row.get(1)?,
+                    tool_name: row.get(2)?,
+                    risk_tier: row.get(3)?,
+                    decision: row.get(4)?,
+                    taint_flags: row.get(5)?,
+                    ok: row.get::<_, i64>(6)? != 0,
+                    duration_ms: row.get(7)?,
+                    reason: row.get(8)?,
+                    created_at: row.get(9)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(AppError::Database)?;
+
+        Ok(Some(work_review_agent_harness::ledger::AgentRunTrace {
+            run,
+            events,
+            audits,
+        }))
     }
 
     // ══════════════════════════════════════════════════════════
@@ -8785,6 +9223,130 @@ mod tests {
             .expect("读取已删除记忆失败")
             .is_none());
         assert_eq!(db.clear_user_memories().expect("清空长期记忆失败"), 3);
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn agent_run账本与审计应完整记录并在删除会话时级联清理() {
+        let db_path = temp_db_path("agent-run-ledger");
+        let db = Database::new(&db_path).expect("创建测试数据库失败");
+        let conv_id = db
+            .create_assistant_conversation("Personal Agent 测试")
+            .expect("创建会话失败");
+
+        db.create_agent_run(
+            "run_test_1",
+            Some(conv_id),
+            "desktop",
+            "work_review",
+            Some("gpt-6.2-sol"),
+            "帮我复盘今天的工作",
+        )
+        .expect("创建 run 失败");
+        db.append_agent_run_event(
+            "run_test_1",
+            1,
+            "run_started",
+            None,
+            r#"{"mode":"work_review"}"#,
+        )
+        .expect("追加事件失败");
+        db.record_agent_tool_audit(
+            "run_test_1",
+            "query_activities",
+            "read_only",
+            "allow",
+            "local_work_data",
+            true,
+            12,
+            None,
+        )
+        .expect("写入审计失败");
+        db.update_agent_run_status("run_test_1", "waiting_approval", "local_work_data")
+            .expect("更新状态失败");
+        db.finish_agent_run(
+            "run_test_1",
+            "completed",
+            Some("今天主要完成了 Agent Harness 升级"),
+            "local_work_data",
+            1,
+            1,
+            None,
+        )
+        .expect("结束 run 失败");
+
+        let runs = db
+            .list_agent_runs(Some(conv_id), 10)
+            .expect("列出 runs 失败");
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, "completed");
+        assert_eq!(runs[0].compaction_count, 1);
+        assert_eq!(runs[0].tool_call_count, 1);
+
+        let trace = db
+            .get_agent_run_trace("run_test_1")
+            .expect("读取 trace 失败")
+            .expect("应找到 trace");
+        assert_eq!(trace.events.len(), 1);
+        assert_eq!(trace.audits.len(), 1);
+        assert_eq!(trace.audits[0].tool_name, "query_activities");
+        assert!(trace.audits[0].ok);
+
+        db.delete_assistant_conversation(conv_id)
+            .expect("删除会话失败");
+        assert!(db
+            .get_agent_run_trace("run_test_1")
+            .expect("查询已删 trace 失败")
+            .is_none());
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn sqlite_v3升级到v4应自动补建agent账本表并推进user_version() {
+        let db_path = temp_db_path("agent-run-v3-upgrade");
+        // 先创建库，再模拟旧版 v3 状态（删掉 v4 新增表并将 PRAGMA user_version 回退至 3）
+        {
+            let db = Database::new(&db_path).expect("初始化测试库失败");
+            let conn = db.conn.lock().unwrap();
+            conn.execute_batch(
+                "DROP TABLE IF EXISTS agent_run_events;
+                 DROP TABLE IF EXISTS agent_tool_audit;
+                 DROP TABLE IF EXISTS agent_runs;
+                 PRAGMA user_version = 3;",
+            )
+            .expect("回退至 v3 状态失败");
+        }
+
+        // 重新打开数据库应自动建表并升级至 CURRENT_SCHEMA_VERSION (4)
+        let upgraded = Database::new(&db_path).expect("v3 -> v4 升级打开失败");
+        let version: i32 = upgraded
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("读取 user_version 失败");
+        assert_eq!(version, CURRENT_SCHEMA_VERSION);
+
+        upgraded
+            .create_agent_run(
+                "run_upgrade_1",
+                None,
+                "bot:feishu",
+                "work_review",
+                None,
+                "查询今天工作",
+            )
+            .expect("升级后创建 run 失败");
+        let oversized = format!(r#"{{"blob":"{}"}}"#, "x".repeat(5000));
+        upgraded
+            .append_agent_run_event("run_upgrade_1", 1, "run_started", None, &oversized)
+            .expect("追加事件失败");
+        let trace = upgraded
+            .get_agent_run_trace("run_upgrade_1")
+            .expect("查询 trace 失败")
+            .expect("应存在升级后的 run");
+        assert_eq!(trace.events[0].payload_json, r#"{"truncated":true}"#);
+
         let _ = std::fs::remove_file(db_path);
     }
 

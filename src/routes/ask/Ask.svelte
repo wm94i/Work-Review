@@ -26,6 +26,8 @@
   import { interceptExternalLinks } from '$lib/actions/externalLinks.ts';
   import { cache } from '../../lib/stores/cache.ts';
   import { trapFocus } from '$lib/utils/focusTrap.ts';
+  import AgentHarnessDrawer from './AgentHarnessDrawer.svelte';
+  import type { SkillMetadata } from './agentHarnessTypes.ts';
 
   marked.use({
     gfm: true,
@@ -109,6 +111,9 @@
   let destroyed = false;
   let activeSendingRequestId: string | null = null;
   let stickToBottom = true;
+  let showHarnessDrawer = false;
+  let personalSkillsCount = 0;
+  let harnessTriggerEl: HTMLButtonElement | null = null;
   $: sending = assistantState.sending ?? false;
   $: messages = assistantState.messages ?? [];
   $: currentLocale = $locale;
@@ -832,6 +837,7 @@
           modelConfig: getSelectedModelConfig(),
           locale: currentLocale,
           requestId: assistantMessageId,
+          conversationId: convId,
           onEvent: channel,
         }),
         assistantTimeoutMs(),
@@ -1019,7 +1025,10 @@
 
 <svelte:window
   on:keydown={(e) => {
-    if (e.key === 'Escape' && showConversationList) {
+    if (e.key === 'Escape' && showHarnessDrawer) {
+      showHarnessDrawer = false;
+      harnessTriggerEl?.focus();
+    } else if (e.key === 'Escape' && showConversationList) {
       showConversationList = false;
     }
   }}
@@ -1045,9 +1054,33 @@
 
       <div class="ask-header-actions">
         <button
+          bind:this={harnessTriggerEl}
+          type="button"
+          class="ask-header-action ask-header-harness"
+          on:click={() => {
+            showConversationList = false;
+            showHarnessDrawer = true;
+          }}
+          aria-label={t('ask.harness.button')}
+          title={t('ask.harness.button')}
+        >
+          <svg class="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8" d="M9 3v2m6-2v2M9 19v2m6-2v2M5 9H3m2 6H3m18-6h-2m2 6h-2M7 19h10a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2H7a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2Zm2-8h6v2H9v-2Z" />
+          </svg>
+          <span>{t('ask.harness.button')}</span>
+          {#if personalSkillsCount > 0}
+            <span class="rounded-full bg-indigo-500/15 px-1.5 py-0.5 text-[10px] font-semibold text-indigo-600 dark:text-indigo-300">
+              {personalSkillsCount}
+            </span>
+          {/if}
+        </button>
+        <button
           type="button"
           class="ask-header-action ask-header-history"
-          on:click={openConversationDrawer}
+          on:click={() => {
+            showHarnessDrawer = false;
+            void openConversationDrawer();
+          }}
           aria-label={t('ask.conversationHistory')}
           title={t('ask.conversationHistory')}
         >
@@ -1408,3 +1441,15 @@
     </div>
   </div>
 {/if}
+
+<AgentHarnessDrawer
+  open={showHarnessDrawer}
+  {conversationId}
+  onClose={() => {
+    showHarnessDrawer = false;
+    harnessTriggerEl?.focus();
+  }}
+  onSkillsChanged={(items: SkillMetadata[]) => {
+    personalSkillsCount = items.length;
+  }}
+/>

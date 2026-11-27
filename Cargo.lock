@@ -7671,7 +7671,7 @@ dependencies = [
 
 [[package]]
 name = "work-review"
-version = "1.2.0-rc.1"
+version = "1.2.0"
 dependencies = [
  "aes",
  "anyhow",
@@ -7720,8 +7720,19 @@ dependencies = [
  "uuid",
  "winapi",
  "windows-capture",
+ "work-review-agent-harness",
  "work-review-core",
  "x11",
+]
+
+[[package]]
+name = "work-review-agent-harness"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "uuid",
 ]
 
 [[package]]
@@ -7743,6 +7754,7 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "uuid",
+ "work-review-agent-harness",
 ]
 
 [[package]]
