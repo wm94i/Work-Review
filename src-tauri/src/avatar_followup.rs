@@ -6,8 +6,11 @@ use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 use tauri::{AppHandle, Emitter};
 use work_review_core::config::AvatarFollowupItem;
+#[cfg(test)]
 use work_review_core::database::Activity;
-use work_review_core::work_intelligence::{build_work_sessions, WorkSession};
+#[cfg(test)]
+use work_review_core::work_intelligence::build_work_sessions;
+use work_review_core::work_intelligence::WorkSession;
 
 pub const AVATAR_FOLLOWUP_EVENT: &str = "avatar-followup-suggestion";
 const FOLLOWUP_LOOKBACK_DAYS: i64 = 3;
@@ -107,6 +110,7 @@ pub fn apply_followup_action(project_key: &str, action: AvatarFollowupAction, pe
     runtime.last_emitted_at_ms = now_ms;
 }
 
+#[cfg(test)]
 pub fn find_followup_suggestion(
     activities: &[Activity],
     active_window: &ActiveWindow,
@@ -115,19 +119,49 @@ pub fn find_followup_suggestion(
     now_ts: i64,
     now_ms: u64,
 ) -> Option<AvatarFollowupSuggestionPayload> {
-    let current_context = CurrentContext::from_active_window(active_window)?;
     let sessions = build_work_sessions(activities);
+    find_followup_suggestion_from_sessions(
+        &sessions,
+        active_window,
+        persona,
+        manual_followups,
+        now_ts,
+        now_ms,
+    )
+}
+
+/// 基于已构建的 `WorkSession` 切片查找最匹配的待跟进建议（避免高频切窗时重复重算会话与分词）。
+pub fn find_followup_suggestion_from_sessions(
+    sessions: &[WorkSession],
+    active_window: &ActiveWindow,
+    persona: &str,
+    manual_followups: &[AvatarFollowupItem],
+    now_ts: i64,
+    now_ms: u64,
+) -> Option<AvatarFollowupSuggestionPayload> {
+    let current_context = CurrentContext::from_active_window(active_window)?;
     let threshold = persona_score_threshold(persona);
 
     let mut best: Option<(i32, AvatarFollowupSuggestionPayload)> = None;
 
     for session in sessions {
-        if !is_resume_worthy_session(&session, manual_followups, now_ts) {
+        if !is_session_basic_eligible(session, now_ts) {
             continue;
         }
 
-        let project_key = session_project_key(&session);
-        let score = score_session_against_context(&session, &current_context);
+        // 每个会话只执行一次正则分词与 project_key 构造，避免原先 4 次重复正则扫描。
+        let session_title_tokens = significant_tokens(&session.title);
+        let project_key = session_project_key_with_tokens(session, &session_title_tokens);
+        if has_open_manual_followup(&project_key, manual_followups, now_ts) {
+            continue;
+        }
+
+        let score = score_session_against_context(
+            session,
+            &project_key,
+            &session_title_tokens,
+            &current_context,
+        );
         if score < threshold {
             continue;
         }
@@ -147,7 +181,7 @@ pub fn find_followup_suggestion(
             intent_label: session.intent_label.clone(),
             confidence: score.clamp(0, 100),
             persona: persona.to_string(),
-            session_age_hours: session_age_hours(&session, now_ts),
+            session_age_hours: session_age_hours(session, now_ts),
         };
 
         let replace = best
@@ -224,11 +258,7 @@ impl CurrentContext {
     }
 }
 
-fn is_resume_worthy_session(
-    session: &WorkSession,
-    manual_followups: &[AvatarFollowupItem],
-    now_ts: i64,
-) -> bool {
+fn is_session_basic_eligible(session: &WorkSession, now_ts: i64) -> bool {
     if session.duration < MIN_SESSION_DURATION_SECONDS {
         return false;
     }
@@ -252,30 +282,37 @@ fn is_resume_worthy_session(
         return false;
     }
 
-    if session.date.is_empty() || session.title.trim().is_empty() {
-        return false;
-    }
+    !session.date.is_empty() && !session.title.trim().is_empty()
+}
 
-    let project_key = session_project_key(session);
-    !manual_followups.iter().any(|item| {
+fn has_open_manual_followup(
+    project_key: &str,
+    manual_followups: &[AvatarFollowupItem],
+    now_ts: i64,
+) -> bool {
+    manual_followups.iter().any(|item| {
         item.status == "open"
             && item.project_key == project_key
             && now_ts - item.created_at <= FOLLOWUP_LOOKBACK_DAYS * 24 * 60 * 60
     })
 }
 
-fn score_session_against_context(session: &WorkSession, current: &CurrentContext) -> i32 {
+fn score_session_against_context(
+    session: &WorkSession,
+    session_project_key: &str,
+    session_title_tokens: &[String],
+    current: &CurrentContext,
+) -> i32 {
     let mut score = 0;
 
     if normalize_match_text(&session.dominant_app) == normalize_match_text(&current.app_name) {
         score += 18;
     }
 
-    let session_project_key = session_project_key(session);
     if session_project_key == current.project_key {
         score += 44;
     } else if session_project_key.contains(&current.project_key)
-        || current.project_key.contains(&session_project_key)
+        || current.project_key.contains(session_project_key)
     {
         score += 26;
     }
@@ -288,8 +325,7 @@ fn score_session_against_context(session: &WorkSession, current: &CurrentContext
         score += 32;
     }
 
-    let session_title_tokens = significant_tokens(&session.title);
-    let title_overlap = overlap_count(&current.title_tokens, &session_title_tokens);
+    let title_overlap = overlap_count(&current.title_tokens, session_title_tokens);
     score += (title_overlap as i32 * 9).min(27);
 
     let keyword_overlap = overlap_count(&current.title_tokens, &session.top_keywords);
@@ -307,12 +343,17 @@ fn session_age_hours(session: &WorkSession, now_ts: i64) -> u32 {
     ((diff + 3599) / 3600).try_into().unwrap_or(u32::MAX)
 }
 
+#[cfg(test)]
 fn session_project_key(session: &WorkSession) -> String {
-    let title_tokens = significant_tokens(&session.title);
+    let tokens = significant_tokens(&session.title);
+    session_project_key_with_tokens(session, &tokens)
+}
+
+fn session_project_key_with_tokens(session: &WorkSession, title_tokens: &[String]) -> String {
     build_project_key(
         &session.dominant_app,
         session.browser_domains.first().map(String::as_str),
-        &title_tokens,
+        title_tokens,
         &session.title,
     )
     .unwrap_or_else(|| normalize_match_text(&session.dominant_app))
@@ -502,6 +543,8 @@ mod tests {
 
     #[test]
     fn 回到同类项目时应命中继续建议() {
+        let _guard = FOLLOWUP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_followup_runtime();
         let activities = vec![
             sample_activity(
                 1_710_000_000,
@@ -547,6 +590,8 @@ mod tests {
 
     #[test]
     fn 已手动记为待跟进的项目不应重复提醒() {
+        let _guard = FOLLOWUP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_followup_runtime();
         let activities = vec![sample_activity(
             1_710_000_000,
             "Google Chrome",
@@ -605,5 +650,48 @@ mod tests {
         assert!(should_emit_followup(project_key, 20_000));
         apply_followup_action(project_key, AvatarFollowupAction::Focus, "assistant");
         assert!(!should_emit_followup(project_key, 20_001));
+    }
+
+    #[test]
+    fn 冷却期内重复扫描同一会话不应再次返回建议() {
+        let _guard = FOLLOWUP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_followup_runtime();
+        let activities = vec![sample_activity(
+            1_710_000_000,
+            "Google Chrome",
+            "PR #128 · 支付回调修复",
+            Some("https://github.com/wm94i/Work_Review/pull/128"),
+            1200,
+        )];
+        let active_window = ActiveWindow {
+            app_name: "Google Chrome".to_string(),
+            window_title: "PR #128 · 支付回调修复".to_string(),
+            browser_url: Some("https://github.com/wm94i/Work_Review/pull/128".to_string()),
+            executable_path: None,
+            window_bounds: None,
+            is_minimized: false,
+            is_private: false,
+        };
+        let sessions = build_work_sessions(&activities);
+        let first = super::find_followup_suggestion_from_sessions(
+            &sessions,
+            &active_window,
+            "assistant",
+            &[],
+            1_710_020_000,
+            100_000,
+        )
+        .expect("首次扫描应命中待跟进建议");
+        super::note_followup_emitted(&first.project_key, 100_000);
+
+        let second = super::find_followup_suggestion_from_sessions(
+            &sessions,
+            &active_window,
+            "assistant",
+            &[],
+            1_710_020_000,
+            102_000,
+        );
+        assert!(second.is_none(), "冷却期内二次扫描必须跳过同一项目");
     }
 }

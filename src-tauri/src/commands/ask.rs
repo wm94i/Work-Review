@@ -2557,9 +2557,11 @@ pub async fn chat_work_assistant(
             .flatten()
         };
         let mcp_fut = async {
-            crate::agent::mcp_bridge::McpToolBridge::discover_for_data_dir(&data_dir, self_api_port)
-                .await
-                .map(std::sync::Arc::new)
+            crate::agent::mcp_bridge::McpToolBridge::discover_cached_for_data_dir(
+                &data_dir,
+                self_api_port,
+            )
+            .await
         };
         tokio::join!(skills_fut, mcp_fut)
     } else {

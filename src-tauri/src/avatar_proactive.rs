@@ -59,8 +59,6 @@ pub async fn decide_and_speak(
     locale: &str,
     context: &ProactiveContext,
 ) -> ProactiveOutcome {
-    let now_ms = chrono::Local::now().timestamp_millis() as u64;
-
     let system = build_system_prompt(avatar_persona, locale);
     let event = build_event_prompt(context, avatar_persona);
 
@@ -76,10 +74,13 @@ pub async fn decide_and_speak(
         Ok(r) => r,
         Err(e) => {
             log::warn!("桌宠主动开口 LLM 调用失败: {e}");
-            return fallback(now_ms);
+            let completed_ms = chrono::Local::now().timestamp_millis().max(0) as u64;
+            return fallback(completed_ms);
         }
     };
 
+    // 请求完成后再取当前时间，避免把 LLM 网络耗时吃进 next_check_ms 与 mood 有效期。
+    let now_ms = chrono::Local::now().timestamp_millis().max(0) as u64;
     let content = response.content.unwrap_or_default();
     let parsed = match parse_reply(&content) {
         Some(p) => p,
@@ -134,19 +135,93 @@ fn fallback(now_ms: u64) -> ProactiveOutcome {
     }
 }
 
+fn strip_think_blocks(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut rest = raw;
+    while let Some(start) = rest.find("<think>") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + "<think>".len()..];
+        if let Some(end) = after.find("</think>") {
+            rest = &after[end + "</think>".len()..];
+        } else {
+            // 未闭合的思考段直接截断，不参与 JSON 提取
+            return out;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+fn extract_balanced_json_objects(text: &str) -> Vec<&str> {
+    let mut results = Vec::new();
+    let mut cursor = 0usize;
+
+    while cursor < text.len() {
+        let slice = &text[cursor..];
+        let mut depth = 0usize;
+        let mut start_rel: Option<usize> = None;
+        let mut in_string = false;
+        let mut escaped = false;
+        let mut matched_end: Option<usize> = None;
+
+        for (rel_idx, ch) in slice.char_indices() {
+            if in_string {
+                if escaped {
+                    escaped = false;
+                } else if ch == '\\' {
+                    escaped = true;
+                } else if ch == '"' {
+                    in_string = false;
+                }
+                continue;
+            }
+            match ch {
+                '"' if depth > 0 => in_string = true,
+                '{' => {
+                    if depth == 0 {
+                        start_rel = Some(rel_idx);
+                    }
+                    depth += 1;
+                }
+                '}' if depth > 0 => {
+                    depth -= 1;
+                    if depth == 0 {
+                        if let Some(start) = start_rel.take() {
+                            results.push(&slice[start..=rel_idx]);
+                            matched_end = Some(rel_idx + 1);
+                            break;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if let Some(end_rel) = matched_end {
+            cursor += end_rel;
+        } else if let Some(unclosed_start) = start_rel {
+            // 遇到未闭合的孤立 `{`（如模型自然语言说明），跳过该字符继续查找后续有效 JSON 对象。
+            cursor += unclosed_start + 1;
+        } else {
+            break;
+        }
+    }
+    results
+}
+
 fn parse_reply(content: &str) -> Option<ProactiveReply> {
-    let trimmed = content.trim();
+    let cleaned = strip_think_blocks(content);
+    let trimmed = cleaned.trim();
     if let Ok(p) = serde_json::from_str::<ProactiveReply>(trimmed) {
         return Some(p);
     }
-    // 模型可能把 JSON 包在 ```json ... ``` 或多余文字里，抠出最外层 {...}
-    let start = trimmed.find('{')?;
-    let end = trimmed.rfind('}')?;
-    if end > start {
-        serde_json::from_str::<ProactiveReply>(&trimmed[start..=end]).ok()
-    } else {
-        None
+    // 从后往前扫描配平的顶层 JSON 对象，兼容思考过程或说明文字里夹带 `{...}` 的模型输出。
+    for candidate in extract_balanced_json_objects(trimmed).into_iter().rev() {
+        if let Ok(p) = serde_json::from_str::<ProactiveReply>(candidate) {
+            return Some(p);
+        }
     }
+    None
 }
 
 fn build_system_prompt(persona: &str, locale: &str) -> String {
@@ -159,6 +234,8 @@ fn build_system_prompt(persona: &str, locale: &str) -> String {
         "English"
     } else if locale.starts_with("zh-TW") || locale.starts_with("zh_TW") {
         "繁體中文"
+    } else if locale.starts_with("ar") {
+        "العربية"
     } else {
         "简体中文"
     };
@@ -257,6 +334,44 @@ mod tests {
         let r = parse_reply(raw).expect("json with leading prose");
         assert!(r.speak);
         assert_eq!(r.tone, "focus");
+    }
+
+    #[test]
+    fn parse_reply_ignores_think_blocks_and_earlier_braces() {
+        let raw = "<think>草稿 {\"speak\":false,\"text\":\"ignore\"}</think>\n{\"speak\":true,\"text\":\"起来活动下\",\"tone\":\"tired\",\"next_check_minutes\":10}";
+        let r = parse_reply(raw).expect("json after think block");
+        assert!(r.speak);
+        assert_eq!(r.text, "起来活动下");
+        assert_eq!(r.tone, "tired");
+        assert_eq!(r.next_check_minutes, 10);
+
+        let prompt_ar = build_system_prompt("assistant", "ar");
+        assert!(prompt_ar.contains("العربية"));
+    }
+
+    #[test]
+    fn parse_reply_recovers_after_unmatched_open_brace_and_unclosed_think() {
+        let stray_brace =
+            "Note: keep { in mind. {\"speak\":true,\"text\":\"喝口水\",\"tone\":\"happy\",\"next_check_minutes\":12}";
+        let r = parse_reply(stray_brace).expect("should recover after stray open brace");
+        assert!(r.speak);
+        assert_eq!(r.text, "喝口水");
+        assert_eq!(r.next_check_minutes, 12);
+
+        let unclosed_think = "{\"speak\":false,\"next_check_minutes\":20}<think>trailing draft";
+        let r2 = parse_reply(unclosed_think).expect("should keep valid json before unclosed think");
+        assert!(!r2.speak);
+        assert_eq!(r2.next_check_minutes, 20);
+    }
+
+    #[test]
+    fn parse_reply_recovers_after_stray_brace_and_unterminated_quote() {
+        let raw =
+            "说明 { \"未闭合的说明文字\n{\"speak\":true,\"text\":\"继续 👋\",\"tone\":\"happy\"}";
+        let reply = parse_reply(raw).expect("should recover JSON after unmatched prose quote");
+        assert!(reply.speak);
+        assert_eq!(reply.text, "继续 👋");
+        assert_eq!(reply.tone, "happy");
     }
 
     #[test]

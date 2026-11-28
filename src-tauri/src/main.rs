@@ -100,6 +100,13 @@ async fn main() {
     // 初始化日志
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
+    // 必须在 GTK/Tauri 或采集线程首次使用 Xlib 前初始化其全局锁。
+    #[cfg(target_os = "linux")]
+    if unsafe { x11::xlib::XInitThreads() } == 0 {
+        log::error!("Xlib 多线程初始化失败，无法安全启动桌面采集");
+        std::process::exit(1);
+    }
+
     // Linux: 修复 sudo 下丢失的 Wayland/DBus 环境变量
     #[cfg(target_os = "linux")]
     linux_session::fix_wayland_env_if_sudo();
@@ -459,6 +466,7 @@ async fn main() {
                 let avatar_enabled = if let Ok(s) = state.inner().lock() {
                     avatar_input::set_avatar_enabled_flag(s.config.avatar_enabled);
                     avatar_input::set_avatar_click_through_flag(s.config.avatar_click_through);
+                    avatar_input::set_avatar_body_hidden_flag(s.config.avatar_body_hidden);
                     s.config.avatar_enabled
                 } else {
                     false
@@ -471,6 +479,7 @@ async fn main() {
             } else {
                 avatar_input::set_avatar_enabled_flag(false);
                 avatar_input::set_avatar_click_through_flag(false);
+                avatar_input::set_avatar_body_hidden_flag(false);
                 log::warn!("配置损坏，已跳过全局键鼠监听初始化");
             }
 
@@ -589,30 +598,24 @@ async fn main() {
                         emit_recording_state_changed(app);
                     }
                     TRAY_MENU_LIGHTWEIGHT_MODE_ID => {
-                        let next_config = {
-                            let state = state_for_tray.lock().unwrap_or_else(|e| e.into_inner());
-                            let mut config = state.config.clone();
-                            config.lightweight_mode = !config.lightweight_mode;
-                            config
-                        };
-
                         if let Err(e) =
-                            commands::persist_app_config(next_config, app.clone(), &state_for_tray)
+                            commands::update_app_config(app.clone(), &state_for_tray, |current| {
+                                let mut next = current.clone();
+                                next.lightweight_mode = !next.lightweight_mode;
+                                Ok(next)
+                            })
                         {
                             log::warn!("从托盘切换轻量模式失败: {e}");
                             refresh_tray_menu(app);
                         }
                     }
                     TRAY_MENU_AVATAR_TOGGLE_ID => {
-                        let next_config = {
-                            let state = state_for_tray.lock().unwrap_or_else(|e| e.into_inner());
-                            let mut config = state.config.clone();
-                            config.avatar_enabled = !config.avatar_enabled;
-                            config
-                        };
-
                         if let Err(e) =
-                            commands::persist_app_config(next_config, app.clone(), &state_for_tray)
+                            commands::update_app_config(app.clone(), &state_for_tray, |current| {
+                                let mut next = current.clone();
+                                next.avatar_enabled = !next.avatar_enabled;
+                                Ok(next)
+                            })
                         {
                             log::warn!("从托盘切换桌宠失败: {e}");
                             refresh_tray_menu(app);
@@ -775,6 +778,8 @@ async fn main() {
                 }
             }
             tauri::RunEvent::Exit => {
+                avatar_input::set_avatar_enabled_flag(false);
+                avatar_input::stop_avatar_input_monitor(_app_handle);
                 if let Some(state) = _app_handle.try_state::<Arc<Mutex<AppState>>>() {
                     flush_active_recording_session_on_exit(state.inner());
                 }

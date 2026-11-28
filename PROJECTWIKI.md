@@ -146,4 +146,4 @@ flowchart LR
 
 ## 12. 变更日志
 
-- 参见 [CHANGELOG.md](./CHANGELOG.md)。当前稳定版本：[1.2.0](./CHANGELOG.md#120---2026-11-27)，历史候选版 [1.2.0-rc.1](./CHANGELOG.md#120-rc1---2026-11-26) 保留。1.2.0 汇总 M1–M4、效率洞察与个人 Agent 工作流（运行追踪、个人技能、自主任务、外部 HTTP MCP）；SQLite Schema 为 4，升级、备份范围及已知验收边界见正式版记录。后续变更见 [Unreleased](./CHANGELOG.md#unreleased)。
+- 参见 [CHANGELOG.md](./CHANGELOG.md)。当前稳定版本：[1.2.0](./CHANGELOG.md#120---2026-11-27)，历史候选版 [1.2.0-rc.1](./CHANGELOG.md#120-rc1---2026-11-26) 保留。1.2.0 汇总 M1–M4、效率洞察与助手扩展（运行记录、个人技能、自动任务、外部 HTTP MCP）；SQLite Schema 为 4，升级、备份范围及已知验收边界见正式版记录。后续变更见 [Unreleased](./CHANGELOG.md#unreleased)。

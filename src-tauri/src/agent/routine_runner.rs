@@ -159,11 +159,55 @@ async fn execute_routine_internal(
         });
     }
 
+    let privacy_filter = Arc::new(PrivacyFilter::from_config(&privacy_config));
+
+    // 过滤未填全 endpoint/model 的半配置模型（与 Orchestrator::handle 的 has_model 判定保持一致），
+    // 确保 effective_model.is_some() 时 Orchestrator 必然进入 QueryPath::Agent，不会误走 FastPath。
+    let configured_model =
+        candidate_model.filter(|m| !m.endpoint.trim().is_empty() && !m.model.trim().is_empty());
+
     // 默认禁止定时任务把本机工作记录发往云模型；仅本机回环模型或用户显式勾选 allow_cloud_model 时启用 AI 模型。
-    let effective_model = candidate_model
+    let cloud_model_blocked = configured_model
+        .as_ref()
+        .is_some_and(|m| !routine.allow_cloud_model && !is_local_only_model_endpoint(&m.endpoint));
+    let effective_model = configured_model
         .filter(|m| routine.allow_cloud_model || is_local_only_model_endpoint(&m.endpoint));
 
-    let privacy_filter = Arc::new(PrivacyFilter::from_config(&privacy_config));
+    // 绑定了个人技能的自主任务无法仅凭规则 FastPath 执行，缺少可用 AI 模型时明确失败，避免静默误报成功。
+    if effective_model.is_none() && routine.skill_name.is_some() {
+        let ran_at = chrono::Utc::now().timestamp();
+        let reason = if cloud_model_blocked {
+            "该自主任务绑定了个人技能，但仅允许本机模型且当前助手模型为云端模型；请在任务设置中允许云端模型或切换为本机回环模型。"
+        } else {
+            "该自主任务绑定了个人技能，但尚未配置可用的 AI 模型，无法执行技能步骤。"
+        };
+        let status = "failed".to_string();
+        let summary = sanitize_routine_summary(&privacy_filter, reason);
+        let data_dir_for_save = data_dir.clone();
+        let id_for_save = routine.id.clone();
+        let status_for_save = status.clone();
+        let summary_for_save = summary.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            if let Err(err) = record_routine_execution(
+                &data_dir_for_save,
+                &id_for_save,
+                None,
+                &status_for_save,
+                Some(&summary_for_save),
+                ran_at,
+            ) {
+                log::warn!("记录自主任务执行快照失败 ({id_for_save}): {err}");
+            }
+        })
+        .await;
+        return Ok(RoutineRunOutcome {
+            routine_id: routine.id,
+            status,
+            run_id: None,
+            summary,
+        });
+    }
+
     let source_tag = format!("routine:{}", routine.id);
     let runtime = AssistantRuntime {
         avatar_followups,
@@ -208,33 +252,32 @@ async fn execute_routine_internal(
     .await;
 
     let ran_at = chrono::Utc::now().timestamp();
-    let (status, summary) = match outcome {
-        Ok(res) => (
-            "completed".to_string(),
-            sanitize_routine_summary(&privacy_filter, &res.answer),
-        ),
-        Err(err) => (
-            "failed".to_string(),
-            sanitize_routine_summary(&privacy_filter, &format!("自主任务执行失败: {err}")),
-        ),
-    };
 
-    // 读取本次执行落盘的最新对应 source 的 run_id（纯本地 FastPath 无 LLM 轮次时返回 None）
+    // 读取本次执行落盘的最新对应 source 的账本记录（纯本地 FastPath 无 LLM 轮次时返回 None）
     let db_for_lookup = database.clone();
     let source_for_lookup = source_tag.clone();
-    let last_run_id = tokio::task::spawn_blocking(move || {
+    let last_run = tokio::task::spawn_blocking(move || {
         db_for_lookup
-            .list_agent_runs(None, 20)
+            .list_agent_runs(None, 50)
             .ok()
             .and_then(|runs| {
                 runs.into_iter()
                     .find(|r| r.source == source_for_lookup && r.started_at >= run_started_at)
-                    .map(|r| r.id)
             })
     })
     .await
     .ok()
     .flatten();
+    let last_run_id = last_run.as_ref().map(|r| r.id.clone());
+    let ledger_status = last_run.as_ref().map(|r| r.status.as_str());
+
+    let (status, summary) = resolve_routine_outcome(
+        outcome,
+        effective_model.is_some(),
+        cloud_model_blocked,
+        ledger_status,
+        &privacy_filter,
+    );
 
     let data_dir_for_save = data_dir.clone();
     let id_for_save = routine.id.clone();
@@ -305,6 +348,47 @@ pub async fn agent_routine_scheduler_task(state: Arc<Mutex<AppState>>) {
     }
 }
 
+/// 综合 Orchestrator 返回值、是否期望使用 AI 及账本终态，判定自主任务最终状态与摘要。
+fn resolve_routine_outcome(
+    outcome: Result<crate::agent::orchestrator::OrchestratorResult, AppError>,
+    expected_ai: bool,
+    cloud_model_blocked: bool,
+    ledger_status: Option<&str>,
+    privacy_filter: &PrivacyFilter,
+) -> (String, String) {
+    match outcome {
+        Err(err) => (
+            "failed".to_string(),
+            sanitize_routine_summary(privacy_filter, &format!("自主任务执行失败: {err}")),
+        ),
+        Ok(res) => {
+            if expected_ai && !res.used_ai {
+                // Orchestrator 在 AI 执行失败时会降级为本地统计并返回 Ok(used_ai=false)；
+                // 对自主任务而言这属于执行失败，不得误报 completed。
+                return (
+                    "failed".to_string(),
+                    sanitize_routine_summary(privacy_filter, &res.answer),
+                );
+            }
+            let status = match ledger_status {
+                Some("timed_out") => "timed_out",
+                Some("failed") => "failed",
+                Some("cancelled") => "cancelled",
+                _ => "completed",
+            };
+            let raw_summary = if !expected_ai && cloud_model_blocked {
+                format!("[仅本机统计：未授权云端模型] {}", res.answer)
+            } else {
+                res.answer
+            };
+            (
+                status.to_string(),
+                sanitize_routine_summary(privacy_filter, &raw_summary),
+            )
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -367,5 +451,107 @@ mod tests {
         for part in ["alpha", "beta", "gamma"] {
             assert!(!safe.contains(part), "定时任务摘要残留凭证: {safe}");
         }
+    }
+
+    #[test]
+    fn 自主任务结果判定应识别ai降级失败超时与未授权云模型提示() {
+        use crate::agent::orchestrator::OrchestratorResult;
+
+        let filter =
+            PrivacyFilter::from_config(&work_review_core::config::PrivacyConfig::default());
+
+        // 1. 期望 AI 执行但 Orchestrator 降级返回 used_ai=false → 必须记为 failed
+        let (st, summary) = resolve_routine_outcome(
+            Ok(OrchestratorResult {
+                answer: "⚠️ AI 模型调用失败，已降级为本地统计".to_string(),
+                used_ai: false,
+                tool_labels: vec!["降级查询".to_string()],
+                references: vec![],
+            }),
+            true,
+            false,
+            Some("failed"),
+            &filter,
+        );
+        assert_eq!(st, "failed");
+        assert!(summary.contains("AI 模型调用失败"));
+
+        // 1b. 即使账本未命中（如账本写盘降级），只要 expected_ai=true（已保证必走 AgentPath）且 used_ai=false 仍应判定为 failed
+        let (st, _) = resolve_routine_outcome(
+            Ok(OrchestratorResult {
+                answer: "⚠️ AI 模型调用失败，已降级为本地统计".to_string(),
+                used_ai: false,
+                tool_labels: vec!["降级查询".to_string()],
+                references: vec![],
+            }),
+            true,
+            false,
+            None,
+            &filter,
+        );
+        assert_eq!(st, "failed");
+
+        // 2. AI 正常返回但账本标记 timed_out → 透传 timed_out
+        let (st, _) = resolve_routine_outcome(
+            Ok(OrchestratorResult {
+                answer: "处理超时，请尝试更具体的问题。".to_string(),
+                used_ai: true,
+                tool_labels: vec![],
+                references: vec![],
+            }),
+            true,
+            false,
+            Some("timed_out"),
+            &filter,
+        );
+        assert_eq!(st, "timed_out");
+
+        // 3. 本地统计模式且因未授权云模型而跳过云模型 → completed 且摘要显式提示
+        let (st, summary) = resolve_routine_outcome(
+            Ok(OrchestratorResult {
+                answer: "今日工作 4 小时".to_string(),
+                used_ai: false,
+                tool_labels: vec!["rule-based".to_string()],
+                references: vec![],
+            }),
+            false,
+            true,
+            None,
+            &filter,
+        );
+        assert_eq!(st, "completed");
+        assert!(summary.starts_with("[仅本机统计：未授权云端模型]"));
+
+        // 3b. 纯本地模式（未配置任何云模型）→ completed 且不附加未授权云模型提示
+        let (st, summary) = resolve_routine_outcome(
+            Ok(OrchestratorResult {
+                answer: "今日工作 4 小时".to_string(),
+                used_ai: false,
+                tool_labels: vec!["rule-based".to_string()],
+                references: vec![],
+            }),
+            false,
+            false,
+            None,
+            &filter,
+        );
+        assert_eq!(st, "completed");
+        assert_eq!(summary, "今日工作 4 小时");
+
+        // 4. 正常 AI 完成 → completed
+        let (st, summary) = resolve_routine_outcome(
+            Ok(OrchestratorResult {
+                answer: "本周复盘完成".to_string(),
+                used_ai: true,
+                tool_labels: vec!["weekly_review".to_string()],
+                references: vec![],
+            }),
+            true,
+            false,
+            Some("completed"),
+            &filter,
+        );
+        assert_eq!(st, "completed");
+        assert_eq!(summary, "本周复盘完成");
     }
 }

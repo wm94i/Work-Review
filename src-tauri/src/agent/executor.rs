@@ -262,8 +262,8 @@ fn build_executor_system_prompt(
 ///
 /// 实现 `Drop` 兜底：若执行中途因 `?` 提前返回（如前端通道断开），自动以 `cancelled` 终态
 /// 落盘，防止 `agent_runs` 长期滞留在 `running` / `waiting_approval`。
-struct RunLedgerRecorder<'a> {
-    database: &'a Database,
+struct RunLedgerRecorder {
+    database: Database,
     privacy_filter: Option<Arc<work_review_core::privacy::PrivacyFilter>>,
     run_id: Option<String>,
     seq: i64,
@@ -273,7 +273,7 @@ struct RunLedgerRecorder<'a> {
     finished: bool,
 }
 
-impl<'a> RunLedgerRecorder<'a> {
+impl RunLedgerRecorder {
     fn sanitize_text(
         privacy_filter: Option<&work_review_core::privacy::PrivacyFilter>,
         raw: &str,
@@ -288,24 +288,98 @@ impl<'a> RunLedgerRecorder<'a> {
         scrub_preview(raw, max_chars)
     }
 
+    fn disabled(database: Database) -> Self {
+        Self {
+            database,
+            privacy_filter: None,
+            run_id: None,
+            seq: 0,
+            compaction_count: 0,
+            tool_call_count: 0,
+            last_taint: DataTaint::default(),
+            finished: true,
+        }
+    }
+
+    async fn start_async(
+        database: &Database,
+        runtime: &AssistantRuntime,
+        mode: AssistantRequestMode,
+        model_name: &str,
+        question: &str,
+    ) -> Self {
+        let Some(source) = runtime.run_source.clone() else {
+            return Self::disabled(database.clone());
+        };
+        let db = database.clone();
+        let privacy_filter = runtime.privacy_filter.clone();
+        let conversation_id = runtime.conversation_id;
+        let client_request_id = runtime.client_request_id.clone();
+        let model_name_owned = model_name.to_string();
+        let question_owned = question.to_string();
+
+        tokio::task::spawn_blocking(move || {
+            let run_id = new_run_id();
+            let mode_str = match mode {
+                AssistantRequestMode::WorkReview => "work_review",
+                AssistantRequestMode::GeneralChat => "general_chat",
+            };
+            let input_preview =
+                Self::sanitize_text(privacy_filter.as_deref(), &question_owned, 120);
+            if let Err(err) = db.create_agent_run(
+                &run_id,
+                conversation_id,
+                &source,
+                mode_str,
+                Some(&model_name_owned),
+                &input_preview,
+            ) {
+                log::warn!("创建 Agent Run 账本失败（降级为非持久化）: {err}");
+                return Self::disabled(db);
+            }
+
+            let mut recorder = Self {
+                database: db,
+                privacy_filter,
+                run_id: Some(run_id),
+                seq: 0,
+                compaction_count: 0,
+                tool_call_count: 0,
+                last_taint: DataTaint::default(),
+                finished: false,
+            };
+            let client_req_meta = client_request_id
+                .as_deref()
+                .map(|id| scrub_preview(id, 64))
+                .filter(|id| !id.is_empty());
+            recorder.event(
+                HarnessEventKind::RunStarted,
+                None,
+                serde_json::json!({
+                    "mode": mode_str,
+                    "source": source,
+                    "clientRequestId": client_req_meta,
+                }),
+            );
+            recorder
+        })
+        .await
+        .unwrap_or_else(|err| {
+            log::warn!("异步初始化 Agent Run 账本任务失败: {err}");
+            Self::disabled(database.clone())
+        })
+    }
+
+    #[cfg(test)]
     fn start(
-        database: &'a Database,
+        database: &Database,
         runtime: &AssistantRuntime,
         mode: AssistantRequestMode,
         model_name: &str,
         question: &str,
     ) -> Self {
         let Some(source) = runtime.run_source.as_deref() else {
-            return Self {
-                database,
-                privacy_filter: None,
-                run_id: None,
-                seq: 0,
-                compaction_count: 0,
-                tool_call_count: 0,
-                last_taint: DataTaint::default(),
-                finished: true,
-            };
+            return Self::disabled(database.clone());
         };
 
         // 始终由服务端生成唯一 run_id，不信任客户端传入的 request_id 作为主键，防止碰撞或伪造。
@@ -324,20 +398,11 @@ impl<'a> RunLedgerRecorder<'a> {
             &input_preview,
         ) {
             log::warn!("创建 Agent Run 账本失败（降级为非持久化）: {err}");
-            return Self {
-                database,
-                privacy_filter: None,
-                run_id: None,
-                seq: 0,
-                compaction_count: 0,
-                tool_call_count: 0,
-                last_taint: DataTaint::default(),
-                finished: true,
-            };
+            return Self::disabled(database.clone());
         }
 
         let mut recorder = Self {
-            database,
+            database: database.clone(),
             privacy_filter: runtime.privacy_filter.clone(),
             run_id: Some(run_id),
             seq: 0,
@@ -363,6 +428,37 @@ impl<'a> RunLedgerRecorder<'a> {
         recorder
     }
 
+    async fn event_async(
+        &mut self,
+        kind: HarnessEventKind,
+        tool_name: Option<&str>,
+        payload: serde_json::Value,
+    ) {
+        let Some(run_id) = self.run_id.clone() else {
+            return;
+        };
+        self.seq += 1;
+        let seq = self.seq;
+        let db = self.database.clone();
+        let tool_owned = tool_name.map(str::to_string);
+        let payload_json = payload.to_string();
+        if let Err(err) = tokio::task::spawn_blocking(move || {
+            if let Err(err) = db.append_agent_run_event(
+                &run_id,
+                seq,
+                kind.as_str(),
+                tool_owned.as_deref(),
+                &payload_json,
+            ) {
+                log::debug!("写入 Agent Run 事件失败 ({run_id}): {err}");
+            }
+        })
+        .await
+        {
+            log::warn!("异步写入 Agent Run 事件任务失败: {err}");
+        }
+    }
+
     fn event(
         &mut self,
         kind: HarnessEventKind,
@@ -385,6 +481,25 @@ impl<'a> RunLedgerRecorder<'a> {
         }
     }
 
+    async fn set_status_async(&mut self, status: RunStatus, taint: DataTaint) {
+        self.last_taint = taint;
+        let Some(run_id) = self.run_id.clone() else {
+            return;
+        };
+        let db = self.database.clone();
+        let flags = taint.to_flag_string();
+        if let Err(err) = tokio::task::spawn_blocking(move || {
+            if let Err(err) = db.update_agent_run_status(&run_id, status.as_str(), &flags) {
+                log::debug!("更新 Agent Run 状态失败 ({run_id}): {err}");
+            }
+        })
+        .await
+        {
+            log::warn!("异步更新 Agent Run 状态任务失败: {err}");
+        }
+    }
+
+    #[cfg(test)]
     fn set_status(&mut self, status: RunStatus, taint: DataTaint) {
         self.last_taint = taint;
         let Some(run_id) = self.run_id.as_deref() else {
@@ -399,6 +514,48 @@ impl<'a> RunLedgerRecorder<'a> {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    async fn record_audit_async(
+        &mut self,
+        tool_name: &str,
+        risk_tier: &str,
+        decision: &str,
+        taint: DataTaint,
+        ok: bool,
+        duration_ms: i64,
+        reason: Option<&str>,
+    ) {
+        self.last_taint = taint;
+        let Some(run_id) = self.run_id.clone() else {
+            return;
+        };
+        let db = self.database.clone();
+        let flags = taint.to_flag_string();
+        let tool_owned = tool_name.to_string();
+        let risk_owned = risk_tier.to_string();
+        let decision_owned = decision.to_string();
+        let reason_owned = reason.map(str::to_string);
+        if let Err(err) = tokio::task::spawn_blocking(move || {
+            if let Err(err) = db.record_agent_tool_audit(
+                &run_id,
+                &tool_owned,
+                &risk_owned,
+                &decision_owned,
+                &flags,
+                ok,
+                duration_ms,
+                reason_owned.as_deref(),
+            ) {
+                log::debug!("写入 Agent 工具审计失败 ({run_id}): {err}");
+            }
+        })
+        .await
+        {
+            log::warn!("异步写入 Agent 工具审计任务失败: {err}");
+        }
+    }
+
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     fn record_audit(
         &mut self,
@@ -429,6 +586,42 @@ impl<'a> RunLedgerRecorder<'a> {
         }
     }
 
+    async fn record_unregistered_tool_denial_async(&mut self, taint: DataTaint, duration_ms: i64) {
+        self.last_taint = taint;
+        self.tool_call_count += 1;
+        self.event_async(
+            HarnessEventKind::PolicyEvaluated,
+            Some("<unregistered>"),
+            serde_json::json!({
+                "riskTier": "destructive",
+                "decision": "deny",
+                "taint": taint.to_flag_string(),
+            }),
+        )
+        .await;
+        self.record_audit_async(
+            "<unregistered>",
+            "destructive",
+            "deny",
+            taint,
+            false,
+            duration_ms,
+            Some("请求了未注册的工具"),
+        )
+        .await;
+        self.event_async(
+            HarnessEventKind::ToolCompleted,
+            Some("<unregistered>"),
+            serde_json::json!({
+                "ok": false,
+                "durationMs": duration_ms,
+                "taint": taint.to_flag_string(),
+            }),
+        )
+        .await;
+    }
+
+    #[cfg(test)]
     fn record_unregistered_tool_denial(&mut self, taint: DataTaint, duration_ms: i64) {
         self.last_taint = taint;
         self.tool_call_count += 1;
@@ -461,6 +654,79 @@ impl<'a> RunLedgerRecorder<'a> {
         );
     }
 
+    async fn finish_async(
+        &mut self,
+        status: RunStatus,
+        answer: Option<&str>,
+        taint: DataTaint,
+        error_message: Option<&str>,
+    ) {
+        self.finish_with_meta_async(status, answer, taint, error_message, false)
+            .await;
+    }
+
+    async fn finish_with_meta_async(
+        &mut self,
+        status: RunStatus,
+        answer: Option<&str>,
+        taint: DataTaint,
+        error_message: Option<&str>,
+        truncated: bool,
+    ) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        self.last_taint = taint;
+        let Some(run_id) = self.run_id.clone() else {
+            return;
+        };
+        let kind = match status {
+            RunStatus::Cancelled => HarnessEventKind::RunCancelled,
+            RunStatus::Failed | RunStatus::TimedOut => HarnessEventKind::RunFailed,
+            _ => HarnessEventKind::RunCompleted,
+        };
+        self.seq += 1;
+        let seq = self.seq;
+        let payload_json = serde_json::json!({
+            "status": status.as_str(),
+            "toolCalls": self.tool_call_count,
+            "compactions": self.compaction_count,
+            "truncated": truncated,
+        })
+        .to_string();
+        let _ = answer;
+        let scrubbed_error =
+            error_message.map(|msg| Self::sanitize_text(self.privacy_filter.as_deref(), msg, 240));
+        let flags = taint.to_flag_string();
+        let compaction_count = self.compaction_count;
+        let tool_call_count = self.tool_call_count;
+        let db = self.database.clone();
+        if let Err(err) = tokio::task::spawn_blocking(move || {
+            if let Err(err) =
+                db.append_agent_run_event(&run_id, seq, kind.as_str(), None, &payload_json)
+            {
+                log::debug!("写入 Agent Run 终态事件失败 ({run_id}): {err}");
+            }
+            if let Err(err) = db.finish_agent_run(
+                &run_id,
+                status.as_str(),
+                None,
+                &flags,
+                compaction_count,
+                tool_call_count,
+                scrubbed_error.as_deref(),
+            ) {
+                log::debug!("结束 Agent Run 账本失败 ({run_id}): {err}");
+            }
+        })
+        .await
+        {
+            log::warn!("异步结束 Agent Run 账本任务失败: {err}");
+        }
+    }
+
+    #[cfg(test)]
     fn finish(
         &mut self,
         status: RunStatus,
@@ -522,7 +788,7 @@ impl<'a> RunLedgerRecorder<'a> {
     }
 }
 
-impl Drop for RunLedgerRecorder<'_> {
+impl Drop for RunLedgerRecorder {
     fn drop(&mut self) {
         if !self.finished && self.run_id.is_some() {
             self.finish_with_meta(
@@ -536,6 +802,16 @@ impl Drop for RunLedgerRecorder<'_> {
     }
 }
 
+/// 估算单条消息在上下文预算中的文本表示：当 assistant 消息同时包含文本与 `tool_calls` 时两者一并计入。
+fn compaction_message_text(msg: &Message) -> String {
+    match (&msg.content, &msg.tool_calls) {
+        (Some(content), Some(calls)) => format!("{content}\n{calls}"),
+        (Some(content), None) => content.clone(),
+        (None, Some(calls)) => calls.to_string(),
+        (None, None) => String::new(),
+    }
+}
+
 /// 将上下文压缩规划应用到 `messages`，保持跨模型（含 Claude/Gemini）的严格角色交替。
 fn apply_context_compaction(
     messages: &mut Vec<Message>,
@@ -546,11 +822,7 @@ fn apply_context_compaction(
         .iter()
         .map(|msg| CompactionItem {
             role: msg.role.clone(),
-            text: msg
-                .content
-                .clone()
-                .or_else(|| msg.tool_calls.as_ref().map(|v| v.to_string()))
-                .unwrap_or_default(),
+            text: compaction_message_text(msg),
             is_tool_call: msg.role == "assistant" && msg.tool_calls.is_some(),
             is_tool_result: msg.role == "tool",
         })
@@ -587,25 +859,27 @@ fn apply_context_compaction(
 }
 
 /// 在模型调用（含收束 wrap_up）前按需执行确定性上下文压缩，并写入运行账本事件。
-fn maybe_compact_messages(
+async fn maybe_compact_messages(
     messages: &mut Vec<Message>,
     system_prompt: &str,
     budget: &ContextBudget,
-    ledger: &mut RunLedgerRecorder<'_>,
+    ledger: &mut RunLedgerRecorder,
 ) {
     if let Some((dropped, tokens_before, tokens_after)) =
         apply_context_compaction(messages, system_prompt, budget)
     {
         ledger.compaction_count += 1;
-        ledger.event(
-            HarnessEventKind::ContextCompacted,
-            None,
-            serde_json::json!({
-                "droppedMessages": dropped,
-                "tokensBefore": tokens_before,
-                "tokensAfter": tokens_after,
-            }),
-        );
+        ledger
+            .event_async(
+                HarnessEventKind::ContextCompacted,
+                None,
+                serde_json::json!({
+                    "droppedMessages": dropped,
+                    "tokensBefore": tokens_before,
+                    "tokensAfter": tokens_after,
+                }),
+            )
+            .await;
     }
 }
 
@@ -704,13 +978,14 @@ impl AgentExecutor {
         let max_iter = max_iterations.unwrap_or(DEFAULT_MAX_ITERATIONS);
 
         // 启动持久化运行账本（仅当调用方设置 run_source 时落盘）。
-        let mut ledger = RunLedgerRecorder::start(
+        let mut ledger = RunLedgerRecorder::start_async(
             database,
             &runtime,
             request_mode,
             &model_config.model,
             question,
-        );
+        )
+        .await;
 
         // 从模式对应的最小权限工具集开始注册，避免普通聊天先获得本机工具再删除。
         let registry =
@@ -745,14 +1020,18 @@ impl AgentExecutor {
 
         for _ in 0..max_iter {
             if let Err(err) = ensure_event_receiver_open(&event_tx) {
-                ledger.finish(RunStatus::Cancelled, None, taint, Some("事件接收端已关闭"));
+                ledger
+                    .finish_async(RunStatus::Cancelled, None, taint, Some("事件接收端已关闭"))
+                    .await;
                 return Err(err);
             }
 
             // 用户主动停止：在新一轮开始前收束（模型/工具在途时由 select 提前打断）。
             if is_cancelled(&cancel_rx) {
                 let references = tool_context.take_all_references();
-                ledger.finish(RunStatus::Cancelled, Some(CANCELLED_ANSWER), taint, None);
+                ledger
+                    .finish_async(RunStatus::Cancelled, Some(CANCELLED_ANSWER), taint, None)
+                    .await;
                 emit_done(&event_tx, CANCELLED_ANSWER, &references, &tool_labels).await?;
                 return Ok(AgentResult {
                     answer: CANCELLED_ANSWER.to_string(),
@@ -764,7 +1043,7 @@ impl AgentExecutor {
             // 时长预算：只在新一轮开始前检查。剩余时间进入收束预留后，
             // 先按需压缩上下文，再走无工具的最后一次模型调用，把已有工具结果收成答案。
             if deadline.remaining() <= wrap_reserve {
-                maybe_compact_messages(&mut messages, &sys, &context_budget, &mut ledger);
+                maybe_compact_messages(&mut messages, &sys, &context_budget, &mut ledger).await;
                 let result = Self::wrap_up(
                     model_config,
                     &sys,
@@ -776,24 +1055,46 @@ impl AgentExecutor {
                     deadline,
                 )
                 .await;
-                match &result {
-                    Ok(res) => {
-                        let status = if res.answer == CANCELLED_ANSWER {
-                            RunStatus::Cancelled
+                return match result {
+                    Ok((res, used_fallback)) => {
+                        if res.answer == CANCELLED_ANSWER {
+                            ledger
+                                .finish_async(RunStatus::Cancelled, Some(&res.answer), taint, None)
+                                .await;
+                        } else if used_fallback {
+                            ledger
+                                .finish_with_meta_async(
+                                    RunStatus::TimedOut,
+                                    Some(&res.answer),
+                                    taint,
+                                    Some("请求超过时长预算"),
+                                    true,
+                                )
+                                .await;
                         } else {
-                            RunStatus::Completed
-                        };
-                        ledger.finish(status, Some(&res.answer), taint, None);
+                            ledger
+                                .finish_with_meta_async(
+                                    RunStatus::Completed,
+                                    Some(&res.answer),
+                                    taint,
+                                    None,
+                                    true,
+                                )
+                                .await;
+                        }
+                        Ok(res)
                     }
                     Err(err) => {
-                        ledger.finish(RunStatus::Failed, None, taint, Some(&format!("{err:?}")));
+                        ledger
+                            .finish_async(RunStatus::Failed, None, taint, Some(&format!("{err:?}")))
+                            .await;
+                        Err(err)
                     }
-                }
-                return result;
+                };
             }
 
             // 上下文预算检查与确定性压缩（保持 tool_call/tool_result 成对及角色交替）。
-            maybe_compact_messages(&mut messages, &sys, &context_budget, &mut ledger);
+            maybe_compact_messages(&mut messages, &sys, &context_budget, &mut ledger).await;
 
             // ── 第 1 步：调用 LLM（Stage 2） ──
             // 有事件通道时走 token 流式（文本增量实时推给前端，批量合并降低
@@ -823,7 +1124,9 @@ impl AgentExecutor {
             {
                 Ok(outcome) => outcome,
                 Err(err) => {
-                    ledger.finish(RunStatus::Cancelled, None, taint, Some("事件接收端已关闭"));
+                    ledger
+                        .finish_async(RunStatus::Cancelled, None, taint, Some("事件接收端已关闭"))
+                        .await;
                     return Err(err);
                 }
             };
@@ -833,7 +1136,9 @@ impl AgentExecutor {
                 AwaitOutcome::Done(r) => r,
                 AwaitOutcome::Cancelled => {
                     let references = tool_context.take_all_references();
-                    ledger.finish(RunStatus::Cancelled, Some(CANCELLED_ANSWER), taint, None);
+                    ledger
+                        .finish_async(RunStatus::Cancelled, Some(CANCELLED_ANSWER), taint, None)
+                        .await;
                     emit_done(&event_tx, CANCELLED_ANSWER, &references, &tool_labels).await?;
                     return Ok(AgentResult {
                         answer: CANCELLED_ANSWER.to_string(),
@@ -846,14 +1151,18 @@ impl AgentExecutor {
             // 若模型执行期间前端已离开，关闭原因优先于模型结果：不能把它误判为
             // 模型失败后继续进入 FastPath 降级，也不能继续执行模型返回的工具调用。
             if let Err(err) = ensure_event_receiver_open(&event_tx) {
-                ledger.finish(RunStatus::Cancelled, None, taint, Some("事件接收端已关闭"));
+                ledger
+                    .finish_async(RunStatus::Cancelled, None, taint, Some("事件接收端已关闭"))
+                    .await;
                 return Err(err);
             }
             let response = match response_result {
                 Ok(r) => r,
                 Err(e) => {
                     let msg = format!("Agent 调用失败: {e}");
-                    ledger.finish(RunStatus::Failed, None, taint, Some(&msg));
+                    ledger
+                        .finish_async(RunStatus::Failed, None, taint, Some(&msg))
+                        .await;
                     return Err(AgentRunError::Execution(AppError::Analysis(msg)));
                 }
             };
@@ -864,7 +1173,9 @@ impl AgentExecutor {
                     // LLM 给出最终回答 → 循环结束
                     let content = response.content.unwrap_or_default();
                     let references = tool_context.take_all_references();
-                    ledger.finish(RunStatus::Completed, Some(&content), taint, None);
+                    ledger
+                        .finish_async(RunStatus::Completed, Some(&content), taint, None)
+                        .await;
                     emit_done(&event_tx, &content, &references, &tool_labels).await?;
                     return Ok(AgentResult {
                         answer: content,
@@ -886,7 +1197,9 @@ impl AgentExecutor {
                             "模型未返回可执行的工具调用，请稍后重试。".to_string()
                         });
                         let references = tool_context.take_all_references();
-                        ledger.finish(RunStatus::Completed, Some(&content), taint, None);
+                        ledger
+                            .finish_async(RunStatus::Completed, Some(&content), taint, None)
+                            .await;
                         emit_done(&event_tx, &content, &references, &tool_labels).await?;
                         return Ok(AgentResult {
                             answer: content,
@@ -938,15 +1251,17 @@ impl AgentExecutor {
                                 let decision =
                                     HarnessPolicyEngine::evaluate(&spec, taint, channel_caps);
                                 policy_decision_label = decision.as_str();
-                                ledger.event(
-                                    HarnessEventKind::PolicyEvaluated,
-                                    Some(tool),
-                                    serde_json::json!({
-                                        "riskTier": spec.risk_tier.as_str(),
-                                        "decision": policy_decision_label,
-                                        "taint": taint.to_flag_string(),
-                                    }),
-                                );
+                                ledger
+                                    .event_async(
+                                        HarnessEventKind::PolicyEvaluated,
+                                        Some(tool),
+                                        serde_json::json!({
+                                            "riskTier": spec.risk_tier.as_str(),
+                                            "decision": policy_decision_label,
+                                            "taint": taint.to_flag_string(),
+                                        }),
+                                    )
+                                    .await;
                                 match decision {
                                     PolicyDecision::Allow => {}
                                     PolicyDecision::Deny { reason } => {
@@ -957,15 +1272,19 @@ impl AgentExecutor {
                                         reason,
                                         taint_triggered,
                                     } => {
-                                        ledger.set_status(RunStatus::WaitingApproval, taint);
-                                        ledger.event(
-                                            HarnessEventKind::ApprovalRequested,
-                                            Some(tool),
-                                            serde_json::json!({
-                                                "taintTriggered": taint_triggered,
-                                                "reason": reason,
-                                            }),
-                                        );
+                                        ledger
+                                            .set_status_async(RunStatus::WaitingApproval, taint)
+                                            .await;
+                                        ledger
+                                            .event_async(
+                                                HarnessEventKind::ApprovalRequested,
+                                                Some(tool),
+                                                serde_json::json!({
+                                                    "taintTriggered": taint_triggered,
+                                                    "reason": reason,
+                                                }),
+                                            )
+                                            .await;
                                         let confirm_outcome = Self::request_confirmation(
                                             tool,
                                             &tc.arguments,
@@ -975,17 +1294,19 @@ impl AgentExecutor {
                                             deadline,
                                         )
                                         .await?;
-                                        ledger.set_status(RunStatus::Running, taint);
+                                        ledger.set_status_async(RunStatus::Running, taint).await;
                                         let outcome_label = match confirm_outcome {
                                             ConfirmDecision::Approved => "approved",
                                             ConfirmDecision::Denied => "denied",
                                             ConfirmDecision::TimedOut => "timed_out",
                                         };
-                                        ledger.event(
-                                            HarnessEventKind::ApprovalResolved,
-                                            Some(tool),
-                                            serde_json::json!({ "outcome": outcome_label }),
-                                        );
+                                        ledger
+                                            .event_async(
+                                                HarnessEventKind::ApprovalResolved,
+                                                Some(tool),
+                                                serde_json::json!({ "outcome": outcome_label }),
+                                            )
+                                            .await;
                                         match confirm_outcome {
                                             ConfirmDecision::Approved => {
                                                 policy_decision_label = "approved";
@@ -1031,12 +1352,14 @@ impl AgentExecutor {
                                     }
                                     AwaitOutcome::Cancelled => {
                                         let references = tool_context.take_all_references();
-                                        ledger.finish(
-                                            RunStatus::Cancelled,
-                                            Some(CANCELLED_ANSWER),
-                                            taint,
-                                            None,
-                                        );
+                                        ledger
+                                            .finish_async(
+                                                RunStatus::Cancelled,
+                                                Some(CANCELLED_ANSWER),
+                                                taint,
+                                                None,
+                                            )
+                                            .await;
                                         emit_done(
                                             &event_tx,
                                             CANCELLED_ANSWER,
@@ -1058,28 +1381,34 @@ impl AgentExecutor {
                             let duration_ms = tool_started.elapsed().as_millis() as i64;
                             if let (Some((tool, _)), Some(spec)) = (&trusted_metadata, tool_spec) {
                                 HarnessPolicyEngine::propagate_taint(&mut taint, &spec, ok);
-                                ledger.record_audit(
-                                    tool,
-                                    spec.risk_tier.as_str(),
-                                    policy_decision_label,
-                                    taint,
-                                    ok,
-                                    duration_ms,
-                                    policy_reason.as_deref(),
-                                );
-                                ledger.event(
-                                    HarnessEventKind::ToolCompleted,
-                                    Some(tool),
-                                    serde_json::json!({
-                                        "ok": ok,
-                                        "durationMs": duration_ms,
-                                        "taint": taint.to_flag_string(),
-                                    }),
-                                );
+                                ledger
+                                    .record_audit_async(
+                                        tool,
+                                        spec.risk_tier.as_str(),
+                                        policy_decision_label,
+                                        taint,
+                                        ok,
+                                        duration_ms,
+                                        policy_reason.as_deref(),
+                                    )
+                                    .await;
+                                ledger
+                                    .event_async(
+                                        HarnessEventKind::ToolCompleted,
+                                        Some(tool),
+                                        serde_json::json!({
+                                            "ok": ok,
+                                            "durationMs": duration_ms,
+                                            "taint": taint.to_flag_string(),
+                                        }),
+                                    )
+                                    .await;
                             } else {
                                 // 未注册/被撤销的工具名可能是提示词注入探测：fail-closed 拒绝并落盘固定占位审计，
                                 // 绝不将模型输出的原始未注册工具名写入 SQLite。
-                                ledger.record_unregistered_tool_denial(taint, duration_ms);
+                                ledger
+                                    .record_unregistered_tool_denial_async(taint, duration_ms)
+                                    .await;
                             }
 
                             // 步骤结束：推送 StepResult（携带本轮新增引用与可信状态元数据）。
@@ -1110,11 +1439,13 @@ impl AgentExecutor {
                                                 context_budget.max_tool_result_chars,
                                             );
                                         if let Some(art_id) = artifact_id {
-                                            ledger.event(
-                                                HarnessEventKind::ArtifactStored,
-                                                Some(tool),
-                                                serde_json::json!({ "artifactId": art_id }),
-                                            );
+                                            ledger
+                                                .event_async(
+                                                    HarnessEventKind::ArtifactStored,
+                                                    Some(tool),
+                                                    serde_json::json!({ "artifactId": art_id }),
+                                                )
+                                                .await;
                                         }
                                         clipped
                                     } else {
@@ -1134,7 +1465,9 @@ impl AgentExecutor {
                                 .is_some_and(|(tool, _)| !is_web_tool(tool));
                             let already_wrapped =
                                 trusted_metadata.as_ref().is_some_and(|(tool, _)| {
-                                    tool == "semantic_search" || tool == "load_skill"
+                                    tool == "semantic_search"
+                                        || tool == "load_skill"
+                                        || tool == "read_run_artifact"
                                 });
                             let result = if ok && is_local_tool && !already_wrapped {
                                 wrap_local_record_content(&result)
@@ -1157,13 +1490,15 @@ impl AgentExecutor {
                         .content
                         .unwrap_or_else(|| "回答被截断，请尝试缩短问题。".to_string());
                     let references = tool_context.take_all_references();
-                    ledger.finish_with_meta(
-                        RunStatus::Completed,
-                        Some(&content),
-                        taint,
-                        None,
-                        true,
-                    );
+                    ledger
+                        .finish_with_meta_async(
+                            RunStatus::Completed,
+                            Some(&content),
+                            taint,
+                            None,
+                            true,
+                        )
+                        .await;
                     emit_done(&event_tx, &content, &references, &tool_labels).await?;
                     return Ok(AgentResult {
                         answer: content,
@@ -1177,7 +1512,7 @@ impl AgentExecutor {
         }
 
         // ── 超过最大迭代次数：先按需压缩上下文，再走收束路径，把已有工具结果转成答案 ──
-        maybe_compact_messages(&mut messages, &sys, &context_budget, &mut ledger);
+        maybe_compact_messages(&mut messages, &sys, &context_budget, &mut ledger).await;
         let result = Self::wrap_up(
             model_config,
             &sys,
@@ -1189,25 +1524,37 @@ impl AgentExecutor {
             deadline,
         )
         .await;
-        match &result {
-            Ok(res) => {
-                let status = if res.answer == CANCELLED_ANSWER {
-                    RunStatus::Cancelled
+        match result {
+            Ok((res, _used_fallback)) => {
+                if res.answer == CANCELLED_ANSWER {
+                    ledger
+                        .finish_async(RunStatus::Cancelled, Some(&res.answer), taint, None)
+                        .await;
                 } else {
-                    RunStatus::Completed
-                };
-                ledger.finish(status, Some(&res.answer), taint, None);
+                    ledger
+                        .finish_with_meta_async(
+                            RunStatus::Completed,
+                            Some(&res.answer),
+                            taint,
+                            None,
+                            true,
+                        )
+                        .await;
+                }
+                Ok(res)
             }
             Err(err) => {
-                ledger.finish(RunStatus::Failed, None, taint, Some(&format!("{err:?}")));
+                ledger
+                    .finish_async(RunStatus::Failed, None, taint, Some(&format!("{err:?}")))
+                    .await;
+                Err(err)
             }
         }
-        result
     }
 
     /// 收束路径：预算（时长/轮数）耗尽时，禁用工具做最后一次模型调用，
     /// 强制基于已收集的工具结果产出答案；若一次工具都没跑过或收束调用失败，
-    /// 退回固定文案。
+    /// 退回固定文案，并通过返回值第二项 `used_fallback` 告知调用方是否命中兜底超时文案。
     #[allow(clippy::too_many_arguments)]
     async fn wrap_up(
         model_config: &ModelConfig,
@@ -1218,16 +1565,19 @@ impl AgentExecutor {
         event_tx: &Option<StreamEventSender>,
         cancel_rx: &mut Option<tokio::sync::watch::Receiver<bool>>,
         deadline: Deadline,
-    ) -> Result<AgentResult, AgentRunError> {
+    ) -> Result<(AgentResult, bool), AgentRunError> {
         ensure_event_receiver_open(event_tx)?;
         if is_cancelled(cancel_rx) {
             let references = tool_context.take_all_references();
             emit_done(event_tx, CANCELLED_ANSWER, &references, &tool_labels).await?;
-            return Ok(AgentResult {
-                answer: CANCELLED_ANSWER.to_string(),
-                tool_labels,
-                references,
-            });
+            return Ok((
+                AgentResult {
+                    answer: CANCELLED_ANSWER.to_string(),
+                    tool_labels,
+                    references,
+                },
+                false,
+            ));
         }
 
         let fallback = if tool_labels.is_empty() {
@@ -1239,11 +1589,14 @@ impl AgentExecutor {
         if tool_labels.is_empty() {
             let references = tool_context.take_all_references();
             emit_done(event_tx, &fallback, &references, &tool_labels).await?;
-            return Ok(AgentResult {
-                answer: fallback,
-                tool_labels,
-                references,
-            });
+            return Ok((
+                AgentResult {
+                    answer: fallback,
+                    tool_labels,
+                    references,
+                },
+                true,
+            ));
         }
 
         messages.push(Message::user(
@@ -1274,18 +1627,24 @@ impl AgentExecutor {
         })
         .await?;
 
-        let content = match wrap_result {
-            AwaitOutcome::Done(Ok(response)) => response.content.unwrap_or(fallback),
-            AwaitOutcome::Done(Err(_)) => fallback,
-            AwaitOutcome::Cancelled => CANCELLED_ANSWER.to_string(),
+        let (content, used_fallback) = match wrap_result {
+            AwaitOutcome::Done(Ok(response)) => match response.content {
+                Some(text) if !text.trim().is_empty() => (text, false),
+                _ => (fallback, true),
+            },
+            AwaitOutcome::Done(Err(_)) => (fallback, true),
+            AwaitOutcome::Cancelled => (CANCELLED_ANSWER.to_string(), false),
         };
         let references = tool_context.take_all_references();
         emit_done(event_tx, &content, &references, &tool_labels).await?;
-        Ok(AgentResult {
-            answer: content,
-            tool_labels,
-            references,
-        })
+        Ok((
+            AgentResult {
+                answer: content,
+                tool_labels,
+                references,
+            },
+            used_fallback,
+        ))
     }
 
     /// 行动工具确认流程：推送 ConfirmRequest 事件 → 等待前端回传决定。
@@ -1853,7 +2212,8 @@ mod tests {
             })
             .await
             .expect("已取消的收束不应等待模型");
-            let result = result.unwrap();
+            let (result, used_fallback) = result.unwrap();
+            assert!(!used_fallback);
             assert_eq!(result.answer, CANCELLED_ANSWER);
             assert_eq!(result.tool_labels, tool_labels);
             assert_eq!(messages.len(), 1, "取消后不应追加收束模型提示");
@@ -2207,5 +2567,69 @@ mod tests {
         let err_msg2 = trace2.run.error_message.as_deref().unwrap_or("");
         assert!(err_msg2.contains("网关报错"));
         assert!(!err_msg2.contains("sk-proj-1234567890abcdef"));
+    }
+
+    #[test]
+    fn 上下文压缩文本估算应同时计入assistant正文与tool_calls() {
+        let mut msg = Message::assistant_with_tool_calls(&[super::model::ToolCall {
+            id: "call_1".to_string(),
+            name: "project_stats".to_string(),
+            arguments: serde_json::json!({ "days": 7 }),
+        }]);
+        msg.content = Some("正在查询项目统计".to_string());
+        let text = compaction_message_text(&msg);
+        assert!(text.contains("正在查询项目统计"));
+        assert!(text.contains("project_stats"));
+
+        msg.content = None;
+        let only_calls = compaction_message_text(&msg);
+        assert!(only_calls.contains("project_stats"));
+    }
+
+    #[tokio::test]
+    async fn 请求时长预算耗尽触发兜底文案时账本应记录为timed_out() {
+        let db = Database::new(std::path::Path::new(":memory:")).expect("创建内存库失败");
+        let model = ModelConfig {
+            provider: work_review_core::config::AiProvider::OpenAI,
+            endpoint: "http://127.0.0.1:1".to_string(),
+            api_key: Some(String::new()),
+            model: "test-timeout-model".to_string(),
+            enable_thinking: None,
+            thinking_budget: None,
+            max_output_tokens: None,
+        };
+        let runtime = AssistantRuntime {
+            run_source: Some("desktop".to_string()),
+            ..Default::default()
+        };
+
+        // 零时长预算 → 首轮直接进入 wrap_up 兜底，触发 RunStatus::TimedOut
+        let res = AgentExecutor::run(
+            "帮我汇总今日工作",
+            AssistantRequestMode::WorkReview,
+            &model,
+            &db,
+            None,
+            &[],
+            None,
+            vec![],
+            vec![],
+            None,
+            runtime,
+            None,
+            Deadline::after(Duration::from_secs(0)),
+        )
+        .await
+        .expect("超时收束应优雅返回兜底文案");
+
+        assert!(res.answer.contains("处理超时"));
+        let runs = db.list_agent_runs(None, 10).expect("查询运行列表失败");
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, "timed_out");
+        assert!(runs[0]
+            .error_message
+            .as_deref()
+            .unwrap_or("")
+            .contains("时长预算"));
     }
 }

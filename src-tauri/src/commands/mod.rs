@@ -54,7 +54,7 @@ pub use user_memory::*;
 pub(crate) use shared::{
     collect_privacy_filters, filter_activities_by_privacy, is_iso_date,
     load_filtered_activities_in_range, merge_manual_followups_into_todos, parse_temporal_range,
-    persist_app_config, resolve_single_date, sanitize_activities_for_external,
+    persist_app_config, resolve_single_date, sanitize_activities_for_external, update_app_config,
     update_app_config_with_source, ConfigWriteSource,
 };
 pub(crate) use system::apply_dock_visibility;

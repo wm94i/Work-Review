@@ -8508,6 +8508,72 @@ mod tests {
     }
 
     #[test]
+    fn 带端口的ip网址应从地址标题和ocr计入同一站点并保留页面端口() {
+        let db = in_memory_db();
+        let date = "2026-11-27";
+        let url = "http://60.205.157.148:8080/v2/index";
+        let other_port = "http://60.205.157.148:8081/v2/index";
+        let cases = [
+            (Some(url), "管理控制台", None),
+            (
+                None,
+                "管理控制台 - 60.205.157.148:8080/v2/index - Google Chrome",
+                None,
+            ),
+            (
+                None,
+                "管理控制台",
+                Some("不安全 60.205.157.148:8080/v2/index"),
+            ),
+            (Some(other_port), "其他服务", None),
+        ];
+        for (index, (browser_url, title, ocr)) in cases.into_iter().enumerate() {
+            let mut activity =
+                sample_activity(local_ts(date, 10, index as u32 + 1), "Google Chrome");
+            activity.duration = 60;
+            activity.category = "browser".to_string();
+            activity.window_title = title.to_string();
+            activity.browser_url = browser_url.map(str::to_string);
+            activity.ocr_text = ocr.map(str::to_string);
+            db.insert_activity(&activity).unwrap();
+        }
+
+        let stats = db.get_daily_stats(date).unwrap();
+        assert_eq!(stats.browser_duration, 240);
+        assert_eq!(stats.domain_total_count, 1);
+        let domain = &stats.domain_usage[0];
+        assert_eq!(domain.domain, "60.205.157.148");
+        assert_eq!(domain.duration, 240);
+        assert_eq!(domain.urls.len(), 2);
+        assert_eq!(
+            domain
+                .urls
+                .iter()
+                .find(|page| page.url == url)
+                .unwrap()
+                .duration,
+            180
+        );
+        assert_eq!(
+            domain
+                .urls
+                .iter()
+                .find(|page| page.url == other_port)
+                .unwrap()
+                .duration,
+            60
+        );
+        assert_eq!(stats.browser_usage[0].domains[0].domain, domain.domain);
+
+        let excluded = ["60.205.157.148".to_string()];
+        let filtered = db
+            .get_daily_stats_with_segments_filtered(date, &[], &[], &excluded)
+            .unwrap();
+        assert_eq!(filtered.browser_duration, 0);
+        assert!(filtered.domain_usage.is_empty());
+    }
+
+    #[test]
     fn 网站历史回填应覆盖推断页面并与展示及工休统计一致() {
         let db = in_memory_db();
         let date = "2026-03-27";

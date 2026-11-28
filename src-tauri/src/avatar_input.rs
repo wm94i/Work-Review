@@ -20,22 +20,53 @@ static LAST_MOUSE_GROUP_CODE: AtomicU8 = AtomicU8::new(0);
 static CURSOR_RATIO_X_PERMILLE: AtomicU32 = AtomicU32::new(500);
 static CURSOR_RATIO_Y_PERMILLE: AtomicU32 = AtomicU32::new(500);
 static CURSOR_RATIO_INITIALIZED: AtomicBool = AtomicBool::new(false);
+static KEYBOARD_HAS_PRESSED_KEYS: AtomicBool = AtomicBool::new(false);
+#[cfg(target_os = "windows")]
+static WINDOWS_KEYBOARD_INPUTS: Lazy<KeyboardInputBuffer> = Lazy::new(KeyboardInputBuffer::new);
+#[cfg(target_os = "windows")]
+static WINDOWS_HOOK_THREAD_ID: AtomicU32 = AtomicU32::new(0);
+#[cfg(target_os = "windows")]
+static WINDOWS_RAW_CURSOR_POS: AtomicU64 = AtomicU64::new(0);
+#[cfg(target_os = "windows")]
+static WINDOWS_RAW_CURSOR_DIRTY: AtomicBool = AtomicBool::new(false);
+#[cfg(target_os = "windows")]
+type VirtualScreenCache = Option<(std::time::Instant, (i32, i32, f64, f64))>;
+#[cfg(target_os = "windows")]
+static WINDOWS_VIRTUAL_SCREEN_CACHE: Lazy<Mutex<VirtualScreenCache>> =
+    Lazy::new(|| Mutex::new(None));
 #[cfg(target_os = "linux")]
 static WAYLAND_CURSOR_POSITION: AtomicU64 = AtomicU64::new(0);
 #[cfg(target_os = "linux")]
 static WAYLAND_CURSOR_UPDATED_AT_MS: AtomicU64 = AtomicU64::new(0);
-static INPUT_BRIDGE_STARTED: AtomicBool = AtomicBool::new(false);
+static INPUT_BRIDGE_GEN: AtomicU64 = AtomicU64::new(0);
 static INPUT_MONITOR_STARTED: AtomicBool = AtomicBool::new(false);
+static INPUT_MONITOR_GEN: AtomicU64 = AtomicU64::new(0);
+static INPUT_MONITOR_LIFECYCLE_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 #[cfg(target_os = "macos")]
-static INPUT_MONITOR_RETRY_STARTED: AtomicBool = AtomicBool::new(false);
-// 智能穿透运行时状态（无锁读，避免轮询每轮锁 Mutex）
+static INPUT_MONITOR_RETRY_GEN: AtomicU64 = AtomicU64::new(0);
+// 智能穿透与隐藏本体运行时状态（无锁读，避免轮询每轮锁 Mutex）
 static AVATAR_CLICK_THROUGH_ENABLED: AtomicBool = AtomicBool::new(false);
 static AVATAR_ENABLED_FLAG: AtomicBool = AtomicBool::new(false);
+static AVATAR_BODY_HIDDEN_FLAG: AtomicBool = AtomicBool::new(false);
 // set_ignore_cursor_events 缓存：-1=未知，0=false，1=true
 static AVATAR_CLICK_THROUGH_IGNORE_CACHE: AtomicI8 = AtomicI8::new(-1);
 
 pub fn set_avatar_click_through_flag(on: bool) {
     AVATAR_CLICK_THROUGH_ENABLED.store(on, Ordering::Relaxed);
+}
+pub fn set_avatar_body_hidden_flag(hidden: bool) {
+    AVATAR_BODY_HIDDEN_FLAG.store(hidden, Ordering::Relaxed);
+    if hidden {
+        #[cfg(target_os = "windows")]
+        WINDOWS_KEYBOARD_INPUTS.invalidate();
+        KEYBOARD_HAS_PRESSED_KEYS.store(false, Ordering::Relaxed);
+        KEYBOARD_STATE
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .pressed_keys
+            .clear();
+    }
+    force_resync_click_through();
 }
 pub fn set_avatar_enabled_flag(on: bool) {
     AVATAR_ENABLED_FLAG.store(on, Ordering::Relaxed);
@@ -52,17 +83,22 @@ static KEYBOARD_STATE: Lazy<Mutex<KeyboardInputState>> =
     Lazy::new(|| Mutex::new(KeyboardInputState::default()));
 
 fn clear_avatar_input_state() {
+    #[cfg(target_os = "windows")]
+    WINDOWS_KEYBOARD_INPUTS.invalidate();
     LAST_KEYBOARD_INPUT_AT_MS.store(0, Ordering::Relaxed);
     LAST_MOUSE_INPUT_AT_MS.store(0, Ordering::Relaxed);
     LAST_KEYBOARD_GROUP_CODE.store(0, Ordering::Relaxed);
     LAST_KEYBOARD_KEY_CODE.store(0, Ordering::Relaxed);
     LAST_MOUSE_GROUP_CODE.store(0, Ordering::Relaxed);
     CURSOR_RATIO_INITIALIZED.store(false, Ordering::Relaxed);
+    KEYBOARD_HAS_PRESSED_KEYS.store(false, Ordering::Relaxed);
     KEYBOARD_STATE
         .lock()
         .unwrap_or_else(|error| error.into_inner())
         .pressed_keys
         .clear();
+    #[cfg(target_os = "windows")]
+    WINDOWS_RAW_CURSOR_DIRTY.store(false, Ordering::Relaxed);
     #[cfg(target_os = "linux")]
     WAYLAND_CURSOR_UPDATED_AT_MS.store(0, Ordering::Relaxed);
 }
@@ -88,6 +124,7 @@ const MOUSE_GROUP_LEFT: u8 = 2;
 const MOUSE_GROUP_RIGHT: u8 = 3;
 const MOUSE_GROUP_SIDE: u8 = 4;
 const INPUT_BRIDGE_POLL_INTERVAL: Duration = Duration::from_millis(16);
+const INPUT_BRIDGE_IDLE_POLL_INTERVAL: Duration = Duration::from_millis(64);
 #[cfg(target_os = "macos")]
 const INPUT_MONITOR_RETRY_INTERVAL: Duration = Duration::from_secs(2);
 const PRESSED_KEY_STALE_MS: u64 = KEYBOARD_ACTIVE_WINDOW_MS;
@@ -104,6 +141,72 @@ struct KeyboardInputState {
 struct PressedKeyState {
     key_code: u16,
     pressed_at_ms: u64,
+}
+
+#[cfg(any(target_os = "windows", test))]
+const KEYBOARD_INPUT_CAPACITY: usize = 256;
+
+#[cfg(any(target_os = "windows", test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BufferedKeyboardInput {
+    epoch: u64,
+    pressed_at_ms: u64,
+    key_code: u16,
+    group_code: u8,
+    pressed: bool,
+}
+
+#[cfg(any(target_os = "windows", test))]
+struct KeyboardInputBuffer {
+    sender: std::sync::mpsc::SyncSender<BufferedKeyboardInput>,
+    receiver: Mutex<std::sync::mpsc::Receiver<BufferedKeyboardInput>>,
+    epoch: AtomicU64,
+    reset_pending: AtomicBool,
+}
+
+#[cfg(any(target_os = "windows", test))]
+impl KeyboardInputBuffer {
+    fn new() -> Self {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(KEYBOARD_INPUT_CAPACITY);
+        Self {
+            sender,
+            receiver: Mutex::new(receiver),
+            epoch: AtomicU64::new(0),
+            reset_pending: AtomicBool::new(false),
+        }
+    }
+
+    fn invalidate(&self) {
+        self.epoch.fetch_add(1, Ordering::AcqRel);
+        self.reset_pending.store(true, Ordering::Release);
+    }
+
+    fn push(&self, input: BufferedKeyboardInput) -> bool {
+        if input.epoch != self.epoch.load(Ordering::Acquire) {
+            return false;
+        }
+        if self.sender.try_send(input).is_err() {
+            // shortcut: 超过 256 个待采样键事件时重置可视按键；需完整展示高频宏时再扩容。
+            self.invalidate();
+            return false;
+        }
+        true
+    }
+
+    fn drain(&self) -> (bool, Vec<BufferedKeyboardInput>) {
+        let receiver = self
+            .receiver
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let reset = self.reset_pending.swap(false, Ordering::AcqRel);
+        let epoch = self.epoch.load(Ordering::Acquire);
+        let events = receiver
+            .try_iter()
+            .take(KEYBOARD_INPUT_CAPACITY)
+            .filter(|input| input.epoch == epoch)
+            .collect();
+        (reset, events)
+    }
 }
 
 fn now_ms() -> u64 {
@@ -151,6 +254,7 @@ fn current_keyboard_key_codes(now_ms: u64) -> Vec<u16> {
     state
         .pressed_keys
         .retain(|item| now_ms.saturating_sub(item.pressed_at_ms) <= PRESSED_KEY_STALE_MS);
+    KEYBOARD_HAS_PRESSED_KEYS.store(!state.pressed_keys.is_empty(), Ordering::Relaxed);
 
     state
         .pressed_keys
@@ -542,7 +646,7 @@ fn run_linux_avatar_command_with_timeout(
         match child.try_wait() {
             Ok(Some(_)) => return child.wait_with_output().ok(),
             Ok(None) if started_at.elapsed() < timeout => {
-                thread::sleep(Duration::from_millis(50));
+                thread::sleep(Duration::from_millis(20));
             }
             Ok(None) => {
                 let _ = child.kill();
@@ -776,17 +880,47 @@ fn virtual_desktop_logical_bounds_from_monitors(app: &AppHandle) -> Option<(i32,
     ))
 }
 
+#[cfg(target_os = "linux")]
+fn probe_linux_wayland_mouse_providers(
+    session: crate::linux_session::LinuxDesktopSession,
+    desktop_environment: crate::linux_session::LinuxDesktopEnvironment,
+) -> (bool, bool, bool) {
+    use crate::linux_session::{LinuxDesktopEnvironment, LinuxDesktopSession};
+
+    if session != LinuxDesktopSession::Wayland {
+        return (false, false, false);
+    }
+
+    match desktop_environment {
+        LinuxDesktopEnvironment::Gnome => {
+            (is_gnome_wayland_mouse_provider_available(), false, false)
+        }
+        LinuxDesktopEnvironment::Kde => (false, is_kde_wayland_mouse_provider_available(), false),
+        LinuxDesktopEnvironment::Hyprland => {
+            (false, false, is_hyprland_wayland_mouse_provider_available())
+        }
+        LinuxDesktopEnvironment::Sway => (false, false, false),
+        LinuxDesktopEnvironment::Unknown => (
+            is_gnome_wayland_mouse_provider_available(),
+            is_kde_wayland_mouse_provider_available(),
+            is_hyprland_wayland_mouse_provider_available(),
+        ),
+    }
+}
+
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 #[cfg(target_os = "linux")]
 pub fn current_linux_avatar_input_support() -> LinuxAvatarInputSupport {
     let session = crate::linux_session::current_linux_desktop_session();
     let desktop_environment = crate::linux_session::current_linux_desktop_environment();
+    let (gnome_available, kde_available, hyprland_available) =
+        probe_linux_wayland_mouse_providers(session, desktop_environment);
     linux_avatar_input_support_for_session(
         session,
         desktop_environment,
-        is_gnome_wayland_mouse_provider_available(),
-        is_kde_wayland_mouse_provider_available(),
-        is_hyprland_wayland_mouse_provider_available(),
+        gnome_available,
+        kde_available,
+        hyprland_available,
     )
 }
 
@@ -797,14 +931,17 @@ pub fn current_linux_avatar_input_support() -> LinuxAvatarInputSupport {
 }
 
 #[cfg(target_os = "macos")]
-fn mouse_group_from_event_type(event_type: cocoa::appkit::NSEventType) -> u8 {
+fn mouse_group_from_event_type_raw(event_type_raw: usize) -> u8 {
     use cocoa::appkit::NSEventType;
 
-    match event_type {
-        NSEventType::NSLeftMouseDown => MOUSE_GROUP_LEFT,
-        NSEventType::NSRightMouseDown => MOUSE_GROUP_RIGHT,
-        NSEventType::NSOtherMouseDown => MOUSE_GROUP_SIDE,
-        _ => MOUSE_GROUP_MOVE,
+    if event_type_raw == NSEventType::NSLeftMouseDown as usize {
+        MOUSE_GROUP_LEFT
+    } else if event_type_raw == NSEventType::NSRightMouseDown as usize {
+        MOUSE_GROUP_RIGHT
+    } else if event_type_raw == NSEventType::NSOtherMouseDown as usize {
+        MOUSE_GROUP_SIDE
+    } else {
+        MOUSE_GROUP_MOVE
     }
 }
 
@@ -857,10 +994,10 @@ fn windows_virtual_key_to_avatar_key_code(virtual_key: u32) -> Option<u16> {
         0x26 => Some(126),
         0x27 => Some(124),
         0x28 => Some(125),
-        0x2C => Some(43),
-        0x2E => Some(47),
-        0x2F => Some(44),
-        0x2D => Some(117),
+        0xBC => Some(43),
+        0xBE => Some(47),
+        0xBF => Some(44),
+        0x2E => Some(117),
         0xA0 => Some(56),
         0xA1 => Some(60),
         0xA2 => Some(59),
@@ -890,20 +1027,100 @@ fn windows_mouse_group_from_message(message: u32) -> u8 {
 }
 
 #[cfg(target_os = "windows")]
-fn cursor_ratio_from_virtual_screen(point_x: i32, point_y: i32) -> (f64, f64) {
+fn cached_windows_virtual_screen_metrics() -> (i32, i32, f64, f64) {
     use winapi::um::winuser::{
         GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
         SM_YVIRTUALSCREEN,
     };
 
+    const CACHE_TTL: Duration = Duration::from_secs(2);
+    let now = std::time::Instant::now();
+    {
+        let cache = WINDOWS_VIRTUAL_SCREEN_CACHE
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some((captured_at, metrics)) = *cache {
+            if now.duration_since(captured_at) < CACHE_TTL {
+                return metrics;
+            }
+        }
+    }
+
     let min_x = unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) };
     let min_y = unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) };
     let width = unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) }.max(1) as f64;
     let height = unsafe { GetSystemMetrics(SM_CYVIRTUALSCREEN) }.max(1) as f64;
+    let metrics = (min_x, min_y, width, height);
+
+    let mut cache = WINDOWS_VIRTUAL_SCREEN_CACHE
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    *cache = Some((now, metrics));
+    metrics
+}
+
+#[cfg(target_os = "windows")]
+fn cursor_ratio_from_virtual_screen(point_x: i32, point_y: i32) -> (f64, f64) {
+    let (min_x, min_y, width, height) = cached_windows_virtual_screen_metrics();
     let x_ratio = ((point_x - min_x) as f64 / width).clamp(0.0, 1.0);
     let y_ratio = ((point_y - min_y) as f64 / height).clamp(0.0, 1.0);
 
     (x_ratio, y_ratio)
+}
+
+#[cfg(target_os = "windows")]
+fn buffer_windows_keyboard_input(input: BufferedKeyboardInput) {
+    if WINDOWS_KEYBOARD_INPUTS.push(input) && input.pressed {
+        LAST_KEYBOARD_INPUT_AT_MS.store(input.pressed_at_ms, Ordering::Relaxed);
+        LAST_KEYBOARD_GROUP_CODE.store(input.group_code, Ordering::Relaxed);
+        LAST_KEYBOARD_KEY_CODE.store(input.key_code, Ordering::Relaxed);
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn sync_windows_keyboard_input() {
+    let (reset, events) = WINDOWS_KEYBOARD_INPUTS.drain();
+    if !reset && events.is_empty() {
+        return;
+    }
+    let mut state = KEYBOARD_STATE
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if reset {
+        state.pressed_keys.clear();
+    }
+    for input in events {
+        if input.epoch != WINDOWS_KEYBOARD_INPUTS.epoch.load(Ordering::Acquire) {
+            continue;
+        }
+        if input.pressed
+            && (!AVATAR_ENABLED_FLAG.load(Ordering::Relaxed)
+                || AVATAR_BODY_HIDDEN_FLAG.load(Ordering::Relaxed))
+        {
+            continue;
+        }
+        state
+            .pressed_keys
+            .retain(|key| key.key_code != input.key_code);
+        if input.pressed {
+            state.pressed_keys.push(PressedKeyState {
+                key_code: input.key_code,
+                pressed_at_ms: input.pressed_at_ms,
+            });
+        }
+    }
+    KEYBOARD_HAS_PRESSED_KEYS.store(!state.pressed_keys.is_empty(), Ordering::Relaxed);
+}
+
+#[cfg(target_os = "windows")]
+fn sync_windows_cursor_ratio() {
+    if !WINDOWS_RAW_CURSOR_DIRTY.swap(false, Ordering::AcqRel) {
+        return;
+    }
+
+    let (x, y) = unpack_wayland_cursor_position(WINDOWS_RAW_CURSOR_POS.load(Ordering::Relaxed));
+    let (cursor_ratio_x, cursor_ratio_y) = cursor_ratio_from_virtual_screen(x, y);
+    record_cursor_ratio(cursor_ratio_x, cursor_ratio_y);
 }
 
 #[cfg(target_os = "windows")]
@@ -917,25 +1134,38 @@ unsafe extern "system" fn windows_keyboard_hook_proc(
         CallNextHookEx, KBDLLHOOKSTRUCT, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
     };
 
-    if code >= 0 {
-        let keyboard_info = &*(l_param as *const KBDLLHOOKSTRUCT);
+    let epoch = WINDOWS_KEYBOARD_INPUTS.epoch.load(Ordering::Acquire);
+    if code >= 0 && AVATAR_ENABLED_FLAG.load(Ordering::Relaxed) {
+        // SAFETY: 非负 Hook code 下，Windows 提供当前回调期间有效的键盘事件结构。
+        let keyboard_info = unsafe { &*(l_param as *const KBDLLHOOKSTRUCT) };
         if let Some(key_code) = windows_virtual_key_to_avatar_key_code(keyboard_info.vkCode) {
             match w_param as u32 {
-                WM_KEYDOWN | WM_SYSKEYDOWN => {
-                    record_keyboard_input(
-                        standard_keyboard_group_from_key_code(key_code),
+                WM_KEYDOWN | WM_SYSKEYDOWN if !AVATAR_BODY_HIDDEN_FLAG.load(Ordering::Relaxed) => {
+                    buffer_windows_keyboard_input(BufferedKeyboardInput {
+                        epoch,
+                        pressed_at_ms: now_ms(),
                         key_code,
-                    );
+                        group_code: standard_keyboard_group_from_key_code(key_code),
+                        pressed: true,
+                    });
                 }
+                // 隐藏期间仍入队松键事件；可视状态锁仅由普通采样线程获取。
                 WM_KEYUP | WM_SYSKEYUP => {
-                    release_keyboard_input(key_code);
+                    buffer_windows_keyboard_input(BufferedKeyboardInput {
+                        epoch,
+                        pressed_at_ms: 0,
+                        key_code,
+                        group_code: 0,
+                        pressed: false,
+                    });
                 }
                 _ => {}
             }
         }
     }
 
-    CallNextHookEx(ptr::null_mut(), code, w_param, l_param)
+    // SAFETY: 将 Windows 提供的原始回调参数原样传递到 Hook 链。
+    unsafe { CallNextHookEx(ptr::null_mut(), code, w_param, l_param) }
 }
 
 #[cfg(target_os = "windows")]
@@ -945,39 +1175,39 @@ unsafe extern "system" fn windows_mouse_hook_proc(
     l_param: isize,
 ) -> isize {
     use std::ptr;
-    use winapi::shared::windef::POINT;
     use winapi::um::winuser::{
-        CallNextHookEx, GetCursorPos, MSLLHOOKSTRUCT, WM_LBUTTONDOWN, WM_MBUTTONDOWN,
-        WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_XBUTTONDOWN,
+        CallNextHookEx, MSLLHOOKSTRUCT, WM_LBUTTONDOWN, WM_MBUTTONDOWN, WM_MOUSEHWHEEL,
+        WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_XBUTTONDOWN,
     };
 
-    let message = w_param as u32;
-    let tracked_message = matches!(
-        message,
-        WM_MOUSEMOVE
-            | WM_MOUSEWHEEL
-            | WM_MOUSEHWHEEL
-            | WM_LBUTTONDOWN
-            | WM_RBUTTONDOWN
-            | WM_MBUTTONDOWN
-            | WM_XBUTTONDOWN
-    );
+    if code >= 0 && AVATAR_ENABLED_FLAG.load(Ordering::Relaxed) {
+        let message = w_param as u32;
+        let tracked_message = matches!(
+            message,
+            WM_MOUSEMOVE
+                | WM_MOUSEWHEEL
+                | WM_MOUSEHWHEEL
+                | WM_LBUTTONDOWN
+                | WM_RBUTTONDOWN
+                | WM_MBUTTONDOWN
+                | WM_XBUTTONDOWN
+        );
 
-    if code >= 0 && tracked_message {
-        let mouse_info = &*(l_param as *const MSLLHOOKSTRUCT);
-        record_mouse_input(windows_mouse_group_from_message(message));
-        let mut point = POINT {
-            x: mouse_info.pt.x,
-            y: mouse_info.pt.y,
-        };
-        if GetCursorPos(&mut point) == 0 {
-            point = mouse_info.pt;
+        if tracked_message {
+            // 低级鼠标钩子内仅做无锁原子写入，不在 1000Hz 回调里调用 GetCursorPos/GetSystemMetrics。
+            // SAFETY: 这是 Windows 为当前低级鼠标事件提供的有效结构指针。
+            let mouse_info = unsafe { &*(l_param as *const MSLLHOOKSTRUCT) };
+            record_mouse_input(windows_mouse_group_from_message(message));
+            WINDOWS_RAW_CURSOR_POS.store(
+                pack_wayland_cursor_position((mouse_info.pt.x, mouse_info.pt.y)),
+                Ordering::Relaxed,
+            );
+            WINDOWS_RAW_CURSOR_DIRTY.store(true, Ordering::Release);
         }
-        let (cursor_ratio_x, cursor_ratio_y) = cursor_ratio_from_virtual_screen(point.x, point.y);
-        record_cursor_ratio(cursor_ratio_x, cursor_ratio_y);
     }
 
-    CallNextHookEx(ptr::null_mut(), code, w_param, l_param)
+    // SAFETY: 将 Windows 提供的原始回调参数原样传递到 Hook 链。
+    unsafe { CallNextHookEx(ptr::null_mut(), code, w_param, l_param) }
 }
 
 #[cfg(target_os = "linux")]
@@ -986,7 +1216,6 @@ unsafe fn linux_query_cursor_ratio(
     root_window: x11::xlib::Window,
     screen: i32,
 ) -> Option<(f64, f64)> {
-    use std::mem;
     use x11::xlib;
 
     let mut root_return: x11::xlib::Window = 0;
@@ -995,25 +1224,33 @@ unsafe fn linux_query_cursor_ratio(
     let mut root_y = 0;
     let mut win_x = 0;
     let mut win_y = 0;
-    let mut mask_return: u32 = mem::zeroed();
+    let mut mask_return: u32 = 0;
 
-    if xlib::XQueryPointer(
-        display,
-        root_window,
-        &mut root_return,
-        &mut child_return,
-        &mut root_x,
-        &mut root_y,
-        &mut win_x,
-        &mut win_y,
-        &mut mask_return,
-    ) == xlib::False
-    {
+    // SAFETY: 调用方在本线程持有打开的 Display，所有输出参数均为有效局部变量。
+    let found = unsafe {
+        xlib::XQueryPointer(
+            display,
+            root_window,
+            &mut root_return,
+            &mut child_return,
+            &mut root_x,
+            &mut root_y,
+            &mut win_x,
+            &mut win_y,
+            &mut mask_return,
+        )
+    };
+    if found == xlib::False {
         return None;
     }
 
-    let width = xlib::XDisplayWidth(display, screen).max(1) as f64;
-    let height = xlib::XDisplayHeight(display, screen).max(1) as f64;
+    // SAFETY: Display 与 screen 来自同一次有效的 X11 连接。
+    let (width, height) = unsafe {
+        (
+            xlib::XDisplayWidth(display, screen).max(1) as f64,
+            xlib::XDisplayHeight(display, screen).max(1) as f64,
+        )
+    };
 
     Some((
         (root_x as f64 / width).clamp(0.0, 1.0),
@@ -1071,6 +1308,7 @@ pub(crate) fn record_keyboard_input(group_code: u8, key_code: u16) {
             key_code,
             pressed_at_ms,
         });
+        KEYBOARD_HAS_PRESSED_KEYS.store(true, Ordering::Relaxed);
     }
     LAST_KEYBOARD_INPUT_AT_MS.store(pressed_at_ms, Ordering::Relaxed);
     LAST_KEYBOARD_GROUP_CODE.store(group_code, Ordering::Relaxed);
@@ -1086,6 +1324,7 @@ pub(crate) fn release_keyboard_input(key_code: u16) {
         state
             .pressed_keys
             .retain(|existing| existing.key_code != key_code);
+        KEYBOARD_HAS_PRESSED_KEYS.store(!state.pressed_keys.is_empty(), Ordering::Relaxed);
         state.pressed_keys.last().copied()
     };
 
@@ -1119,36 +1358,95 @@ pub(crate) fn record_cursor_ratio(x_ratio: f64, y_ratio: f64) {
     CURSOR_RATIO_INITIALIZED.store(true, Ordering::Release);
 }
 
-pub fn spawn_avatar_input_bridge(app: AppHandle) {
-    if INPUT_BRIDGE_STARTED.swap(true, Ordering::SeqCst) {
-        return;
+fn can_skip_idle_input_payload(last: &AvatarInputPayload) -> bool {
+    if last.keyboard_active || last.mouse_active {
+        return false;
     }
+    if KEYBOARD_HAS_PRESSED_KEYS.load(Ordering::Relaxed) {
+        return false;
+    }
+    if LAST_KEYBOARD_INPUT_AT_MS.load(Ordering::Relaxed) != last.last_keyboard_input_at_ms
+        || LAST_MOUSE_INPUT_AT_MS.load(Ordering::Relaxed) != last.last_mouse_input_at_ms
+    {
+        return false;
+    }
+    let ratio_x = CURSOR_RATIO_X_PERMILLE.load(Ordering::Relaxed) as f64 / 1000.0;
+    let ratio_y = CURSOR_RATIO_Y_PERMILLE.load(Ordering::Relaxed) as f64 / 1000.0;
+    last.cursor_ratio_x == ratio_x && last.cursor_ratio_y == ratio_y
+}
 
+pub fn spawn_avatar_input_bridge(app: AppHandle) {
+    let bridge_gen = INPUT_BRIDGE_GEN.fetch_add(1, Ordering::SeqCst) + 1;
     let smart_click_through_polling_enabled = smart_click_through_polling_enabled_for_platform();
 
     tauri::async_runtime::spawn(async move {
         let mut last_payload: Option<AvatarInputPayload> = None;
-        let mut tick: u32 = 0;
+        let mut active_tick: u32 = 0;
+        let mut idle_ticks: u32 = 0;
 
         loop {
-            if !AVATAR_ENABLED_FLAG.load(Ordering::Relaxed) {
-                INPUT_BRIDGE_STARTED.store(false, Ordering::SeqCst);
+            if INPUT_BRIDGE_GEN.load(Ordering::Acquire) != bridge_gen
+                || !AVATAR_ENABLED_FLAG.load(Ordering::Relaxed)
+            {
                 return;
             }
 
-            let next_payload = build_avatar_input_payload(now_ms());
-            if last_payload.as_ref() != Some(&next_payload) {
-                crate::avatar_engine::emit_avatar_input(&app, &next_payload);
-                last_payload = Some(next_payload);
+            #[cfg(target_os = "windows")]
+            sync_windows_keyboard_input();
+
+            if AVATAR_BODY_HIDDEN_FLAG.load(Ordering::Relaxed) {
+                last_payload = None;
+                idle_ticks = 0;
+                if smart_click_through_polling_enabled {
+                    apply_smart_click_through(&app);
+                }
+                tokio::time::sleep(INPUT_BRIDGE_IDLE_POLL_INTERVAL).await;
+                continue;
             }
 
-            // 智能穿透命中测试：每 4 轮（~64ms）
-            tick = tick.wrapping_add(1);
-            if smart_click_through_polling_enabled && tick.is_multiple_of(4) {
-                apply_smart_click_through(&app);
+            #[cfg(target_os = "windows")]
+            sync_windows_cursor_ratio();
+
+            let mut changed = false;
+            let skip_idle_build = last_payload
+                .as_ref()
+                .is_some_and(can_skip_idle_input_payload);
+            if !skip_idle_build {
+                let next_payload = build_avatar_input_payload(now_ms());
+                if last_payload.as_ref() != Some(&next_payload) {
+                    crate::avatar_engine::emit_avatar_input(&app, &next_payload);
+                    last_payload = Some(next_payload);
+                    changed = true;
+                }
             }
 
-            tokio::time::sleep(INPUT_BRIDGE_POLL_INTERVAL).await;
+            let is_active = changed
+                || last_payload
+                    .as_ref()
+                    .is_some_and(|payload| payload.keyboard_active || payload.mouse_active);
+
+            if is_active {
+                idle_ticks = 0;
+                active_tick = active_tick.wrapping_add(1);
+                if smart_click_through_polling_enabled && active_tick.is_multiple_of(4) {
+                    apply_smart_click_through(&app);
+                }
+                tokio::time::sleep(INPUT_BRIDGE_POLL_INTERVAL).await;
+            } else {
+                idle_ticks = idle_ticks.saturating_add(1);
+                if idle_ticks >= 4 {
+                    if smart_click_through_polling_enabled {
+                        apply_smart_click_through(&app);
+                    }
+                    tokio::time::sleep(INPUT_BRIDGE_IDLE_POLL_INTERVAL).await;
+                } else {
+                    active_tick = active_tick.wrapping_add(1);
+                    if smart_click_through_polling_enabled && active_tick.is_multiple_of(4) {
+                        apply_smart_click_through(&app);
+                    }
+                    tokio::time::sleep(INPUT_BRIDGE_POLL_INTERVAL).await;
+                }
+            }
         }
     });
 }
@@ -1194,9 +1492,12 @@ fn apply_smart_click_through(app: &AppHandle) {
     let desired_cache: i8 = if desired_ignore { 1 } else { 0 };
     if AVATAR_CLICK_THROUGH_IGNORE_CACHE.swap(desired_cache, Ordering::Relaxed) != desired_cache {
         let app_clone = app.clone();
-        let _ = app.run_on_main_thread(move || {
+        if let Err(error) = app.run_on_main_thread(move || {
             crate::avatar_engine::set_avatar_click_through(&app_clone, desired_ignore);
-        });
+        }) {
+            force_resync_click_through();
+            log::debug!("桌宠穿透更新未送达主线程，将重试: {error}");
+        }
     }
 }
 
@@ -1235,12 +1536,12 @@ fn logical_cursor_position_to_target(
     Some((target_x as i64, target_y as i64))
 }
 
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "linux", target_os = "windows")), allow(dead_code))]
 fn pack_wayland_cursor_position(position: (i32, i32)) -> u64 {
     (u64::from(position.0 as u32) << 32) | u64::from(position.1 as u32)
 }
 
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "linux", target_os = "windows")), allow(dead_code))]
 fn unpack_wayland_cursor_position(position: u64) -> (i32, i32) {
     ((position >> 32) as u32 as i32, position as u32 as i32)
 }
@@ -1400,14 +1701,13 @@ fn should_retry_avatar_input_monitor(
 
 #[cfg(target_os = "macos")]
 pub fn spawn_avatar_input_monitor_retry(app: AppHandle) {
-    if INPUT_MONITOR_RETRY_STARTED.swap(true, Ordering::SeqCst) {
-        return;
-    }
+    let retry_gen = INPUT_MONITOR_RETRY_GEN.fetch_add(1, Ordering::SeqCst) + 1;
 
     tauri::async_runtime::spawn(async move {
         loop {
-            if !AVATAR_ENABLED_FLAG.load(Ordering::Relaxed) {
-                INPUT_MONITOR_RETRY_STARTED.store(false, Ordering::SeqCst);
+            if INPUT_MONITOR_RETRY_GEN.load(Ordering::Acquire) != retry_gen
+                || !AVATAR_ENABLED_FLAG.load(Ordering::Relaxed)
+            {
                 return;
             }
             let monitor_started = INPUT_MONITOR_STARTED.load(Ordering::SeqCst);
@@ -1436,8 +1736,13 @@ pub fn spawn_avatar_input_monitor_retry(app: AppHandle) {
 pub fn spawn_avatar_input_monitor_retry(_app: AppHandle) {}
 
 #[cfg(target_os = "macos")]
+type MacosScreenBoundsCache = Option<(std::time::Instant, (f64, f64, f64, f64))>;
+
+#[cfg(target_os = "macos")]
 thread_local! {
     static MACOS_INPUT_MONITOR: std::cell::RefCell<Option<MacosInputMonitor>> =
+        const { std::cell::RefCell::new(None) };
+    static MACOS_SCREEN_BOUNDS_CACHE: std::cell::RefCell<MacosScreenBoundsCache> =
         const { std::cell::RefCell::new(None) };
 }
 
@@ -1451,6 +1756,48 @@ struct MacosInputMonitor {
 }
 
 #[cfg(target_os = "macos")]
+unsafe fn remove_macos_input_monitors() {
+    use cocoa::base::nil;
+
+    MACOS_INPUT_MONITOR.with(|slot| {
+        if let Some(monitor) = slot.borrow_mut().take() {
+            let event_class = class!(NSEvent);
+            // SAFETY: 主线程取出由 NSEvent 注册的监听句柄，每个句柄仅移除一次。
+            if monitor.keyboard_monitor != nil {
+                let _: () =
+                    unsafe { msg_send![event_class, removeMonitor: monitor.keyboard_monitor] };
+            }
+            if monitor.mouse_monitor != nil {
+                let _: () = unsafe { msg_send![event_class, removeMonitor: monitor.mouse_monitor] };
+            }
+        }
+    });
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+fn try_claim_input_monitor_generation() -> Option<u64> {
+    let _guard = INPUT_MONITOR_LIFECYCLE_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if !AVATAR_ENABLED_FLAG.load(Ordering::SeqCst) || INPUT_MONITOR_STARTED.load(Ordering::SeqCst) {
+        return None;
+    }
+    let my_gen = INPUT_MONITOR_GEN.fetch_add(1, Ordering::SeqCst) + 1;
+    INPUT_MONITOR_STARTED.store(true, Ordering::SeqCst);
+    Some(my_gen)
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+fn release_input_monitor_generation(my_gen: u64) {
+    let _guard = INPUT_MONITOR_LIFECYCLE_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if INPUT_MONITOR_GEN.load(Ordering::SeqCst) == my_gen {
+        INPUT_MONITOR_STARTED.store(false, Ordering::SeqCst);
+    }
+}
+
+#[cfg(target_os = "macos")]
 pub fn start_avatar_input_monitor(app: &AppHandle) {
     use block::ConcreteBlock;
     use cocoa::appkit::{NSEventMask, NSEventType};
@@ -1458,39 +1805,65 @@ pub fn start_avatar_input_monitor(app: &AppHandle) {
     use cocoa::foundation::{NSPoint, NSRect};
 
     unsafe fn current_cursor_ratio() -> (f64, f64) {
-        let screens: id = msg_send![class!(NSScreen), screens];
-        let count: usize = msg_send![screens, count];
-        if count == 0 {
-            return (0.5, 0.5);
-        }
-
-        let mut min_x = 0.0;
-        let mut min_y = 0.0;
-        let mut max_x = 0.0;
-        let mut max_y = 0.0;
-
-        for index in 0..count {
-            let screen: id = msg_send![screens, objectAtIndex: index];
-            let frame: NSRect = msg_send![screen, frame];
-            let left = frame.origin.x;
-            let bottom = frame.origin.y;
-            let right = frame.origin.x + frame.size.width;
-            let top = frame.origin.y + frame.size.height;
-
-            if index == 0 {
-                min_x = left;
-                min_y = bottom;
-                max_x = right;
-                max_y = top;
-            } else {
-                min_x = min_x.min(left);
-                min_y = min_y.min(bottom);
-                max_x = max_x.max(right);
-                max_y = max_y.max(top);
+        const SCREEN_BOUNDS_TTL: Duration = Duration::from_secs(2);
+        let now = std::time::Instant::now();
+        let bounds = MACOS_SCREEN_BOUNDS_CACHE.with(|cache| {
+            if let Some((captured_at, cached)) = *cache.borrow() {
+                if now.duration_since(captured_at) < SCREEN_BOUNDS_TTL {
+                    return Some(cached);
+                }
             }
-        }
 
-        let point: NSPoint = msg_send![class!(NSEvent), mouseLocation];
+            // SAFETY: 回调位于 AppKit 主线程，屏幕数组在当前自动释放池内有效。
+            let (screens, count): (id, usize) = unsafe {
+                let screens: id = msg_send![class!(NSScreen), screens];
+                let count: usize = msg_send![screens, count];
+                (screens, count)
+            };
+            if count == 0 {
+                return None;
+            }
+
+            let mut min_x = 0.0;
+            let mut min_y = 0.0;
+            let mut max_x = 0.0;
+            let mut max_y = 0.0;
+
+            for index in 0..count {
+                // SAFETY: index 已受数组 count 限制，返回的 NSScreen 在本次遍历中有效。
+                let frame: NSRect = unsafe {
+                    let screen: id = msg_send![screens, objectAtIndex: index];
+                    msg_send![screen, frame]
+                };
+                let left = frame.origin.x;
+                let bottom = frame.origin.y;
+                let right = frame.origin.x + frame.size.width;
+                let top = frame.origin.y + frame.size.height;
+
+                if index == 0 {
+                    min_x = left;
+                    min_y = bottom;
+                    max_x = right;
+                    max_y = top;
+                } else {
+                    min_x = min_x.min(left);
+                    min_y = min_y.min(bottom);
+                    max_x = max_x.max(right);
+                    max_y = max_y.max(top);
+                }
+            }
+
+            let computed = (min_x, min_y, max_x, max_y);
+            *cache.borrow_mut() = Some((now, computed));
+            Some(computed)
+        });
+
+        let Some((min_x, min_y, max_x, max_y)) = bounds else {
+            return (0.5, 0.5);
+        };
+
+        // SAFETY: 在已初始化 AppKit 的主线程读取全局鼠标位置。
+        let point: NSPoint = unsafe { msg_send![class!(NSEvent), mouseLocation] };
         let width = (max_x - min_x).max(1.0);
         let height = (max_y - min_y).max(1.0);
         let x_ratio = ((point.x - min_x) / width).clamp(0.0, 1.0);
@@ -1500,7 +1873,8 @@ pub fn start_avatar_input_monitor(app: &AppHandle) {
     }
 
     unsafe fn is_macos_modifier_key_pressed(event: id, key_code: u16) -> Option<bool> {
-        let modifier_flags: u64 = msg_send![event, modifierFlags];
+        // SAFETY: event 是当前 NSEvent 回调提供的有效对象。
+        let modifier_flags: u64 = unsafe { msg_send![event, modifierFlags] };
         let active = match key_code {
             55 | 54 => modifier_flags & (1 << 20) != 0,
             56 | 60 => modifier_flags & (1 << 17) != 0,
@@ -1528,44 +1902,61 @@ pub fn start_avatar_input_monitor(app: &AppHandle) {
         return;
     }
 
-    if INPUT_MONITOR_STARTED.swap(true, Ordering::SeqCst) {
+    let Some(my_gen) = try_claim_input_monitor_generation() else {
         return;
-    }
+    };
 
     let run_result = app.run_on_main_thread(move || unsafe {
+        if INPUT_MONITOR_GEN.load(Ordering::Acquire) != my_gen {
+            return;
+        }
         MACOS_INPUT_MONITOR.with(|slot| {
-            if slot.borrow().is_some() {
-                return;
+            let event_class = class!(NSEvent);
+            if let Some(old) = slot.borrow_mut().take() {
+                if old.keyboard_monitor != nil {
+                    let _: () = msg_send![event_class, removeMonitor: old.keyboard_monitor];
+                }
+                if old.mouse_monitor != nil {
+                    let _: () = msg_send![event_class, removeMonitor: old.mouse_monitor];
+                }
             }
 
-            let event_class = class!(NSEvent);
             let keyboard_handler = ConcreteBlock::new(|event: id| {
+                if !AVATAR_ENABLED_FLAG.load(Ordering::Relaxed) {
+                    return;
+                }
+                let body_hidden = AVATAR_BODY_HIDDEN_FLAG.load(Ordering::Relaxed);
                 let event_type_raw: usize = msg_send![event, type];
-                let event_type = std::mem::transmute::<usize, NSEventType>(event_type_raw);
                 let key_code: u16 = msg_send![event, keyCode];
-                match event_type {
-                    NSEventType::NSKeyUp => release_keyboard_input(key_code),
-                    NSEventType::NSFlagsChanged => {
-                        if is_macos_modifier_key_pressed(event, key_code).unwrap_or(true) {
+                if event_type_raw == NSEventType::NSKeyUp as usize {
+                    release_keyboard_input(key_code);
+                } else if event_type_raw == NSEventType::NSFlagsChanged as usize {
+                    if is_macos_modifier_key_pressed(event, key_code).unwrap_or(true) {
+                        if !body_hidden {
                             record_keyboard_input(
                                 standard_keyboard_group_from_key_code(key_code),
                                 key_code,
                             );
-                        } else {
-                            release_keyboard_input(key_code);
                         }
+                    } else {
+                        release_keyboard_input(key_code);
                     }
-                    _ => record_keyboard_input(
+                } else if !body_hidden {
+                    record_keyboard_input(
                         standard_keyboard_group_from_key_code(key_code),
                         key_code,
-                    ),
+                    );
                 }
             })
             .copy();
             let mouse_handler = ConcreteBlock::new(|event: id| {
+                if !AVATAR_ENABLED_FLAG.load(Ordering::Relaxed)
+                    || AVATAR_BODY_HIDDEN_FLAG.load(Ordering::Relaxed)
+                {
+                    return;
+                }
                 let event_type_raw: usize = msg_send![event, type];
-                let event_type = std::mem::transmute::<usize, NSEventType>(event_type_raw);
-                record_mouse_input(mouse_group_from_event_type(event_type));
+                record_mouse_input(mouse_group_from_event_type_raw(event_type_raw));
                 let (cursor_ratio_x, cursor_ratio_y) = current_cursor_ratio();
                 record_cursor_ratio(cursor_ratio_x, cursor_ratio_y);
             })
@@ -1594,8 +1985,20 @@ pub fn start_avatar_input_monitor(app: &AppHandle) {
             ];
 
             if keyboard_monitor == nil || mouse_monitor == nil {
-                INPUT_MONITOR_STARTED.store(false, Ordering::SeqCst);
+                if keyboard_monitor != nil {
+                    let _: () = msg_send![event_class, removeMonitor: keyboard_monitor];
+                }
+                if mouse_monitor != nil {
+                    let _: () = msg_send![event_class, removeMonitor: mouse_monitor];
+                }
+                release_input_monitor_generation(my_gen);
                 log::warn!("桌宠输入联动注册失败：系统未返回有效的全局监听句柄");
+                return;
+            }
+
+            if INPUT_MONITOR_GEN.load(Ordering::Acquire) != my_gen {
+                let _: () = msg_send![event_class, removeMonitor: keyboard_monitor];
+                let _: () = msg_send![event_class, removeMonitor: mouse_monitor];
                 return;
             }
 
@@ -1609,7 +2012,7 @@ pub fn start_avatar_input_monitor(app: &AppHandle) {
     });
 
     if let Err(e) = run_result {
-        INPUT_MONITOR_STARTED.store(false, Ordering::SeqCst);
+        release_input_monitor_generation(my_gen);
         log::warn!("桌宠输入联动注册失败: {e}");
     }
 }
@@ -1618,16 +2021,24 @@ pub fn start_avatar_input_monitor(app: &AppHandle) {
 pub fn start_avatar_input_monitor(_app: &AppHandle) {
     use std::{mem, ptr, thread};
     use winapi::um::libloaderapi::GetModuleHandleW;
+    use winapi::um::processthreadsapi::GetCurrentThreadId;
     use winapi::um::winuser::{
-        DispatchMessageW, GetMessageW, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx,
-        MSG, WH_KEYBOARD_LL, WH_MOUSE_LL,
+        DispatchMessageW, GetMessageW, PeekMessageW, SetWindowsHookExW, TranslateMessage,
+        UnhookWindowsHookEx, MSG, PM_NOREMOVE, WH_KEYBOARD_LL, WH_MOUSE_LL,
     };
 
-    if INPUT_MONITOR_STARTED.swap(true, Ordering::SeqCst) {
+    let Some(my_gen) = try_claim_input_monitor_generation() else {
         return;
-    }
+    };
 
-    thread::spawn(|| unsafe {
+    thread::spawn(move || unsafe {
+        if INPUT_MONITOR_GEN.load(Ordering::Acquire) != my_gen {
+            release_input_monitor_generation(my_gen);
+            return;
+        }
+
+        // 在注册 Hook 前完成有界队列分配，回调里只使用非阻塞入队和原子更新。
+        Lazy::force(&WINDOWS_KEYBOARD_INPUTS);
         let module_handle = GetModuleHandleW(ptr::null());
         let keyboard_hook = SetWindowsHookExW(
             WH_KEYBOARD_LL,
@@ -1645,29 +2056,58 @@ pub fn start_avatar_input_monitor(_app: &AppHandle) {
             if !mouse_hook.is_null() {
                 UnhookWindowsHookEx(mouse_hook);
             }
-            INPUT_MONITOR_STARTED.store(false, Ordering::SeqCst);
+            release_input_monitor_generation(my_gen);
             log::warn!("桌宠输入联动注册失败：Windows 低级键鼠 Hook 初始化失败");
             return;
         }
 
+        // 先通过 PeekMessageW 建立线程消息队列，再在生命周期锁内校验代次并发布线程 ID，
+        // 确保与 stop_avatar_input_monitor 的 WM_QUIT 投递绝不交错丢消息或覆盖新代次。
         let mut message: MSG = mem::zeroed();
-        loop {
-            let result = GetMessageW(&mut message, ptr::null_mut(), 0, 0);
-            if result == -1 {
-                log::warn!("桌宠输入联动消息循环异常退出：Windows 消息泵返回错误");
-                break;
+        PeekMessageW(&mut message, ptr::null_mut(), 0, 0, PM_NOREMOVE);
+        let thread_id = GetCurrentThreadId();
+        let should_run = {
+            let _guard = INPUT_MONITOR_LIFECYCLE_LOCK
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if INPUT_MONITOR_GEN.load(Ordering::SeqCst) == my_gen {
+                WINDOWS_HOOK_THREAD_ID.store(thread_id, Ordering::Release);
+                true
+            } else {
+                false
             }
-            if result == 0 {
-                break;
-            }
+        };
 
-            TranslateMessage(&message);
-            DispatchMessageW(&message);
+        if should_run {
+            loop {
+                let result = GetMessageW(&mut message, ptr::null_mut(), 0, 0);
+                if result == -1 {
+                    log::warn!("桌宠输入联动消息循环异常退出：Windows 消息泵返回错误");
+                    break;
+                }
+                if result == 0 || INPUT_MONITOR_GEN.load(Ordering::Acquire) != my_gen {
+                    break;
+                }
+
+                TranslateMessage(&message);
+                DispatchMessageW(&message);
+            }
         }
 
+        {
+            let _guard = INPUT_MONITOR_LIFECYCLE_LOCK
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let _ = WINDOWS_HOOK_THREAD_ID.compare_exchange(
+                thread_id,
+                0,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            );
+        }
         UnhookWindowsHookEx(keyboard_hook);
         UnhookWindowsHookEx(mouse_hook);
-        INPUT_MONITOR_STARTED.store(false, Ordering::SeqCst);
+        release_input_monitor_generation(my_gen);
     });
 }
 
@@ -1676,14 +2116,16 @@ pub fn start_avatar_input_monitor(app: &AppHandle) {
     use crate::linux_session::{
         current_linux_desktop_environment, current_linux_desktop_session, LinuxDesktopSession,
     };
-    use std::{ffi::CString, mem, ptr, thread};
+    use std::{ffi::CString, mem, ptr, thread, time::Instant};
     use x11::{xinput2, xlib};
 
     let session = current_linux_desktop_session();
     let desktop_environment = current_linux_desktop_environment();
-    let gnome_mouse_provider_available = is_gnome_wayland_mouse_provider_available();
-    let kde_mouse_provider_available = is_kde_wayland_mouse_provider_available();
-    let hyprland_mouse_provider_available = is_hyprland_wayland_mouse_provider_available();
+    let (
+        gnome_mouse_provider_available,
+        kde_mouse_provider_available,
+        hyprland_mouse_provider_available,
+    ) = probe_linux_wayland_mouse_providers(session, desktop_environment);
     let support = linux_avatar_input_support_for_session(
         session,
         desktop_environment,
@@ -1701,18 +2143,16 @@ pub fn start_avatar_input_monitor(app: &AppHandle) {
         return;
     }
 
-    if INPUT_MONITOR_STARTED.swap(true, Ordering::SeqCst) {
+    let Some(my_gen) = try_claim_input_monitor_generation() else {
         return;
-    }
+    };
 
     match session {
         LinuxDesktopSession::X11 => {
-            thread::spawn(|| unsafe {
-                xlib::XInitThreads();
-
+            thread::spawn(move || unsafe {
                 let display = xlib::XOpenDisplay(ptr::null());
                 if display.is_null() {
-                    INPUT_MONITOR_STARTED.store(false, Ordering::SeqCst);
+                    release_input_monitor_generation(my_gen);
                     log::warn!("桌宠输入联动注册失败：无法连接到 X11 Display");
                     return;
                 }
@@ -1733,7 +2173,7 @@ pub fn start_avatar_input_monitor(app: &AppHandle) {
                 ) == xlib::False
                 {
                     xlib::XCloseDisplay(display);
-                    INPUT_MONITOR_STARTED.store(false, Ordering::SeqCst);
+                    release_input_monitor_generation(my_gen);
                     log::warn!("桌宠输入联动注册失败：XInputExtension 不可用");
                     return;
                 }
@@ -1743,7 +2183,7 @@ pub fn start_avatar_input_monitor(app: &AppHandle) {
                 if xinput2::XIQueryVersion(display, &mut major, &mut minor) != xlib::Success as i32
                 {
                     xlib::XCloseDisplay(display);
-                    INPUT_MONITOR_STARTED.store(false, Ordering::SeqCst);
+                    release_input_monitor_generation(my_gen);
                     log::warn!("桌宠输入联动注册失败：XInput2 不可用");
                     return;
                 }
@@ -1764,16 +2204,34 @@ pub fn start_avatar_input_monitor(app: &AppHandle) {
                     != xlib::Success as i32
                 {
                     xlib::XCloseDisplay(display);
-                    INPUT_MONITOR_STARTED.store(false, Ordering::SeqCst);
+                    release_input_monitor_generation(my_gen);
                     log::warn!("桌宠输入联动注册失败：XInput2 事件订阅失败");
                     return;
                 }
 
                 xlib::XFlush(display);
 
+                let mut last_motion_query: Option<Instant> = None;
+                let mut last_event_at = Instant::now();
+
                 loop {
+                    if INPUT_MONITOR_GEN.load(Ordering::Acquire) != my_gen {
+                        break;
+                    }
+
+                    if xlib::XPending(display) == 0 {
+                        let sleep_ms = if last_event_at.elapsed() > Duration::from_secs(1) {
+                            32
+                        } else {
+                            8
+                        };
+                        thread::sleep(Duration::from_millis(sleep_ms));
+                        continue;
+                    }
+
                     let mut event: xlib::XEvent = mem::zeroed();
                     xlib::XNextEvent(display, &mut event);
+                    last_event_at = Instant::now();
 
                     if event.get_type() != xlib::GenericEvent {
                         continue;
@@ -1786,8 +2244,9 @@ pub fn start_avatar_input_monitor(app: &AppHandle) {
                         continue;
                     }
 
+                    let body_hidden = AVATAR_BODY_HIDDEN_FLAG.load(Ordering::Relaxed);
                     match cookie.evtype {
-                        xinput2::XI_RawKeyPress => {
+                        xinput2::XI_RawKeyPress if !body_hidden => {
                             let raw_event = &*(cookie.data as *const xinput2::XIRawEvent);
                             let keysym =
                                 xlib::XkbKeycodeToKeysym(display, raw_event.detail as u8, 0, 0);
@@ -1815,14 +2274,20 @@ pub fn start_avatar_input_monitor(app: &AppHandle) {
                                 linux_query_cursor_ratio(display, root_window, screen)
                             {
                                 record_cursor_ratio(cursor_ratio_x, cursor_ratio_y);
+                                last_motion_query = Some(Instant::now());
                             }
                         }
                         xinput2::XI_RawMotion => {
                             record_mouse_input(MOUSE_GROUP_MOVE);
-                            if let Some((cursor_ratio_x, cursor_ratio_y)) =
-                                linux_query_cursor_ratio(display, root_window, screen)
-                            {
-                                record_cursor_ratio(cursor_ratio_x, cursor_ratio_y);
+                            let should_query = last_motion_query
+                                .is_none_or(|prev| prev.elapsed() >= INPUT_BRIDGE_POLL_INTERVAL);
+                            if should_query {
+                                if let Some((cursor_ratio_x, cursor_ratio_y)) =
+                                    linux_query_cursor_ratio(display, root_window, screen)
+                                {
+                                    record_cursor_ratio(cursor_ratio_x, cursor_ratio_y);
+                                }
+                                last_motion_query = Some(Instant::now());
                             }
                         }
                         _ => {}
@@ -1830,6 +2295,9 @@ pub fn start_avatar_input_monitor(app: &AppHandle) {
 
                     xlib::XFreeEventData(display, cookie);
                 }
+
+                xlib::XCloseDisplay(display);
+                release_input_monitor_generation(my_gen);
             });
         }
         LinuxDesktopSession::Wayland => {
@@ -1839,17 +2307,24 @@ pub fn start_avatar_input_monitor(app: &AppHandle) {
                 kde_mouse_provider_available,
                 hyprland_mouse_provider_available,
             ) else {
-                INPUT_MONITOR_STARTED.store(false, Ordering::SeqCst);
+                release_input_monitor_generation(my_gen);
                 log::warn!("桌宠输入联动注册失败：未找到可用的 Wayland 鼠标 provider");
                 return;
             };
 
             let app = app.clone();
             thread::spawn(move || {
+                const BOUNDS_TTL: Duration = Duration::from_secs(2);
                 let mut last_mouse_state: Option<(i32, i32, u8)> = None;
+                let mut last_cursor_point: Option<(i32, i32)> = None;
                 let mut last_keyboard_timestamp_ms: Option<u64> = None;
+                let mut cached_bounds: Option<(Instant, (i32, i32, u32, u32))> = None;
 
                 loop {
+                    if INPUT_MONITOR_GEN.load(Ordering::Acquire) != my_gen {
+                        break;
+                    }
+
                     if let Some(snapshot) = query_wayland_mouse_cursor_point(provider) {
                         record_wayland_cursor_position((snapshot.x, snapshot.y));
                         let next_mouse_state = (snapshot.x, snapshot.y, snapshot.group_code);
@@ -1858,7 +2333,9 @@ pub fn start_avatar_input_monitor(app: &AppHandle) {
                             last_mouse_state = Some(next_mouse_state);
                         }
 
-                        if snapshot.keyboard_timestamp_ms != last_keyboard_timestamp_ms {
+                        if !AVATAR_BODY_HIDDEN_FLAG.load(Ordering::Relaxed)
+                            && snapshot.keyboard_timestamp_ms != last_keyboard_timestamp_ms
+                        {
                             if let Some(timestamp_ms) = snapshot.keyboard_timestamp_ms {
                                 if let Some(key_code) = snapshot.keyboard_key_code {
                                     record_keyboard_input(
@@ -1870,23 +2347,40 @@ pub fn start_avatar_input_monitor(app: &AppHandle) {
                             }
                         }
 
-                        if let Some((min_x, min_y, width, height)) =
-                            virtual_desktop_logical_bounds_from_monitors(&app)
-                        {
-                            let (cursor_ratio_x, cursor_ratio_y) =
-                                cursor_ratio_from_virtual_desktop_bounds(
-                                    snapshot.x, snapshot.y, min_x, min_y, width, height,
-                                );
-                            record_cursor_ratio(cursor_ratio_x, cursor_ratio_y);
+                        let point = (snapshot.x, snapshot.y);
+                        if last_cursor_point != Some(point) {
+                            last_cursor_point = Some(point);
+                            let bounds = match cached_bounds {
+                                Some((captured_at, b)) if captured_at.elapsed() < BOUNDS_TTL => {
+                                    Some(b)
+                                }
+                                _ => {
+                                    let refreshed =
+                                        virtual_desktop_logical_bounds_from_monitors(&app);
+                                    if let Some(b) = refreshed {
+                                        cached_bounds = Some((Instant::now(), b));
+                                    }
+                                    refreshed
+                                }
+                            };
+                            if let Some((min_x, min_y, width, height)) = bounds {
+                                let (cursor_ratio_x, cursor_ratio_y) =
+                                    cursor_ratio_from_virtual_desktop_bounds(
+                                        snapshot.x, snapshot.y, min_x, min_y, width, height,
+                                    );
+                                record_cursor_ratio(cursor_ratio_x, cursor_ratio_y);
+                            }
                         }
                     }
 
                     thread::sleep(WAYLAND_MOUSE_POLL_INTERVAL);
                 }
+
+                release_input_monitor_generation(my_gen);
             });
         }
         LinuxDesktopSession::Unknown => {
-            INPUT_MONITOR_STARTED.store(false, Ordering::SeqCst);
+            release_input_monitor_generation(my_gen);
             log::warn!("桌宠输入联动注册失败：Linux 会话类型未知");
         }
     }
@@ -1894,6 +2388,55 @@ pub fn start_avatar_input_monitor(app: &AppHandle) {
 
 #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
 pub fn start_avatar_input_monitor(_app: &AppHandle) {}
+
+/// 停止全局键鼠输入监听与桥接任务，释放平台 Hook / NSEvent Monitor / X11 Display。
+pub fn stop_avatar_input_monitor(app: &AppHandle) {
+    #[cfg(target_os = "windows")]
+    let thread_id = {
+        let _guard = INPUT_MONITOR_LIFECYCLE_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        INPUT_MONITOR_GEN.fetch_add(1, Ordering::SeqCst);
+        INPUT_BRIDGE_GEN.fetch_add(1, Ordering::SeqCst);
+        INPUT_MONITOR_STARTED.store(false, Ordering::SeqCst);
+        WINDOWS_HOOK_THREAD_ID.swap(0, Ordering::AcqRel)
+    };
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _guard = INPUT_MONITOR_LIFECYCLE_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        INPUT_MONITOR_GEN.fetch_add(1, Ordering::SeqCst);
+        INPUT_BRIDGE_GEN.fetch_add(1, Ordering::SeqCst);
+        INPUT_MONITOR_STARTED.store(false, Ordering::SeqCst);
+    }
+
+    clear_avatar_input_state();
+
+    #[cfg(target_os = "windows")]
+    {
+        let _ = app;
+        use winapi::um::winuser::{PostThreadMessageW, WM_QUIT};
+        if thread_id != 0 {
+            unsafe {
+                PostThreadMessageW(thread_id, WM_QUIT, 0, 0);
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        INPUT_MONITOR_RETRY_GEN.fetch_add(1, Ordering::SeqCst);
+        let _ = app.run_on_main_thread(|| unsafe {
+            remove_macos_input_monitors();
+        });
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        let _ = app;
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -1915,12 +2458,144 @@ mod tests {
         CURSOR_RATIO_X_PERMILLE.store(500, Ordering::Relaxed);
         CURSOR_RATIO_Y_PERMILLE.store(500, Ordering::Relaxed);
         CURSOR_RATIO_INITIALIZED.store(false, Ordering::Relaxed);
+        KEYBOARD_HAS_PRESSED_KEYS.store(false, Ordering::Relaxed);
+        #[cfg(target_os = "windows")]
+        {
+            WINDOWS_KEYBOARD_INPUTS.invalidate();
+            let _ = WINDOWS_KEYBOARD_INPUTS.drain();
+        }
         KEYBOARD_STATE
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .pressed_keys
             .clear();
         guard
+    }
+
+    #[test]
+    fn 键盘缓冲应按顺序保留按下与松开事件() {
+        let buffer = KeyboardInputBuffer::new();
+        for (key_code, pressed) in [(59, true), (0, true), (0, false)] {
+            assert!(buffer.push(BufferedKeyboardInput {
+                epoch: 0,
+                pressed_at_ms: 1000,
+                key_code,
+                group_code: 0,
+                pressed,
+            }));
+        }
+        let (reset, events) = buffer.drain();
+        assert!(!reset);
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| (event.key_code, event.pressed))
+                .collect::<Vec<_>>(),
+            vec![(59, true), (0, true), (0, false)]
+        );
+    }
+
+    #[test]
+    fn 键盘状态重置后旧事件不应覆盖新输入() {
+        let buffer = KeyboardInputBuffer::new();
+        let old = BufferedKeyboardInput {
+            epoch: 0,
+            pressed_at_ms: 1000,
+            key_code: 0,
+            group_code: KEYBOARD_GROUP_KEY_A,
+            pressed: true,
+        };
+        assert!(buffer.push(old));
+        buffer.invalidate();
+        assert!(!buffer.push(BufferedKeyboardInput {
+            pressed: false,
+            ..old
+        }));
+        let current = BufferedKeyboardInput {
+            epoch: buffer.epoch.load(Ordering::Acquire),
+            ..old
+        };
+        assert!(buffer.push(current));
+        let (reset, events) = buffer.drain();
+        assert!(reset);
+        assert_eq!(events, vec![current]);
+    }
+
+    #[test]
+    fn 键盘缓冲溢出应丢弃旧代次并要求重置可视状态() {
+        let buffer = KeyboardInputBuffer::new();
+        let input = BufferedKeyboardInput {
+            epoch: 0,
+            pressed_at_ms: 1000,
+            key_code: 12,
+            group_code: KEYBOARD_GROUP_KEY_Q,
+            pressed: true,
+        };
+        for _ in 0..KEYBOARD_INPUT_CAPACITY {
+            assert!(buffer.push(input));
+        }
+        assert!(!buffer.push(input));
+        let (reset, events) = buffer.drain();
+        assert!(reset);
+        assert!(events.is_empty());
+        assert!(buffer.push(BufferedKeyboardInput {
+            epoch: buffer.epoch.load(Ordering::Acquire),
+            ..input
+        }));
+        let (reset, events) = buffer.drain();
+        assert!(!reset);
+        assert_eq!(events.len(), 1);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows键盘采集不应等待可视状态锁且采样后应正确松键() {
+        let _guard = reset_avatar_input_test_state();
+        let was_enabled = AVATAR_ENABLED_FLAG.swap(true, Ordering::Relaxed);
+        let was_hidden = AVATAR_BODY_HIDDEN_FLAG.swap(false, Ordering::Relaxed);
+        let epoch = WINDOWS_KEYBOARD_INPUTS.epoch.load(Ordering::Acquire);
+        let state_guard = KEYBOARD_STATE
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let receiver_guard = WINDOWS_KEYBOARD_INPUTS
+            .receiver
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            buffer_windows_keyboard_input(BufferedKeyboardInput {
+                epoch,
+                pressed_at_ms: 1000,
+                key_code: 12,
+                group_code: KEYBOARD_GROUP_KEY_Q,
+                pressed: true,
+            });
+            sender.send(()).unwrap();
+        });
+        let did_not_block = receiver.recv_timeout(Duration::from_secs(1)).is_ok();
+        drop(receiver_guard);
+        drop(state_guard);
+        worker.join().unwrap();
+        sync_windows_keyboard_input();
+        let pressed = build_avatar_input_payload(1000);
+        buffer_windows_keyboard_input(BufferedKeyboardInput {
+            epoch,
+            pressed_at_ms: 0,
+            key_code: 12,
+            group_code: 0,
+            pressed: false,
+        });
+        sync_windows_keyboard_input();
+        let released = build_avatar_input_payload(1200);
+        AVATAR_ENABLED_FLAG.store(was_enabled, Ordering::Relaxed);
+        AVATAR_BODY_HIDDEN_FLAG.store(was_hidden, Ordering::Relaxed);
+        assert!(
+            did_not_block,
+            "输入回调不能等待普通采样线程持有的按键状态锁"
+        );
+        assert_eq!(pressed.keyboard_visual_keys, vec!["KeyQ".to_string()]);
+        assert!(!released.keyboard_active);
+        assert!(released.keyboard_visual_keys.is_empty());
     }
 
     #[test]
@@ -2376,7 +3051,59 @@ mod tests {
         assert_eq!(windows_virtual_key_to_avatar_key_code(0x57), Some(13));
         assert_eq!(windows_virtual_key_to_avatar_key_code(0x20), Some(49));
         assert_eq!(windows_virtual_key_to_avatar_key_code(0x25), Some(123));
+        assert_eq!(windows_virtual_key_to_avatar_key_code(0xBC), Some(43));
+        assert_eq!(windows_virtual_key_to_avatar_key_code(0xBE), Some(47));
+        assert_eq!(windows_virtual_key_to_avatar_key_code(0xBF), Some(44));
+        assert_eq!(windows_virtual_key_to_avatar_key_code(0x2E), Some(117));
+        assert_eq!(windows_virtual_key_to_avatar_key_code(0x2C), None);
+        assert_eq!(windows_virtual_key_to_avatar_key_code(0x2D), None);
+        assert_eq!(windows_virtual_key_to_avatar_key_code(0x2F), None);
         assert_eq!(windows_virtual_key_to_avatar_key_code(0x70), None);
+    }
+
+    #[test]
+    fn 空闲无变化时应允许跳过重复输入载荷构建() {
+        let _guard = reset_avatar_input_test_state();
+        KEYBOARD_HAS_PRESSED_KEYS.store(false, Ordering::Relaxed);
+        let idle = build_avatar_input_payload(2000);
+        assert!(can_skip_idle_input_payload(&idle));
+
+        LAST_MOUSE_INPUT_AT_MS.store(2010, Ordering::Relaxed);
+        assert!(!can_skip_idle_input_payload(&idle));
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+    #[test]
+    fn 输入监听代次切换时旧代次退出不得清除新代次状态() {
+        let _guard = reset_avatar_input_test_state();
+        INPUT_MONITOR_STARTED.store(false, Ordering::SeqCst);
+        AVATAR_ENABLED_FLAG.store(true, Ordering::SeqCst);
+
+        let gen1 = try_claim_input_monitor_generation().expect("首次申请应成功");
+        assert!(
+            try_claim_input_monitor_generation().is_none(),
+            "重复启动应被去重"
+        );
+
+        // 模拟 stop 后立即重启进入新代次 gen2
+        {
+            let _lock = INPUT_MONITOR_LIFECYCLE_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            INPUT_MONITOR_GEN.fetch_add(1, Ordering::SeqCst);
+            INPUT_MONITOR_STARTED.store(false, Ordering::SeqCst);
+        }
+        let gen2 = try_claim_input_monitor_generation().expect("停止后重启应获得新代次");
+        assert!(gen2 > gen1);
+
+        // 旧代次 gen1 迟到退出不得把 gen2 的 STARTED 复位为 false
+        release_input_monitor_generation(gen1);
+        assert!(INPUT_MONITOR_STARTED.load(Ordering::SeqCst));
+
+        // 新代次 gen2 正常退出才复位
+        release_input_monitor_generation(gen2);
+        assert!(!INPUT_MONITOR_STARTED.load(Ordering::SeqCst));
+        AVATAR_ENABLED_FLAG.store(false, Ordering::SeqCst);
     }
 
     #[cfg(target_os = "windows")]

@@ -285,10 +285,13 @@ pub async fn save_mcp_client_server(
     )
     .map_err(AppError::Unknown)?;
 
-    tokio::task::spawn_blocking(move || save_mcp_server_in_dir(&data_dir, input))
+    let data_dir_for_cache = data_dir.clone();
+    let result = tokio::task::spawn_blocking(move || save_mcp_server_in_dir(&data_dir, input))
         .await
         .map_err(|e| AppError::Unknown(format!("保存外部 MCP 服务失败: {e}")))?
-        .map_err(AppError::Unknown)
+        .map_err(AppError::Unknown)?;
+    crate::agent::mcp_bridge::invalidate_mcp_discovery_cache(&data_dir_for_cache);
+    Ok(result)
 }
 
 /// 删除一个外部 HTTP MCP Server，返回脱敏视图列表。
@@ -301,10 +304,13 @@ pub async fn delete_mcp_client_server(
         let guard = state.lock().map_err(|e| AppError::Unknown(e.to_string()))?;
         guard.data_dir.clone()
     };
-    tokio::task::spawn_blocking(move || delete_mcp_server_in_dir(&data_dir, &id))
+    let data_dir_for_cache = data_dir.clone();
+    let result = tokio::task::spawn_blocking(move || delete_mcp_server_in_dir(&data_dir, &id))
         .await
         .map_err(|e| AppError::Unknown(format!("删除外部 MCP 服务失败: {e}")))?
-        .map_err(AppError::Unknown)
+        .map_err(AppError::Unknown)?;
+    crate::agent::mcp_bridge::invalidate_mcp_discovery_cache(&data_dir_for_cache);
+    Ok(result)
 }
 
 /// 测试指定已配置外部 MCP Server 的连通性与可用工具清单。
@@ -317,6 +323,7 @@ pub async fn test_mcp_client_server(
         let guard = state.lock().map_err(|e| AppError::Unknown(e.to_string()))?;
         (guard.data_dir.clone(), guard.config.localhost_api_port)
     };
+    let data_dir_for_cache = data_dir.clone();
     let trimmed_id = id.trim().to_string();
     let server = tokio::task::spawn_blocking(move || {
         load_mcp_servers_from_dir(&data_dir)
@@ -327,5 +334,8 @@ pub async fn test_mcp_client_server(
     .map_err(|e| AppError::Unknown(format!("读取外部 MCP 服务失败: {e}")))?
     .ok_or_else(|| AppError::Unknown("未找到指定的外部 MCP 服务".to_string()))?;
 
-    Ok(test_mcp_server_connection(&server, Some(self_port)).await)
+    let result = test_mcp_server_connection(&server, Some(self_port)).await;
+    // 在连通性测试完成后再失效缓存，避免测试期间并发对话将旧的失败负缓存回填。
+    crate::agent::mcp_bridge::invalidate_mcp_discovery_cache(&data_dir_for_cache);
+    Ok(result)
 }

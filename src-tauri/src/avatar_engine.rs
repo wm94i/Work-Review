@@ -10,6 +10,7 @@ pub const AVATAR_WINDOW_LABEL: &str = "avatar";
 pub const AVATAR_STATE_EVENT: &str = "avatar-state-changed";
 pub const AVATAR_BUBBLE_EVENT: &str = "avatar-bubble";
 pub const AVATAR_INPUT_EVENT: &str = "avatar-input-changed";
+pub const AVATAR_VISIBILITY_EVENT: &str = "avatar-window-visibility";
 pub const AVATAR_PRESET_DEFAULT: &str = "original-standard";
 
 const AVATAR_SCALE_MIN: f64 = 0.4;
@@ -44,8 +45,46 @@ struct AvatarInteractiveHitState {
     regions: Vec<AvatarInteractiveRegion>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PreExpansionAnchor {
+    compact_pos: (i32, i32),
+    clamped_pos: (i32, i32),
+}
+
 static AVATAR_INTERACTIVE_HIT_STATE: Lazy<Mutex<AvatarInteractiveHitState>> =
     Lazy::new(|| Mutex::new(AvatarInteractiveHitState::default()));
+static PRE_EXPANSION_ANCHOR: Lazy<Mutex<Option<PreExpansionAnchor>>> =
+    Lazy::new(|| Mutex::new(None));
+
+const MONITOR_POINT_SNAP_TOLERANCE_PX: i64 = 64;
+
+/// 清除展开前记录的紧凑位置锚点。
+pub fn clear_pre_expansion_anchor() {
+    *PRE_EXPANSION_ANCHOR
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = None;
+}
+
+fn should_clear_pre_expansion_anchor(
+    anchor: Option<PreExpansionAnchor>,
+    reported_pos: (i32, i32),
+) -> bool {
+    anchor.is_some_and(|saved| {
+        // 窗口管理器的 DPI 舍入可能使自动钳制事件偏移几像素。
+        (i64::from(saved.clamped_pos.0) - i64::from(reported_pos.0)).abs() > 4
+            || (i64::from(saved.clamped_pos.1) - i64::from(reported_pos.1)).abs() > 4
+    })
+}
+
+/// 仅当新位置偏离展开自动钳制落点时（即用户手动拖动），才清除展开前保存的紧凑锚点。
+pub fn clear_pre_expansion_anchor_if_moved(x: i32, y: i32) {
+    let mut guard = PRE_EXPANSION_ANCHOR
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if should_clear_pre_expansion_anchor(*guard, (x, y)) {
+        *guard = None;
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct Rect {
@@ -440,6 +479,11 @@ pub fn sync_avatar_window(
     expanded: bool,
     body_hidden: bool,
 ) -> tauri::Result<()> {
+    if !enabled || !expanded {
+        clear_pre_expansion_anchor();
+    }
+    sync_avatar_precise_hit_mode(body_hidden);
+
     if enabled {
         let had_existing_window = app.get_webview_window(AVATAR_WINDOW_LABEL).is_some();
         ensure_avatar_window(app, scale, body_hidden)?;
@@ -462,24 +506,27 @@ pub fn sync_avatar_window(
                 expanded,
                 body_hidden,
             );
-            resize_avatar_window(&window, normalized_scale, expanded, body_hidden);
             let _ = window.set_always_on_top(true);
             let _ = window.set_visible_on_all_workspaces(true);
             let _ = window.set_skip_taskbar(true);
             // 仅当目标位置与当前物理位置不同时才 set_position。
+            // 跨不同 DPI 显示器时先移动到目标显示器，再按目标显示器的缩放比设置逻辑尺寸。
             // 避免每次配置变更都触发无意义的窗口移动，进而引发 onMoved → save →
             // sync 的循环，以及 Wayland/某些 WM 下频繁移动导致的窗口闪烁（#120 飘动）。
             let needs_move = current_position != Some((x, y));
             if needs_move {
                 let _ = window.set_position(Position::Physical(PhysicalPosition::new(x, y)));
             }
+            resize_avatar_window(&window, normalized_scale, expanded, body_hidden);
             let _ = window.unminimize();
             let _ = window.show();
             #[cfg(target_os = "windows")]
             crate::avatar_transparency::schedule(app);
+            let _ = app.emit_to(AVATAR_WINDOW_LABEL, AVATAR_VISIBILITY_EVENT, true);
         }
     } else if let Some(window) = app.get_webview_window(AVATAR_WINDOW_LABEL) {
         let _ = window.hide();
+        let _ = app.emit_to(AVATAR_WINDOW_LABEL, AVATAR_VISIBILITY_EVENT, false);
     }
 
     Ok(())
@@ -490,13 +537,16 @@ pub fn sync_avatar_window(
 pub fn set_avatar_click_through(app: &AppHandle, click_through: bool) {
     if let Some(window) = app.get_webview_window(AVATAR_WINDOW_LABEL) {
         if let Err(e) = window.set_ignore_cursor_events(click_through) {
+            crate::avatar_input::force_resync_click_through();
             log::warn!("设置桌宠鼠标穿透失败: {e}");
         } else {
-            log::info!(
+            log::debug!(
                 "桌宠鼠标穿透已{}",
                 if click_through { "开启" } else { "关闭" }
             );
         }
+    } else {
+        crate::avatar_input::force_resync_click_through();
     }
 }
 
@@ -526,6 +576,19 @@ pub fn update_avatar_interactive_regions(precise: bool, regions: Vec<AvatarInter
         .lock()
         .unwrap_or_else(|error| error.into_inner());
     *state = AvatarInteractiveHitState { precise, regions };
+}
+
+/// 窗口同步阶段先同步精确命中开关，避免隐藏本体首帧出现整窗未穿透的空窗期。
+pub fn sync_avatar_precise_hit_mode(precise: bool) {
+    let mut state = AVATAR_INTERACTIVE_HIT_STATE
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if state.precise != precise {
+        state.precise = precise;
+        if !precise {
+            state.regions.clear();
+        }
+    }
 }
 
 /// 隐藏桌宠时，前端启用精确交互区域命中。
@@ -585,10 +648,15 @@ fn point_in_avatar_interactive_regions(
 /// 全局鼠标是否命中桌宠。精确模式仅命中前端上报的交互区域；
 /// 非精确模式保留原有整窗物理矩形判断。
 pub fn avatar_window_hit_by_cursor(app: &AppHandle) -> Option<bool> {
+    let hit_state = avatar_interactive_hit_state();
+    // 隐藏本体且当前无任何可交互气泡/卡片时，无需执行任何系统窗口或鼠标查询。
+    if hit_state.precise && hit_state.regions.is_empty() {
+        return Some(false);
+    }
+
     let window = app.get_webview_window(AVATAR_WINDOW_LABEL)?;
     let scale_factor = window.scale_factor().ok()?;
     let (cx, cy) = crate::avatar_input::global_cursor_position(app, scale_factor)?;
-    let hit_state = avatar_interactive_hit_state();
 
     if hit_state.precise {
         // getBoundingClientRect() 相对 WebView 客户区，优先使用客户区物理原点。
@@ -618,6 +686,13 @@ pub fn avatar_window_hit_by_cursor(app: &AppHandle) -> Option<bool> {
     ))
 }
 
+fn resolve_expansion_anchor_on_collapse(
+    saved_anchor: Option<(i32, i32)>,
+    current: (i32, i32),
+) -> (i32, i32) {
+    saved_anchor.unwrap_or(current)
+}
+
 pub fn apply_avatar_window_expansion(
     app: &AppHandle,
     scale: f64,
@@ -626,8 +701,49 @@ pub fn apply_avatar_window_expansion(
 ) -> tauri::Result<()> {
     if let Some(window) = app.get_webview_window(AVATAR_WINDOW_LABEL) {
         let normalized_scale = normalize_avatar_scale(scale);
-        resize_avatar_window(&window, normalized_scale, expanded, body_hidden);
-        clamp_window_within_current_monitor(&window, normalized_scale, expanded, body_hidden);
+        if expanded {
+            let before_pos = window
+                .outer_position()
+                .ok()
+                .map(|position| (position.x, position.y));
+            resize_avatar_window(&window, normalized_scale, true, body_hidden);
+            if let Some(clamped_pos) =
+                clamp_window_within_current_monitor(&window, normalized_scale, true, body_hidden)
+            {
+                if let Some(compact_pos) = before_pos {
+                    let mut guard = PRE_EXPANSION_ANCHOR
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner());
+                    match guard.as_mut() {
+                        Some(existing) => existing.clamped_pos = clamped_pos,
+                        None => {
+                            *guard = Some(PreExpansionAnchor {
+                                compact_pos,
+                                clamped_pos,
+                            });
+                        }
+                    }
+                }
+            }
+        } else {
+            let saved_anchor = PRE_EXPANSION_ANCHOR
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .take()
+                .map(|anchor| anchor.compact_pos);
+            resize_avatar_window(&window, normalized_scale, false, body_hidden);
+            if let Ok(current) = window.outer_position() {
+                let target =
+                    resolve_expansion_anchor_on_collapse(saved_anchor, (current.x, current.y));
+                if target != (current.x, current.y) {
+                    let _ = window.set_position(Position::Physical(PhysicalPosition::new(
+                        target.0, target.1,
+                    )));
+                }
+            }
+            let _ =
+                clamp_window_within_current_monitor(&window, normalized_scale, false, body_hidden);
+        }
     }
     Ok(())
 }
@@ -637,14 +753,14 @@ fn clamp_window_within_current_monitor(
     scale: f64,
     expanded: bool,
     body_hidden: bool,
-) {
+) -> Option<(i32, i32)> {
     let monitor = match window.current_monitor() {
         Ok(Some(monitor)) => monitor,
-        _ => return,
+        _ => return None,
     };
     let current = match window.outer_position() {
         Ok(position) => position,
-        Err(_) => return,
+        Err(_) => return None,
     };
     let work_area = monitor.work_area();
     let bounds = Rect {
@@ -665,7 +781,9 @@ fn clamp_window_within_current_monitor(
         let _ = window.set_position(Position::Physical(PhysicalPosition::new(
             clamped_x, clamped_y,
         )));
+        return Some((clamped_x, clamped_y));
     }
+    None
 }
 
 fn remembered_avatar_position(
@@ -719,26 +837,31 @@ fn ensure_avatar_window(app: &AppHandle, scale: f64, body_hidden: bool) -> tauri
 
     let (window_width, window_height) = avatar_window_size(scale, false, body_hidden);
 
-    let window = WebviewWindowBuilder::new(app, AVATAR_WINDOW_LABEL, WebviewUrl::default())
-        .title("Work Review Avatar")
-        .inner_size(window_width, window_height)
-        .min_inner_size(window_width, window_height)
-        .max_inner_size(window_width, window_height)
-        .position(40.0, 40.0)
-        .resizable(false)
-        .maximizable(false)
-        .minimizable(false)
-        .closable(false)
-        .decorations(false)
-        .transparent(true)
-        .visible(false)
-        .always_on_top(true)
-        .visible_on_all_workspaces(true)
-        .skip_taskbar(true)
-        .shadow(false)
-        .focused(false)
-        .on_new_window(|_, _| tauri::webview::NewWindowResponse::Deny)
-        .build()?;
+    let window = WebviewWindowBuilder::new(
+        app,
+        AVATAR_WINDOW_LABEL,
+        WebviewUrl::App("avatar.html".into()),
+    )
+    .title("Work Review Avatar")
+    .inner_size(window_width, window_height)
+    .min_inner_size(window_width, window_height)
+    .max_inner_size(window_width, window_height)
+    .position(40.0, 40.0)
+    .resizable(false)
+    .maximizable(false)
+    .minimizable(false)
+    .closable(false)
+    .decorations(false)
+    .transparent(true)
+    .background_color(tauri::utils::config::Color(0, 0, 0, 0))
+    .visible(false)
+    .always_on_top(true)
+    .visible_on_all_workspaces(true)
+    .skip_taskbar(true)
+    .shadow(false)
+    .focused(false)
+    .on_new_window(|_, _| tauri::webview::NewWindowResponse::Deny)
+    .build()?;
 
     #[cfg(target_os = "windows")]
     record_avatar_hwnd(&window);
@@ -751,16 +874,21 @@ fn ensure_avatar_window(app: &AppHandle, scale: f64, body_hidden: bool) -> tauri
 }
 
 fn resize_avatar_window(window: &WebviewWindow, scale: f64, expanded: bool, body_hidden: bool) {
+    if let Ok(scale_factor) = window.scale_factor() {
+        let expected = avatar_window_physical_size(scale, expanded, body_hidden, scale_factor);
+        // 延迟的程序化 resize 回调可能再次请求同一尺寸，避免重复设置引发回调循环。
+        if window.inner_size().ok() == Some(expected) {
+            return;
+        }
+    }
     let (window_width, window_height) = avatar_window_size(scale, expanded, body_hidden);
-    let _ = window.set_size(Size::Logical(LogicalSize::new(window_width, window_height)));
-    let _ = window.set_min_size(Some(Size::Logical(LogicalSize::new(
-        window_width,
-        window_height,
-    ))));
-    let _ = window.set_max_size(Some(Size::Logical(LogicalSize::new(
-        window_width,
-        window_height,
-    ))));
+    let target_size = Size::Logical(LogicalSize::new(window_width, window_height));
+    // 先释放旧的 min/max 约束再调整尺寸，避免 Win32/macOS WM 按旧固定尺寸钳制新大小。
+    let _ = window.set_min_size(None::<Size>);
+    let _ = window.set_max_size(None::<Size>);
+    let _ = window.set_size(target_size);
+    let _ = window.set_min_size(Some(target_size));
+    let _ = window.set_max_size(Some(target_size));
 }
 
 fn default_avatar_position(
@@ -822,18 +950,8 @@ fn default_avatar_position(
     saved_position.unwrap_or((40, 40))
 }
 
-/// 根据保存的物理坐标选择显示器，保留其工作区与 DPI 信息。
-fn monitor_for_point(app: &AppHandle, x: i32, y: i32) -> Option<Monitor> {
-    let monitors = app.available_monitors().ok()?;
-    for monitor in monitors {
-        let position = monitor.position();
-        let size = monitor.size();
-        let bounds = Rect {
-            x: position.x,
-            y: position.y,
-            width: size.width as i32,
-            height: size.height as i32,
-        };
+fn find_monitor_index_for_point(rects: &[Rect], x: i32, y: i32) -> Option<usize> {
+    for (index, bounds) in rects.iter().enumerate() {
         if point_in_rect(
             x as i64,
             y as i64,
@@ -842,10 +960,64 @@ fn monitor_for_point(app: &AppHandle, x: i32, y: i32) -> Option<Monitor> {
             bounds.width as i64,
             bounds.height as i64,
         ) {
-            return Some(monitor);
+            return Some(index);
         }
     }
-    None
+
+    // 窗口左上角偶尔越出屏幕边缘几像素（如接缝/阴影），在容差内匹配最近显示器；
+    // 若副屏已拔除导致坐标远超所有屏幕，仍返回 None 以回退到可用主屏。
+    let max_dist_sq = MONITOR_POINT_SNAP_TOLERANCE_PX * MONITOR_POINT_SNAP_TOLERANCE_PX;
+    let px = i64::from(x);
+    let py = i64::from(y);
+    let mut best: Option<(usize, i64)> = None;
+    for (index, bounds) in rects.iter().enumerate() {
+        if bounds.width <= 0 || bounds.height <= 0 {
+            continue;
+        }
+        let min_x = i64::from(bounds.x);
+        let max_x = min_x + i64::from(bounds.width) - 1;
+        let min_y = i64::from(bounds.y);
+        let max_y = min_y + i64::from(bounds.height) - 1;
+        let dx = if px < min_x {
+            min_x - px
+        } else if px > max_x {
+            px - max_x
+        } else {
+            0
+        };
+        let dy = if py < min_y {
+            min_y - py
+        } else if py > max_y {
+            py - max_y
+        } else {
+            0
+        };
+        let dist_sq = dx.saturating_mul(dx).saturating_add(dy.saturating_mul(dy));
+        if dist_sq <= max_dist_sq && best.is_none_or(|(_, best_sq)| dist_sq < best_sq) {
+            best = Some((index, dist_sq));
+        }
+    }
+    best.map(|(index, _)| index)
+}
+
+/// 根据保存的物理坐标选择显示器，保留其工作区与 DPI 信息。
+fn monitor_for_point(app: &AppHandle, x: i32, y: i32) -> Option<Monitor> {
+    let monitors = app.available_monitors().ok()?;
+    let rects: Vec<Rect> = monitors
+        .iter()
+        .map(|monitor| {
+            let position = monitor.position();
+            let size = monitor.size();
+            Rect {
+                x: position.x,
+                y: position.y,
+                width: size.width as i32,
+                height: size.height as i32,
+            }
+        })
+        .collect();
+    let index = find_monitor_index_for_point(&rects, x, y)?;
+    monitors.into_iter().nth(index)
 }
 
 fn compute_avatar_position(
@@ -1539,6 +1711,92 @@ mod tests {
                 fallback_bounds.x + fallback_bounds.width - w as i32,
                 fallback_bounds.y + fallback_bounds.height - h as i32
             )
+        );
+    }
+
+    #[test]
+    fn 显示器坐标匹配应容忍边缘微小越界但拒绝已拔除副屏孤立坐标() {
+        let monitors = [
+            Rect {
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: 1080,
+            },
+            Rect {
+                x: 1920,
+                y: 0,
+                width: 2560,
+                height: 1440,
+            },
+        ];
+        assert_eq!(
+            super::find_monitor_index_for_point(&monitors, 2000, 300),
+            Some(1)
+        );
+        assert_eq!(
+            super::find_monitor_index_for_point(&monitors, -8, 100),
+            Some(0)
+        );
+        assert_eq!(
+            super::find_monitor_index_for_point(&monitors, 4488, 500),
+            Some(1)
+        );
+        assert_eq!(
+            super::find_monitor_index_for_point(&monitors, 6000, 500),
+            None
+        );
+    }
+
+    #[test]
+    fn 自动钳制的坐标舍入应保留锚点而实际拖动应清除锚点() {
+        let anchor = Some(super::PreExpansionAnchor {
+            compact_pos: (1650, 820),
+            clamped_pos: (1540, 620),
+        });
+        for position in [(1540, 620), (1544, 616), (1536, 624)] {
+            assert!(!super::should_clear_pre_expansion_anchor(anchor, position));
+        }
+        assert!(super::should_clear_pre_expansion_anchor(
+            anchor,
+            (1545, 620)
+        ));
+        assert!(super::should_clear_pre_expansion_anchor(
+            anchor,
+            (1540, 625)
+        ));
+        let extreme = Some(super::PreExpansionAnchor {
+            compact_pos: (0, 0),
+            clamped_pos: (i32::MIN, i32::MAX),
+        });
+        assert!(super::should_clear_pre_expansion_anchor(
+            extreme,
+            (i32::MAX, i32::MIN)
+        ));
+        assert!(!super::should_clear_pre_expansion_anchor(None, (0, 0)));
+    }
+
+    #[test]
+    fn 展开后收起应优先恢复展开前保存的紧凑锚点() {
+        assert_eq!(
+            super::resolve_expansion_anchor_on_collapse(Some((1650, 820)), (1540, 620)),
+            (1650, 820)
+        );
+        assert_eq!(
+            super::resolve_expansion_anchor_on_collapse(None, (1540, 620)),
+            (1540, 620)
+        );
+        let anchor = Some(super::PreExpansionAnchor {
+            compact_pos: (1650, 820),
+            clamped_pos: (1540, 620),
+        });
+        assert!(
+            !super::should_clear_pre_expansion_anchor(anchor, (1540, 620)),
+            "展开自动钳制触发的同坐标移动事件不应清除紧凑锚点"
+        );
+        assert!(
+            super::should_clear_pre_expansion_anchor(anchor, (1200, 500)),
+            "用户拖动到新坐标后应清除紧凑锚点"
         );
     }
 }

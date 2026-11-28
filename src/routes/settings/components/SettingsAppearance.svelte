@@ -318,6 +318,22 @@
     }
   }
 
+  function toggleAvatarClickThrough() {
+    config.avatar_click_through = !config.avatar_click_through;
+    dispatch('change', config);
+    saveConfigQuietly();
+  }
+
+  function toggleAvatarBodyHidden() {
+    if (!config.avatar_enabled) {
+      return;
+    }
+
+    config.avatar_body_hidden = !config.avatar_body_hidden;
+    dispatch('change', config);
+    saveConfigQuietly();
+  }
+
   function toggleBreakReminder() {
     if (!config.avatar_enabled) {
       return;
@@ -594,7 +610,7 @@
       </div>
       <button
         type="button"
-        on:click={() => { config.avatar_click_through = !config.avatar_click_through; }}
+        on:click={toggleAvatarClickThrough}
         class="switch-track {config.avatar_click_through ? 'bg-primary-500' : 'bg-slate-300 dark:bg-[#484f58]'}"
         role="switch"
         aria-label={t('settingsAppearance.avatarClickThrough')}
@@ -611,7 +627,7 @@
       </div>
       <button
         type="button"
-        on:click={() => { config.avatar_body_hidden = !config.avatar_body_hidden; }}
+        on:click={toggleAvatarBodyHidden}
         class="switch-track {config.avatar_body_hidden ? 'bg-primary-500' : 'bg-slate-300 dark:bg-[#484f58]'} {!config.avatar_enabled ? 'cursor-not-allowed opacity-50' : ''}"
         disabled={!config.avatar_enabled}
         role="switch"

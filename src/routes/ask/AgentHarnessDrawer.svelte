@@ -305,6 +305,8 @@
         </div>
       </div>
 
+      <p class="px-4 pb-3 text-xs leading-relaxed text-slate-500 dark:text-[#8b949e]">{t('ask.harness.description')}</p>
+
       <div class="flex flex-wrap items-center gap-1 border-b border-slate-200/80 px-3 py-2 dark:border-[#30363d]">
         <button
           type="button"

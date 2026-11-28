@@ -18,8 +18,17 @@ pub(crate) fn schedule(app: &AppHandle) {
     }
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
-        // 合并相邻恢复/亮屏通知，给合成器留出恢复时间；平时不轮询。
+        // 合并相邻恢复/亮屏通知：首拍 250ms 尽快恢复，次拍 750ms 后兜底应对 DWM/GPU 慢恢复；平时不轮询。
         tokio::time::sleep(Duration::from_millis(250)).await;
+        let first_handle = app.clone();
+        if let Err(error) = app.run_on_main_thread(move || {
+            if let Err(error) = restore_visible_avatar(&first_handle) {
+                log::warn!("恢复桌宠原生透明失败(首拍): {error}");
+            }
+        }) {
+            log::warn!("调度桌宠首拍透明恢复失败: {error}");
+        }
+        tokio::time::sleep(Duration::from_millis(750)).await;
         let handle = app.clone();
         if let Err(error) = app.run_on_main_thread(move || {
             RECOVERY_PENDING.store(false, Ordering::Release);

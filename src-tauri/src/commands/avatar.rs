@@ -11,7 +11,7 @@ use tauri::{AppHandle, Manager, State};
 use work_review_core::config::AvatarFollowupItem;
 use work_review_core::error::AppError;
 
-use super::shared::persist_app_config;
+use super::shared::update_app_config;
 
 #[cfg(target_os = "linux")]
 const GNOME_AVATAR_EXTENSION_UUID: &str = "work-review-avatar-input@workreview.app";
@@ -113,6 +113,7 @@ pub async fn save_avatar_position(
     y: i32,
     state: State<'_, Arc<Mutex<AppState>>>,
 ) -> Result<(), AppError> {
+    crate::avatar_engine::clear_pre_expansion_anchor_if_moved(x, y);
     let mut state = state.lock().map_err(|e| AppError::Unknown(e.to_string()))?;
     let config_path = state.config_path.clone();
 
@@ -163,6 +164,7 @@ pub async fn persist_avatar_position(
         .outer_position()
         .map_err(|e| AppError::Unknown(format!("读取桌面助手位置失败: {e}")))?;
 
+    crate::avatar_engine::clear_pre_expansion_anchor_if_moved(position.x, position.y);
     let mut state = state.lock().map_err(|e| AppError::Unknown(e.to_string()))?;
     let config_path = state.config_path.clone();
 
@@ -207,31 +209,44 @@ pub async fn handle_avatar_followup_action(
         action,
         crate::avatar_followup::AvatarFollowupAction::Remember
     ) {
-        let mut config = {
-            let state = state.lock().map_err(|e| AppError::Unknown(e.to_string()))?;
-            state.config.clone()
+        let normalized_title = input.title.trim().to_string();
+        let already_exists = {
+            let state_guard = state.lock().map_err(|e| AppError::Unknown(e.to_string()))?;
+            state_guard.config.avatar_followups.iter().any(|item| {
+                item.status == "open"
+                    && item.project_key == project_key
+                    && item.title.trim() == normalized_title
+            })
         };
 
-        let normalized_title = input.title.trim().to_string();
-        let exists = config.avatar_followups.iter().any(|item| {
-            item.status == "open"
-                && item.project_key == project_key
-                && item.title.trim() == normalized_title
-        });
+        if !already_exists {
+            let project_key_for_save = project_key.clone();
+            let date = input.date.trim().to_string();
+            let source_app = input.source_app.trim().to_string();
+            let source_title = input.source_title.trim().to_string();
+            let created_at = chrono::Local::now().timestamp();
 
-        if !exists {
-            config.avatar_followups.push(AvatarFollowupItem {
-                id: uuid::Uuid::new_v4().to_string(),
-                title: normalized_title,
-                date: input.date.trim().to_string(),
-                source_app: input.source_app.trim().to_string(),
-                source_title: input.source_title.trim().to_string(),
-                project_key: project_key.clone(),
-                created_at: chrono::Local::now().timestamp(),
-                status: "open".to_string(),
-            });
-
-            persist_app_config(config, app.clone(), state.inner())?;
+            update_app_config(app.clone(), state.inner(), move |current| {
+                let mut next = current.clone();
+                let exists = next.avatar_followups.iter().any(|item| {
+                    item.status == "open"
+                        && item.project_key == project_key_for_save
+                        && item.title.trim() == normalized_title
+                });
+                if !exists {
+                    next.avatar_followups.push(AvatarFollowupItem {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        title: normalized_title,
+                        date,
+                        source_app,
+                        source_title,
+                        project_key: project_key_for_save,
+                        created_at,
+                        status: "open".to_string(),
+                    });
+                }
+                Ok(next)
+            })?;
         }
     }
 

@@ -1702,64 +1702,52 @@ impl WindowsUiaSession {
             }
         };
         let automation = self.automation.as_ref()?;
+        let walker = automation.get_control_view_walker().ok()?;
+        let started = Instant::now();
+        let budget = Duration::from_millis(WINDOWS_BROWSER_URL_WAIT_TIMEOUT_MS - 50);
+        let mut queue = std::collections::VecDeque::from([(window_element, 0u8)]);
+        let mut visited = 0;
+        let mut best_match: Option<(i32, String)> = None;
 
-        let mut best_match: Option<(i32, String, Option<uiautomation::UIElement>)> = None;
-
-        // 先扫描全部 Edit 控件，定位真实地址栏并缓存该元素。
-        if let Ok(edits) = automation
-            .create_matcher()
-            .from(window_element.clone())
-            .control_type(ControlType::Edit)
-            .timeout(300)
-            .find_all()
-        {
-            for edit in edits {
-                if let Some((score, url)) = Self::extract_url_from_control(&edit) {
+        // find_all 的 timeout 仅限制重试；跳过网页 Document，避免整树遍历耗尽主线程等待预算。
+        while let Some((element, depth)) = queue.pop_front() {
+            if visited >= 256 || started.elapsed() >= budget {
+                break;
+            }
+            visited += 1;
+            let Ok(control_type) = element.get_control_type() else {
+                continue;
+            };
+            if matches!(control_type, ControlType::Edit | ControlType::Document) {
+                if let Some((score, url)) = Self::extract_url_from_control(&element) {
+                    if control_type == ControlType::Edit && score >= 85 {
+                        if self.address_bar_cache.len() >= Self::MAX_CACHED_HWNDS {
+                            self.address_bar_cache.clear();
+                        }
+                        self.address_bar_cache.insert(hwnd, element);
+                        return Some(url);
+                    }
                     if best_match
                         .as_ref()
-                        .map(|(best_score, _, _)| score > *best_score)
-                        .unwrap_or(true)
+                        .is_none_or(|(best_score, _)| score > *best_score)
                     {
-                        best_match = Some((score, url, Some(edit)));
+                        best_match = Some((score, url));
                     }
                 }
             }
-        }
-        if let Some((score, url, cached_el)) = best_match.take() {
-            if score >= 85 {
-                if let Some(el) = cached_el {
-                    if self.address_bar_cache.len() >= Self::MAX_CACHED_HWNDS {
-                        self.address_bar_cache.clear();
-                    }
-                    self.address_bar_cache.insert(hwnd, el);
-                }
-                return Some(url);
+            if control_type == ControlType::Document || depth >= 12 {
+                continue;
             }
-            best_match = Some((score, url, cached_el));
-        }
-
-        // 再扫 Document 控件作为补充。
-        if let Ok(docs) = automation
-            .create_matcher()
-            .from(window_element)
-            .control_type(ControlType::Document)
-            .timeout(300)
-            .find_all()
-        {
-            for doc in docs {
-                if let Some((score, url)) = Self::extract_url_from_control(&doc) {
-                    if best_match
-                        .as_ref()
-                        .map(|(best_score, _, _)| score > *best_score)
-                        .unwrap_or(true)
-                    {
-                        best_match = Some((score, url, None));
-                    }
+            let mut child = walker.get_first_child(&element).ok();
+            while let Some(next) = child {
+                if visited + queue.len() >= 256 || started.elapsed() >= budget {
+                    break;
                 }
+                child = walker.get_next_sibling(&next).ok();
+                queue.push_back((next, depth + 1));
             }
         }
-
-        best_match.map(|(_, url, _)| url)
+        best_match.map(|(_, url)| url)
     }
 }
 
@@ -1816,6 +1804,29 @@ mod tests {
         process::Command,
         time::{SystemTime, UNIX_EPOCH},
     };
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "需显式指定本机浏览器 HWND 与预期主机，不切换或修改用户窗口"]
+    fn 原生地址栏实机读取应在等待预算内返回并命中缓存() {
+        let hwnd: isize = std::env::var("WORK_REVIEW_BROWSER_TEST_HWND")
+            .expect("需要测试窗口 HWND")
+            .parse()
+            .unwrap();
+        let expected_host = std::env::var("WORK_REVIEW_BROWSER_TEST_HOST").unwrap();
+        let mut session = super::WindowsUiaSession::default();
+        for attempt in 0..2 {
+            let started = std::time::Instant::now();
+            let url = session.get_url(hwnd).expect("应读到浏览器地址栏 URL");
+            let elapsed = started.elapsed();
+            assert_eq!(
+                work_review_core::config::PrivacyConfig::extract_domain(&url),
+                expected_host
+            );
+            assert!(elapsed.as_millis() < u128::from(super::WINDOWS_BROWSER_URL_WAIT_TIMEOUT_MS));
+            println!("UIA attempt={attempt} elapsed_ms={}", elapsed.as_millis());
+        }
+    }
 
     #[test]
     fn 未响应后缀应被剥离且不影响正常标题() {

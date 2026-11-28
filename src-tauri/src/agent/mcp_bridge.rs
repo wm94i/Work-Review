@@ -14,12 +14,13 @@ use super::tools::{ensure_public_http_url, is_non_public_ip};
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
-use std::time::Duration;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 use work_review_agent_harness::mcp_client::{
     build_mcp_initialize_request, build_mcp_initialized_notification, build_mcp_tools_call_request,
     build_mcp_tools_list_request, load_mcp_servers_from_dir, normalize_ip,
@@ -30,9 +31,64 @@ use work_review_agent_harness::mcp_client::{
 
 const MCP_HTTP_TIMEOUT_SECS: u64 = 12;
 const MCP_DISCOVERY_TOTAL_BUDGET_SECS: u64 = 8;
+const MCP_DISCOVERY_CACHE_TTL_SECS: u64 = 60;
+const MCP_DISCOVERY_EMPTY_CACHE_TTL_SECS: u64 = 20;
+const MCP_DISCOVERY_CACHE_MAX_ENTRIES: usize = 16;
 const MCP_MAX_RESPONSE_BYTES: usize = 256 * 1024;
 const MCP_SESSION_ID_HEADER: &str = "mcp-session-id";
 const MCP_PROTOCOL_VERSION_HEADER: &str = "mcp-protocol-version";
+
+struct McpDiscoveryCacheEntry {
+    /// `(blocked_self_port, enabled_servers)` 的 SHA-256 指纹：避免在缓存键中滞留明文 auth_token。
+    config_fingerprint: [u8; 32],
+    bridge: Option<Arc<McpToolBridge>>,
+    expires_at: Instant,
+}
+
+static MCP_DISCOVERY_CACHE: OnceLock<Mutex<HashMap<PathBuf, McpDiscoveryCacheEntry>>> =
+    OnceLock::new();
+
+fn mcp_discovery_cache() -> &'static Mutex<HashMap<PathBuf, McpDiscoveryCacheEntry>> {
+    MCP_DISCOVERY_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn compute_discovery_fingerprint(
+    blocked_self_port: Option<u16>,
+    enabled_servers: &[McpClientServerConfig],
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    match blocked_self_port {
+        Some(port) => {
+            hasher.update([1u8]);
+            hasher.update(port.to_le_bytes());
+        }
+        None => hasher.update([0u8]),
+    }
+    hasher.update((enabled_servers.len() as u64).to_le_bytes());
+    for server in enabled_servers {
+        for field in [&server.id, &server.name, &server.endpoint] {
+            hasher.update((field.len() as u64).to_le_bytes());
+            hasher.update(field.as_bytes());
+        }
+        hasher.update([u8::from(server.enabled), u8::from(server.allow_localhost)]);
+        match &server.auth_token {
+            Some(tok) => {
+                hasher.update([1u8]);
+                hasher.update((tok.len() as u64).to_le_bytes());
+                hasher.update(tok.as_bytes());
+            }
+            None => hasher.update([0u8]),
+        }
+    }
+    hasher.finalize().into()
+}
+
+/// 主动失效指定数据目录的外部 MCP 发现缓存（保存/删除/测试 MCP 配置后调用）。
+pub fn invalidate_mcp_discovery_cache(data_dir: &Path) {
+    if let Ok(mut guard) = mcp_discovery_cache().lock() {
+        guard.remove(data_dir);
+    }
+}
 
 /// 测试外部 MCP Server 连通性与工具发现的返回结果。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -451,8 +507,79 @@ pub async fn test_mcp_server_connection(
 }
 
 impl McpToolBridge {
+    /// 带短时 TTL 缓存的外部 MCP 发现入口（桌面每轮工作复盘使用）。
+    ///
+    /// - 未启用任何 MCP 服务时零网络开销且不污染缓存；
+    /// - 命中缓存时复用已握手的 `Arc<McpToolBridge>` 与 `Mcp-Session-Id`，避免每轮提问重跑握手；
+    /// - 配置内容变化或调用 `invalidate_mcp_discovery_cache` 时立即失效。
+    pub async fn discover_cached_for_data_dir(
+        data_dir: &Path,
+        blocked_self_port: Option<u16>,
+    ) -> Option<Arc<Self>> {
+        let dir = data_dir.to_path_buf();
+        let enabled_servers: Vec<McpClientServerConfig> = tokio::task::spawn_blocking(move || {
+            load_mcp_servers_from_dir(&dir)
+                .into_iter()
+                .filter(|s| s.enabled)
+                .collect()
+        })
+        .await
+        .ok()?;
+
+        if enabled_servers.is_empty() {
+            invalidate_mcp_discovery_cache(data_dir);
+            return None;
+        }
+
+        let fingerprint = compute_discovery_fingerprint(blocked_self_port, &enabled_servers);
+        let now = Instant::now();
+        if let Ok(mut guard) = mcp_discovery_cache().lock() {
+            if let Some(entry) = guard.get(data_dir) {
+                if entry.expires_at > now && entry.config_fingerprint == fingerprint {
+                    return entry.bridge.clone();
+                }
+                // 读路径遇到过期或指纹变化的条目立即移除，避免旧条目滞留内存。
+                guard.remove(data_dir);
+            }
+        }
+
+        let discovered = Self::discover_for_servers(enabled_servers, blocked_self_port)
+            .await
+            .map(Arc::new);
+        let ttl = if discovered.is_some() {
+            Duration::from_secs(MCP_DISCOVERY_CACHE_TTL_SECS)
+        } else {
+            Duration::from_secs(MCP_DISCOVERY_EMPTY_CACHE_TTL_SECS)
+        };
+
+        if let Ok(mut guard) = mcp_discovery_cache().lock() {
+            let now_store = Instant::now();
+            guard.retain(|_, entry| entry.expires_at > now_store);
+            if guard.len() >= MCP_DISCOVERY_CACHE_MAX_ENTRIES && !guard.contains_key(data_dir) {
+                if let Some(oldest_key) = guard
+                    .iter()
+                    .min_by_key(|(_, entry)| entry.expires_at)
+                    .map(|(k, _)| k.clone())
+                {
+                    guard.remove(&oldest_key);
+                }
+            }
+            guard.insert(
+                data_dir.to_path_buf(),
+                McpDiscoveryCacheEntry {
+                    config_fingerprint: fingerprint,
+                    bridge: discovered.clone(),
+                    expires_at: now_store + ttl,
+                },
+            );
+        }
+
+        discovered
+    }
+
     /// 按数据目录并行发现所有已启用外部 MCP Server 的工具（总预算上限 8 秒）。
     /// 若未配置任何已启用服务，直接返回 `None`（零网络开销）。
+    #[cfg(test)]
     pub async fn discover_for_data_dir(
         data_dir: &Path,
         blocked_self_port: Option<u16>,
@@ -471,6 +598,13 @@ impl McpToolBridge {
             return None;
         }
 
+        Self::discover_for_servers(enabled_servers, blocked_self_port).await
+    }
+
+    async fn discover_for_servers(
+        enabled_servers: Vec<McpClientServerConfig>,
+        blocked_self_port: Option<u16>,
+    ) -> Option<Self> {
         let mut join_set = tokio::task::JoinSet::new();
         for server in enabled_servers {
             join_set.spawn(async move {
@@ -939,6 +1073,200 @@ mod tests {
             .expect("带会话 tools/call 应成功");
         assert_eq!(reply, "session-pong");
 
+        let _ = server_task.await;
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn mcp发现缓存应复用会话且支持主动失效重建() {
+        use work_review_agent_harness::mcp_client::{
+            save_mcp_server_in_dir, SaveMcpClientServerInput,
+        };
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let init_count = std::sync::Arc::new(AtomicU64::new(0));
+        let init_count_server = init_count.clone();
+
+        let server_task = tokio::spawn(async move {
+            // 预期共 4 轮握手（首次 + 主动失效 + 端口变更 + 配置变更，每轮 3 个请求）= 12 次连接
+            for _ in 0..12 {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 4096];
+                let mut content_len = 0usize;
+                let mut header_end = None;
+                loop {
+                    let n = socket.read(&mut tmp).await.unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&tmp[..n]);
+                    if header_end.is_none() {
+                        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            header_end = Some(pos + 4);
+                            let header_str = String::from_utf8_lossy(&buf[..pos]);
+                            for line in header_str.lines() {
+                                if let Some((k, v)) = line.split_once(':') {
+                                    if k.eq_ignore_ascii_case("content-length") {
+                                        content_len = v.trim().parse().unwrap_or(0);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if let Some(h_end) = header_end {
+                        if buf.len() >= h_end + content_len {
+                            break;
+                        }
+                    }
+                }
+                let h_end = header_end.unwrap_or(buf.len());
+                let body_str = String::from_utf8_lossy(&buf[h_end..]);
+                let req_json: Value = serde_json::from_str(&body_str).unwrap_or(Value::Null);
+                let method = req_json
+                    .get("method")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let id = req_json.get("id").cloned().unwrap_or(Value::Null);
+
+                let response_bytes = match method {
+                    "initialize" => {
+                        init_count_server.fetch_add(1, Ordering::SeqCst);
+                        let resp_body = serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": { "protocolVersion": MCP_PROTOCOL_VERSION, "capabilities": {} }
+                        })
+                        .to_string();
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nMcp-Session-Id: cache-sess\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            resp_body.len(),
+                            resp_body
+                        )
+                    }
+                    "notifications/initialized" => {
+                        "HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            .to_string()
+                    }
+                    "tools/list" => {
+                        let resp_body = serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": {
+                                "tools": [{
+                                    "name": "cached_tool",
+                                    "description": "cached",
+                                    "inputSchema": { "type": "object", "properties": {} }
+                                }]
+                            }
+                        })
+                        .to_string();
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nMcp-Session-Id: cache-sess\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            resp_body.len(),
+                            resp_body
+                        )
+                    }
+                    _ => {
+                        "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            .to_string()
+                    }
+                };
+                let _ = socket.write_all(response_bytes.as_bytes()).await;
+            }
+        });
+
+        let root = std::env::temp_dir().join(format!("wr-mcp-cache-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        save_mcp_server_in_dir(
+            &root,
+            SaveMcpClientServerInput {
+                id: "cached".into(),
+                name: "Cached MCP".into(),
+                endpoint: format!("http://127.0.0.1:{port}/mcp"),
+                enabled: true,
+                allow_localhost: true,
+                auth_token: None,
+            },
+        )
+        .unwrap();
+
+        let first = McpToolBridge::discover_cached_for_data_dir(&root, Some(47831))
+            .await
+            .expect("首次发现应成功");
+        let second = McpToolBridge::discover_cached_for_data_dir(&root, Some(47831))
+            .await
+            .expect("第二次应命中缓存");
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "命中缓存应复用同一个 Arc 实例"
+        );
+        assert_eq!(init_count.load(Ordering::SeqCst), 1, "缓存命中不应重复握手");
+
+        invalidate_mcp_discovery_cache(&root);
+        let third = McpToolBridge::discover_cached_for_data_dir(&root, Some(47831))
+            .await
+            .expect("失效后应重新发现");
+        assert!(!Arc::ptr_eq(&first, &third));
+        assert_eq!(init_count.load(Ordering::SeqCst), 2, "失效后应重新发起握手");
+
+        // blocked_self_port 变化应自动击穿缓存
+        let fourth = McpToolBridge::discover_cached_for_data_dir(&root, Some(47832))
+            .await
+            .expect("自调用保护端口变更后应重新发现");
+        assert!(!Arc::ptr_eq(&third, &fourth));
+        assert_eq!(
+            init_count.load(Ordering::SeqCst),
+            3,
+            "端口变化应触发重新握手"
+        );
+
+        // 配置内容（如服务名或 token）变更应自动击穿缓存
+        save_mcp_server_in_dir(
+            &root,
+            SaveMcpClientServerInput {
+                id: "cached".into(),
+                name: "Cached MCP v2".into(),
+                endpoint: format!("http://127.0.0.1:{port}/mcp"),
+                enabled: true,
+                allow_localhost: true,
+                auth_token: Some("tok-rotated".into()),
+            },
+        )
+        .unwrap();
+        let fifth = McpToolBridge::discover_cached_for_data_dir(&root, Some(47832))
+            .await
+            .expect("配置变更后应重新发现");
+        assert!(!Arc::ptr_eq(&fourth, &fifth));
+        assert_eq!(
+            init_count.load(Ordering::SeqCst),
+            4,
+            "配置变化应触发重新握手"
+        );
+
+        // 禁用所有服务时应直接返回 None 并清理缓存
+        save_mcp_server_in_dir(
+            &root,
+            SaveMcpClientServerInput {
+                id: "cached".into(),
+                name: "Cached MCP v2".into(),
+                endpoint: format!("http://127.0.0.1:{port}/mcp"),
+                enabled: false,
+                allow_localhost: true,
+                auth_token: None,
+            },
+        )
+        .unwrap();
+        assert!(
+            McpToolBridge::discover_cached_for_data_dir(&root, Some(47832))
+                .await
+                .is_none()
+        );
+
+        invalidate_mcp_discovery_cache(&root);
         let _ = server_task.await;
         let _ = std::fs::remove_dir_all(&root);
     }

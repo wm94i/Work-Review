@@ -85,11 +85,15 @@ pub async fn save_config(
 }
 
 /// 由后端维护、前端草稿不应覆盖的字段：设置页持有的是打开时的配置快照，
-/// 期间在聊天中完成的 Bot 发送者绑定 / Telegram 绑定码消费若被整份写回就会丢失（绑定码也会"复活"）。
+/// 期间在聊天中完成的 Bot 发送者绑定 / Telegram 绑定码消费、桌宠实时拖拽坐标及待跟进清单
+/// 若被整份写回就会丢失（绑定码也会"复活"）。
 fn preserve_server_owned_fields(mut incoming: AppConfig, current: &AppConfig) -> AppConfig {
     incoming.bot_sender_bindings = current.bot_sender_bindings.clone();
     incoming.telegram_bot_bind_code = current.telegram_bot_bind_code.clone();
     incoming.telegram_bot_bind_code_expires_at = current.telegram_bot_bind_code_expires_at;
+    incoming.avatar_x = current.avatar_x;
+    incoming.avatar_y = current.avatar_y;
+    incoming.avatar_followups = current.avatar_followups.clone();
     incoming
 }
 
@@ -992,6 +996,40 @@ mod tests {
         assert!(dst.join("mcp_clients.json").is_file());
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn 保存旧配置快照不得覆盖桌宠实时坐标与待跟进记录() {
+        let current = work_review_core::config::AppConfig {
+            avatar_x: Some(1280),
+            avatar_y: Some(640),
+            avatar_followups: vec![work_review_core::config::AvatarFollowupItem {
+                id: "followup-1".to_string(),
+                title: "继续收尾".to_string(),
+                date: "2026-11-27".to_string(),
+                source_app: "Code".to_string(),
+                source_title: "avatar.rs".to_string(),
+                project_key: "work_review".to_string(),
+                created_at: 1_700_000_000,
+                status: "open".to_string(),
+            }],
+            ..Default::default()
+        };
+
+        let incoming = work_review_core::config::AppConfig {
+            avatar_x: Some(100),
+            avatar_y: Some(100),
+            avatar_opacity: 0.65,
+            ..Default::default()
+        };
+
+        let merged = super::preserve_server_owned_fields(incoming, &current);
+
+        assert_eq!(merged.avatar_x, Some(1280));
+        assert_eq!(merged.avatar_y, Some(640));
+        assert_eq!(merged.avatar_followups.len(), 1);
+        assert_eq!(merged.avatar_followups[0].id, "followup-1");
+        assert!((merged.avatar_opacity - 0.65).abs() < f64::EPSILON);
     }
 }
 

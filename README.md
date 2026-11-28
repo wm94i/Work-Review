@@ -55,7 +55,7 @@ The focus is not "monitoring". It is helping you **recall, organize, and review*
 - **Unified timeline and statistics** — Overview, timeline, work assistant, and daily report share the same local records, so you can inspect trends and drill into context
 - **Questions over local records** — Use the basic template or your configured model to answer "What did I do today?", "How long did this task take?", and "What have I been focused on?"
 - **Daily and periodic reviews** — Generate daily, weekly, and monthly reports with Markdown / Obsidian section exports and paragraph management
-- **Personal Agent workflows** — Inspect runs and approvals, maintain personal skills, schedule read-only routines, and approve each external MCP tool call
+- **Assistant extensions** — Inspect runs and approvals, maintain personal skills, schedule read-only routines, and approve each external MCP tool call
 - **Privacy-first and locally controllable** — Data is stored in local SQLite by default; AI is optional, and model calls use your own API key without third-party relay
 - **Desktop Avatar Beta** — Shows work status through a desktop avatar and is gradually expanding toward proactive reminders and context assistance
 - **Multilingual UI** — Available in Simplified Chinese, English, Traditional Chinese, and Arabic (with RTL layout)
@@ -191,14 +191,14 @@ You can control the recording scope as needed:
 - Website semantic categorization: changing a domain category automatically backfills history
 - Multi-segment work time: e.g. morning + afternoon, break time excluded
 
-### Personal Agent Workflows
+### Assistant Extensions
 
-Open **Work Assistant → Harness & Skills** to manage:
+Open **Work Assistant → Assistant Extensions** to manage:
 
-- **Run Trace:** inspect status, tool approvals, data boundaries, and context compaction events; input and error previews redact common credentials
-- **Personal Skills:** create or edit local `skills/<name>/SKILL.md` workflows, loaded on demand in work-review mode
-- **Routines:** daily, interval, or manual triggers while the app is running; read-only execution uses local statistics or a local model by default, with explicit cloud-model opt-in for each routine
-- **MCP Extensions:** connect HTTP MCP services with approval for every tool call; public endpoints require HTTPS and loopback endpoints require explicit permission. General chat, bots, and background routines do not use them
+- **Run History:** inspect status, tool approvals, data boundaries, and context compaction events; input and error previews redact common credentials
+- **Skills:** create or edit local `skills/<name>/SKILL.md` workflows, loaded on demand in work-review mode
+- **Scheduled Tasks:** daily, interval, or manual triggers while the app is running; read-only execution uses local statistics or a local model by default, with explicit cloud-model opt-in for each routine
+- **Connected Tools (MCP):** connect HTTP MCP services with approval for every tool call; public endpoints require HTTPS and loopback endpoints require explicit permission. General chat, bots, and background routines do not use them
 
 Use **Settings → Storage** for CSV / JSON export, backup, and restore. Back up the complete data directory before upgrading; 1.2.0 automatically migrates the database to schema 4. In-app backups exclude personal skills, routines, and MCP configuration: separately secure `skills/`, `agent_routines.json`, and `mcp_clients.json`. Restore preserves these files on the destination machine.
 

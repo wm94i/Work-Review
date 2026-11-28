@@ -597,10 +597,11 @@
           try {
             await push('/timeline');
             if (nextDate) {
+              const nextHash = `#/timeline?date=${encodeURIComponent(nextDate)}`;
               window.history.replaceState(
                 window.history.state,
                 '',
-                `/timeline?date=${encodeURIComponent(nextDate)}`
+                `${window.location.pathname}${window.location.search}${nextHash}`
               );
             }
             await tick();

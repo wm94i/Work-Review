@@ -358,6 +358,7 @@ pub(crate) fn update_app_config_with_source(
         previous_avatar_scale,
         previous_avatar_opacity,
         previous_avatar_preset,
+        previous_avatar_persona,
         previous_avatar_click_through,
         previous_avatar_body_hidden,
         previous_avatar_x,
@@ -430,6 +431,7 @@ pub(crate) fn update_app_config_with_source(
             previous_config.avatar_scale,
             previous_config.avatar_opacity,
             previous_config.avatar_preset,
+            previous_config.avatar_persona,
             previous_config.avatar_click_through,
             previous_config.avatar_body_hidden,
             previous_config.avatar_x,
@@ -450,7 +452,8 @@ pub(crate) fn update_app_config_with_source(
         || previous_avatar_y != config.avatar_y;
     let avatar_click_through_changed = previous_avatar_click_through != config.avatar_click_through;
     let avatar_visual_changed = previous_avatar_opacity != config.avatar_opacity
-        || previous_avatar_preset != config.avatar_preset;
+        || previous_avatar_preset != config.avatar_preset
+        || previous_avatar_persona != config.avatar_persona;
     // 隐藏本体既是窗口尺寸变化也是视觉变化（前端需重新渲染 canvas 显隐）
     let avatar_body_hidden_changed = previous_avatar_body_hidden != config.avatar_body_hidden;
     let dock_visibility_changed = previous_hide_dock_icon != config.hide_dock_icon
@@ -475,22 +478,26 @@ pub(crate) fn update_app_config_with_source(
 
     if config.avatar_enabled
         && (avatar_window_changed || avatar_visual_changed || avatar_body_hidden_changed)
-        && !refresh_avatar_state_for_current_window(&app, state)
     {
+        // 先立刻推送带新视觉配置的状态，避免同步前台窗口探测阻塞设置保存/托盘点击。
         crate::avatar_engine::emit_avatar_state(&app, &avatar_state);
+        spawn_refresh_avatar_state_for_current_window(app.clone(), state.clone());
     }
 
     if avatar_click_through_changed && config.avatar_enabled {
         crate::avatar_engine::set_avatar_click_through(&app, config.avatar_click_through);
     }
 
-    // 同步智能穿透运行时 flag（供 spawn_avatar_input_bridge 轮询无锁读）
+    // 同步智能穿透与隐藏本体运行时 flag（供 spawn_avatar_input_bridge 轮询无锁读）
     crate::avatar_input::set_avatar_enabled_flag(config.avatar_enabled);
     crate::avatar_input::set_avatar_click_through_flag(config.avatar_click_through);
+    crate::avatar_input::set_avatar_body_hidden_flag(config.avatar_body_hidden);
     if config.avatar_enabled && !previous_avatar_enabled {
         crate::avatar_input::start_avatar_input_monitor(&app);
         crate::avatar_input::spawn_avatar_input_monitor_retry(app.clone());
         crate::avatar_input::spawn_avatar_input_bridge(app.clone());
+    } else if !config.avatar_enabled && previous_avatar_enabled {
+        crate::avatar_input::stop_avatar_input_monitor(&app);
     }
     if avatar_window_changed || avatar_click_through_changed {
         crate::avatar_input::force_resync_click_through();
@@ -514,46 +521,51 @@ pub(crate) fn update_app_config_with_source(
     Ok(config)
 }
 
-fn refresh_avatar_state_for_current_window(app: &AppHandle, state: &Arc<Mutex<AppState>>) -> bool {
-    let active_window = match crate::monitor::get_active_window_fast() {
-        Ok(window) => window,
-        Err(_) => return false,
-    };
+fn spawn_refresh_avatar_state_for_current_window(app: AppHandle, state: Arc<Mutex<AppState>>) {
+    tauri::async_runtime::spawn(async move {
+        let active_window =
+            match tokio::task::spawn_blocking(crate::monitor::get_active_window_fast).await {
+                Ok(Ok(window)) => window,
+                _ => return,
+            };
 
-    let next_avatar_state = {
-        let mut state_guard = match state.lock() {
-            Ok(guard) => guard,
-            Err(e) => {
-                log::warn!("刷新桌宠状态时获取状态锁失败: {e}");
-                return false;
+        let next_avatar_state = {
+            let mut state_guard = match state.lock() {
+                Ok(guard) => guard,
+                Err(e) => {
+                    log::warn!("刷新桌宠状态时获取状态锁失败: {e}");
+                    return;
+                }
+            };
+
+            if !state_guard.config.avatar_enabled {
+                return;
             }
+
+            let next_state = crate::avatar_engine::apply_avatar_visual_settings(
+                crate::avatar_engine::derive_avatar_state_with_rules(
+                    &state_guard.config.app_category_rules,
+                    &state_guard.config.custom_categories,
+                    &active_window.app_name,
+                    &active_window.window_title,
+                    active_window.browser_url.as_deref(),
+                    state_guard.avatar_state.is_idle,
+                    state_guard.avatar_generating_report,
+                ),
+                state_guard.config.avatar_opacity,
+                &state_guard.config.avatar_preset,
+                &state_guard.config.avatar_persona,
+                state_guard.config.avatar_body_hidden,
+            );
+            if state_guard.avatar_state == next_state {
+                return;
+            }
+            state_guard.avatar_state = next_state.clone();
+            next_state
         };
 
-        if !state_guard.config.avatar_enabled {
-            return false;
-        }
-
-        let next_state = crate::avatar_engine::apply_avatar_visual_settings(
-            crate::avatar_engine::derive_avatar_state_with_rules(
-                &state_guard.config.app_category_rules,
-                &state_guard.config.custom_categories,
-                &active_window.app_name,
-                &active_window.window_title,
-                active_window.browser_url.as_deref(),
-                state_guard.avatar_state.is_idle,
-                state_guard.avatar_generating_report,
-            ),
-            state_guard.config.avatar_opacity,
-            &state_guard.config.avatar_preset,
-            &state_guard.config.avatar_persona,
-            state_guard.config.avatar_body_hidden,
-        );
-        state_guard.avatar_state = next_state.clone();
-        next_state
-    };
-
-    crate::avatar_engine::emit_avatar_state(app, &next_avatar_state);
-    true
+        crate::avatar_engine::emit_avatar_state(&app, &next_avatar_state);
+    });
 }
 
 #[cfg(test)]

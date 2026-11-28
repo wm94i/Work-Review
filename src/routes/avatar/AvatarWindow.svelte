@@ -102,12 +102,18 @@
   let focusSession: AvatarFocusSession | null = null;
   let focusTimer: ReturnType<typeof setInterval> | null = null;
   let focusNowMs = 0;
+  let focusIntroUntilMs = 0;
   let lastStateBubbleAt = 0;
   let transitionClass: AvatarTransitionClass = '';
   let transitionTimer: ReturnType<typeof setTimeout> | null = null;
   let motionBeat = 0;
   let motionTimer: ReturnType<typeof setTimeout> | null = null;
+  let lastInputMotionBeatAt = 0;
+  let windowVisible = true;
   let positionSaveTimer: ReturnType<typeof setTimeout> | null = null;
+  let suppressPositionSaveUntil = 0;
+  let bubbleEdgeTimer: ReturnType<typeof setTimeout> | null = null;
+  let bubbleEdgeRequestSeq = 0;
   let sizeCorrectionTimer: ReturnType<typeof setTimeout> | null = null;
   let resizeGuardTimer: ReturnType<typeof setTimeout> | null = null;
   let suppressNextResizeCorrection = false;
@@ -123,6 +129,7 @@
   let interactiveRegionSyncPending = false;
   let interactiveRegionSyncRequested = false;
   let interactiveRegionsMounted = false;
+  let lastInteractiveRegionsSignature: string | null = null;
   $: currentLocale = $locale;
 
   const RUNTIME_BUBBLE_MESSAGES: Partial<Record<string, Partial<Record<Locale, string>>>> = {
@@ -143,6 +150,12 @@
       'zh-TW': '別再切了，先把手上這段收住。',
       en: 'Enough switching. Close this stretch before moving on.',
       ar: 'توقف عن التبديل وأنهِ ما بين يديك أولاً.',
+    },
+    __avatar_goal_achieved__: {
+      'zh-CN': '今日专注目标达成！干得漂亮！',
+      'zh-TW': '今日專注目標達成！幹得漂亮！',
+      en: 'Daily focus goal reached! Great job!',
+      ar: 'تم تحقيق هدف التركيز اليومي! عمل رائع!',
     },
     '先放松一下，待会再继续推进。': {
       'zh-CN': '先放松一下，待会再继续推进。',
@@ -312,6 +325,9 @@
     // focusNowMs must appear in the reactive expression so Svelte
     // re-evaluates every second when the timer ticks.
     void focusNowMs;
+    if (focusSession && bubbleSource && focusNowMs < focusIntroUntilMs) {
+      return null;
+    }
     return buildFocusBubblePayload(focusSession);
   })();
   $: bubble = localizeBubblePayload(focusBubble || bubbleSource, currentLocale);
@@ -359,28 +375,43 @@
           return;
         }
 
-        const elements = Array.from(
-          document.querySelectorAll('[data-avatar-hit-region]'),
-        );
+        const precise = !!state.avatarBodyHidden;
+        const elements = precise
+          ? Array.from(document.querySelectorAll('[data-avatar-hit-region]'))
+          : [];
         refreshInteractiveRegionObserver(elements);
 
-        const regions = elements
-          .map((element) => {
-            const rect = element.getBoundingClientRect();
-            return {
-              x: rect.x,
-              y: rect.y,
-              width: rect.width,
-              height: rect.height,
-            };
-          })
-          .filter((region) => region.width > 0 && region.height > 0);
+        const regions = precise
+          ? elements
+              .map((element) => {
+                const rect = element.getBoundingClientRect();
+                return {
+                  x: rect.x,
+                  y: rect.y,
+                  width: rect.width,
+                  height: rect.height,
+                };
+              })
+              .filter((region) => region.width > 0 && region.height > 0)
+          : [];
+
+        const signature = `${precise ? '1' : '0'}:${regions
+          .map(
+            (region) =>
+              `${Math.round(region.x)},${Math.round(region.y)},${Math.round(region.width)},${Math.round(region.height)}`,
+          )
+          .join(';')}`;
+
+        if (signature === lastInteractiveRegionsSignature) {
+          continue;
+        }
 
         try {
           await invoke('set_avatar_interactive_regions', {
             precise: !!state.avatarBodyHidden,
             regions,
           });
+          lastInteractiveRegionsSignature = signature;
         } catch (e) {
           console.error('更新桌宠精确交互区域失败:', e);
         }
@@ -420,13 +451,32 @@
     }
     const previous = avatarExpanded;
     avatarExpanded = expanded;
+    if (sizeCorrectionTimer !== null) {
+      clearTimeout(sizeCorrectionTimer);
+      sizeCorrectionTimer = null;
+    }
+    suppressNextResizeCorrection = true;
+    suppressPositionSaveUntil = Date.now() + 450;
+    if (resizeGuardTimer !== null) {
+      clearTimeout(resizeGuardTimer);
+      resizeGuardTimer = null;
+    }
     try {
       await invoke('set_avatar_window_expanded', { expanded });
+      void refreshBubbleEdge();
     } catch (e) {
       if (!force) {
         avatarExpanded = previous;
       }
       console.error('更新桌宠窗口尺寸失败:', e);
+    } finally {
+      if (resizeGuardTimer !== null) {
+        clearTimeout(resizeGuardTimer);
+      }
+      resizeGuardTimer = setTimeout(() => {
+        suppressNextResizeCorrection = false;
+        resizeGuardTimer = null;
+      }, 220);
     }
   }
 
@@ -439,18 +489,9 @@
       clearTimeout(sizeCorrectionTimer);
     }
     sizeCorrectionTimer = setTimeout(async () => {
+      sizeCorrectionTimer = null;
       const expanded = avatarExpanded === null ? followup != null : avatarExpanded;
-      suppressNextResizeCorrection = true;
-      if (resizeGuardTimer !== null) {
-        clearTimeout(resizeGuardTimer);
-      }
-
       await syncAvatarExpansion(expanded, { force: true });
-
-      resizeGuardTimer = setTimeout(() => {
-        suppressNextResizeCorrection = false;
-        resizeGuardTimer = null;
-      }, 180);
     }, 120);
   }
 
@@ -468,7 +509,7 @@
       return;
     }
 
-    if (focusSession && !payload?.persistent) {
+    if ((focusSession || bubbleSource?.persistent) && !payload?.persistent) {
       return;
     }
 
@@ -478,10 +519,14 @@
     }
 
     if (!payload?.persistent) {
+      const durationMs =
+        typeof payload?.durationMs === 'number' && Number.isFinite(payload.durationMs) && payload.durationMs > 0
+          ? payload.durationMs
+          : 4200;
       bubbleTimer = setTimeout(() => {
         bubbleSource = null;
         bubbleTimer = null;
-      }, payload?.durationMs ?? 4200);
+      }, durationMs);
     }
   }
 
@@ -638,6 +683,7 @@
     }
     focusSession = null;
     focusNowMs = 0;
+    focusIntroUntilMs = 0;
     clearFocusTimer();
     if (showEndedBubble) {
       clearBubble();
@@ -657,18 +703,22 @@
       }
 
       clearFollowup();
-      focusSession = {
-        projectKey: payload.projectKey,
-        title: payload.title,
-        endsAtMs: Date.now() + 25 * 60 * 1000,
-      };
       clearBubble();
-      ensureFocusTicking();
+      const now = Date.now();
       const theme = getFollowupTheme(payload.persona);
+      focusIntroUntilMs = now + 2600;
+      // 必须在写入 focusSession 之前展示开场提示，否则 showBubble 会把专注期非持久气泡过滤掉。
       showBubble({
         message: t(theme.focusStartedKey),
         tone: 'success',
+        durationMs: 2600,
       });
+      focusSession = {
+        projectKey: payload.projectKey,
+        title: payload.title,
+        endsAtMs: now + 25 * 60 * 1000,
+      };
+      ensureFocusTicking();
     } catch (e) {
       console.error('桌宠开始专注失败:', e);
       showBubble({
@@ -785,6 +835,10 @@
   }
 
   function scheduleAvatarPositionSave(position: PhysicalPosition): void {
+    if (Date.now() < suppressPositionSaveUntil) {
+      return;
+    }
+
     const nextX = Math.round(position.x);
     const nextY = Math.round(position.y);
     const nextKey = `${nextX},${nextY}`;
@@ -809,26 +863,39 @@
   // 根据窗口在屏幕中的水平位置决定气泡朝向：靠近右侧时气泡向左展开，
   // 避免桌宠缩小并贴右下角时气泡向右溢出被裁（#137 诉求一）。
   async function refreshBubbleEdge() {
+    const requestSeq = ++bubbleEdgeRequestSeq;
     try {
-      const [position, monitor] = await Promise.all([
+      const [position, outerSize, monitor] = await Promise.all([
         nativeWindow.outerPosition(),
+        nativeWindow.outerSize().catch(() => null),
         currentMonitor(),
       ]);
-      if (!monitor) return;
+      if (requestSeq !== bubbleEdgeRequestSeq || !monitor) return;
       const monitorRight = monitor.position.x + monitor.size.width;
-      // 窗口右半部分越过显示器中线 → 视为靠近右侧，气泡翻转朝左
-      const windowCenterX = position.x + 138; // 基准宽 276 的一半作近似中心
+      const halfWidth = outerSize && outerSize.width > 0 ? outerSize.width / 2 : 138;
+      // 窗口中心越过显示器中线 → 视为靠近右侧，气泡翻转朝左
+      const windowCenterX = position.x + halfWidth;
       bubbleFlipLeft = windowCenterX > (monitor.position.x + monitorRight) / 2;
     } catch (e) {
       // 取不到显示器信息时保持默认（右锚点），不影响主流程
     }
   }
 
+  function scheduleBubbleEdgeRefresh(): void {
+    if (bubbleEdgeTimer !== null) {
+      clearTimeout(bubbleEdgeTimer);
+    }
+    bubbleEdgeTimer = setTimeout(() => {
+      bubbleEdgeTimer = null;
+      void refreshBubbleEdge();
+    }, 80);
+  }
+
   function scheduleNextMotionStep(): void {
     if (motionTimer !== null) {
       clearTimeout(motionTimer);
     }
-    if (document.hidden) {
+    if (document.hidden || !windowVisible) {
       motionTimer = null;
       return;
     }
@@ -840,10 +907,12 @@
   }
 
   onMount(() => {
+    let disposed = false;
     let unlistenState = () => {};
     let unlistenBubble = () => {};
     let unlistenFollowup = () => {};
     let unlistenInput = () => {};
+    let unlistenVisibility = () => {};
     let unlistenMoved = () => {};
     let unlistenResized = () => {};
     let unlistenLocaleChanged = () => {};
@@ -858,8 +927,12 @@
     });
 
     // 初始计算一次气泡朝向（窗口已定位后再读位置）
-    setTimeout(refreshBubbleEdge, 0);
-    if (!document.hidden) {
+    const initialBubbleEdgeTimer = setTimeout(() => {
+      if (!disposed) {
+        void refreshBubbleEdge();
+      }
+    }, 0);
+    if (!document.hidden && windowVisible) {
       scheduleNextMotionStep();
     }
 
@@ -892,9 +965,21 @@
     document.addEventListener('contextmenu', handleContextMenu);
     document.addEventListener('keydown', handleKeydown, true);
 
+    const registerUnlisten = (unlisten: () => void, assign: (fn: () => void) => void): boolean => {
+      if (disposed) {
+        try {
+          unlisten();
+        } catch {}
+        return false;
+      }
+      assign(unlisten);
+      return true;
+    };
+
     (async () => {
       try {
         const payload = await invoke<unknown>('get_avatar_state');
+        if (disposed) return;
         const nextState = parseAvatarState(payload);
         if (nextState) {
           state = nextState;
@@ -904,8 +989,9 @@
       } catch (e) {
         console.error('获取桌宠状态失败:', e);
       }
+      if (disposed) return;
 
-      unlistenState = await appWindow.listen<unknown>('avatar-state-changed', (event) => {
+      const stateOff = await appWindow.listen<unknown>('avatar-state-changed', (event) => {
         const nextState = parseAvatarState(event.payload);
         if (!nextState) {
           console.warn('桌宠状态事件载荷格式无效，已忽略');
@@ -955,8 +1041,9 @@
         state = nextState;
         scheduleNextMotionStep();
       });
+      if (!registerUnlisten(stateOff, (fn) => { unlistenState = fn; })) return;
 
-      unlistenBubble = await appWindow.listen<unknown>('avatar-bubble', (event) => {
+      const bubbleOff = await appWindow.listen<unknown>('avatar-bubble', (event) => {
         const payload = parseAvatarBubblePayload(event.payload);
         if (!payload) {
           console.warn('桌宠气泡事件载荷格式无效，已忽略');
@@ -964,8 +1051,9 @@
         }
         showBubble(payload);
       });
+      if (!registerUnlisten(bubbleOff, (fn) => { unlistenBubble = fn; })) return;
 
-      unlistenFollowup = await appWindow.listen<unknown>('avatar-followup-suggestion', (event) => {
+      const followupOff = await appWindow.listen<unknown>('avatar-followup-suggestion', (event) => {
         const payload = parseAvatarFollowupPayload(event.payload);
         if (!payload) {
           console.warn('桌宠跟进事件载荷格式无效，已忽略');
@@ -973,37 +1061,65 @@
         }
         followup = payload;
       });
+      if (!registerUnlisten(followupOff, (fn) => { unlistenFollowup = fn; })) return;
 
-      unlistenInput = await appWindow.listen<unknown>('avatar-input-changed', (event) => {
+      const inputOff = await appWindow.listen<unknown>('avatar-input-changed', (event) => {
         inputActivity = normalizeAvatarInputActivity(event.payload);
 
         if (inputActivity.keyboardActive || inputActivity.mouseActive) {
-          motionBeat = (motionBeat + 1) % 96;
-          scheduleNextMotionStep();
+          const now = Date.now();
+          if (!state.avatarBodyHidden && now - lastInputMotionBeatAt >= 180) {
+            lastInputMotionBeatAt = now;
+            motionBeat = (motionBeat + 1) % 96;
+            scheduleNextMotionStep();
+          }
         }
       });
+      if (!registerUnlisten(inputOff, (fn) => { unlistenInput = fn; })) return;
 
-      unlistenLocaleChanged = await listen('locale-changed', (event) => {
+      const visibilityOff = await appWindow.listen<boolean>('avatar-window-visibility', (event) => {
+        windowVisible = event.payload !== false;
+        document.body.classList.toggle('avatar-window-hidden', !windowVisible);
+        if (!windowVisible) {
+          if (motionTimer !== null) {
+            clearTimeout(motionTimer);
+          }
+          motionTimer = null;
+        } else {
+          scheduleNextMotionStep();
+          scheduleBubbleEdgeRefresh();
+          scheduleInteractiveRegionsSync();
+        }
+      });
+      if (!registerUnlisten(visibilityOff, (fn) => { unlistenVisibility = fn; })) return;
+
+      const localeOff = await listen('locale-changed', (event) => {
         const nextLocale = event.payload;
         if (typeof nextLocale === 'string' && nextLocale) {
           initializeLocale(nextLocale);
         }
       });
+      if (!registerUnlisten(localeOff, (fn) => { unlistenLocaleChanged = fn; })) return;
 
-      unlistenMoved = await nativeWindow.onMoved(({ payload: position }) => {
+      const movedOff = await nativeWindow.onMoved(({ payload: position }) => {
         scheduleAvatarPositionSave(position);
-        refreshBubbleEdge();
+        scheduleBubbleEdgeRefresh();
       });
+      if (!registerUnlisten(movedOff, (fn) => { unlistenMoved = fn; })) return;
 
       // Windows 拖拽到桌面顶部附近时，系统可能短暂调整窗口尺寸。
       // 这里在 resize 后回正到当前配置尺寸，避免出现“拖一下就变小一圈”。
-      unlistenResized = await nativeWindow.onResized(() => {
+      const resizedOff = await nativeWindow.onResized(() => {
         scheduleAvatarSizeCorrection();
         scheduleInteractiveRegionsSync();
       });
+      if (!registerUnlisten(resizedOff, (fn) => { unlistenResized = fn; })) return;
     })();
 
     return () => {
+      disposed = true;
+      clearTimeout(initialBubbleEdgeTimer);
+      document.body.classList.remove('avatar-window-hidden');
       interactiveRegionsMounted = false;
       interactiveRegionSyncRequested = false;
       if (interactiveRegionFrame !== null) {
@@ -1014,6 +1130,7 @@
       interactiveRegionObserver = null;
       interactiveRegionElements = [];
       if (bubbleTimer !== null) clearTimeout(bubbleTimer);
+      if (bubbleEdgeTimer !== null) clearTimeout(bubbleEdgeTimer);
       if (transitionTimer !== null) clearTimeout(transitionTimer);
       if (positionSaveTimer !== null) clearTimeout(positionSaveTimer);
       if (motionTimer !== null) clearTimeout(motionTimer);
@@ -1028,12 +1145,15 @@
       unlistenBubble();
       unlistenFollowup();
       unlistenInput();
+      unlistenVisibility();
       unlistenLocaleChanged();
       unlistenMoved();
       unlistenResized();
     };
   });
 </script>
+
+<svelte:window on:dragover|preventDefault on:drop|preventDefault />
 
 <div
   role="presentation"
@@ -1090,5 +1210,11 @@
   :global(body) {
     margin: 0;
     overflow: hidden;
+  }
+
+  :global(body.avatar-window-hidden *),
+  :global(body.avatar-window-hidden *::before),
+  :global(body.avatar-window-hidden *::after) {
+    animation-play-state: paused !important;
   }
 </style>

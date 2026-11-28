@@ -322,7 +322,8 @@ impl Default for AiProviderConfig {
             provider: AiProvider::Ollama,
             endpoint: AiProvider::Ollama.default_endpoint().to_string(),
             api_key: None,
-            model: AiProvider::Ollama.default_model().to_string(),
+            // 旧配置的缺省值不能在迁移时冒充用户配置的模型。
+            model: String::new(),
             vision_model: Some("llava".to_string()),
         }
     }
@@ -2994,6 +2995,36 @@ mod tests {
         local.apply_synced_remote(AppConfig::default());
         assert!(local.storage.metadata_cleanup_enabled);
         assert_eq!(local.storage.metadata_retention_days, 90);
+    }
+
+    #[test]
+    fn 未配置模型时规范化与重载不应生成默认模型档案() {
+        let mut config = AppConfig::default();
+        config.normalize();
+        assert!(config.text_model.model.is_empty());
+        assert!(config.text_model_profiles.is_empty());
+
+        let mut value = serde_json::to_value(&config).unwrap();
+        value.as_object_mut().unwrap().remove("ai_provider");
+        let mut reloaded: AppConfig = serde_json::from_value(value).unwrap();
+        reloaded.normalize();
+        reloaded.normalize();
+        assert!(reloaded.text_model.model.is_empty());
+        assert!(reloaded.text_model_profiles.is_empty());
+        assert!(reloaded.text_model_provider_cache.is_empty());
+    }
+
+    #[test]
+    fn 旧版显式保存的本地模型仍应迁移到主模型() {
+        let mut value = serde_json::to_value(AppConfig::default()).unwrap();
+        value.as_object_mut().unwrap().remove("text_model");
+        value["ai_provider"]["model"] = serde_json::json!("qwen3");
+        let mut config: AppConfig = serde_json::from_value(value).unwrap();
+        config.normalize();
+        assert_eq!(config.text_model.provider, AiProvider::Ollama);
+        assert_eq!(config.text_model.model, "qwen3");
+        assert_eq!(config.text_model_profiles.len(), 1);
+        assert_eq!(config.text_model_profiles[0].model_config.model, "qwen3");
     }
 
     #[test]

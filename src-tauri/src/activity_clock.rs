@@ -102,7 +102,6 @@ fn needs_display_recovery(previous: u64, next: u64) -> bool {
     previous != next && next & POWER_FLAGS == 0
 }
 
-#[cfg(target_os = "windows")]
 pub(crate) fn display_is_available() -> bool {
     power_snapshot() & POWER_FLAGS == 0
 }

@@ -58,28 +58,33 @@
   ]);
   const cursorRatioXTween = tweened(0.5, { duration: 70, easing: cubicOut });
   const cursorRatioYTween = tweened(0.5, { duration: 70, easing: cubicOut });
+  let lastCursorTargetX = 0.5;
+  let lastCursorTargetY = 0.5;
+
+  const ARM_CONTROL_COUNT = 19;
+  const ARM_SAMPLE_ITER = 25;
+  const ARM_BERNSTEIN_TABLE = (() => {
+    const degree = ARM_CONTROL_COUNT - 1;
+    const binom = new Float64Array(ARM_CONTROL_COUNT);
+    binom[0] = 1;
+    for (let k = 1; k <= degree; k += 1) {
+      binom[k] = (binom[k - 1] * (degree - k + 1)) / k;
+    }
+    const table = new Float64Array((ARM_SAMPLE_ITER - 1) * ARM_CONTROL_COUNT);
+    for (let index = 1; index < ARM_SAMPLE_ITER; index += 1) {
+      const ratio = index / ARM_SAMPLE_ITER;
+      const inv = 1 - ratio;
+      const rowOffset = (index - 1) * ARM_CONTROL_COUNT;
+      for (let k = 0; k < ARM_CONTROL_COUNT; k += 1) {
+        table[rowOffset + k] = binom[k] * Math.pow(inv, degree - k) * Math.pow(ratio, k);
+      }
+    }
+    return table;
+  })();
+  const standardArmControlCoords = new Float64Array(ARM_CONTROL_COUNT * 2);
+
   function clamp01(value: number): number {
     return Math.min(1, Math.max(0, value));
-  }
-
-  function bezierPoint(ratio: number, flatPoints: readonly number[]): [number, number] {
-    let points: Point[] = [];
-    for (let index = 0; index < flatPoints.length; index += 2) {
-      points.push({ x: flatPoints[index], y: flatPoints[index + 1] });
-    }
-
-    while (points.length > 1) {
-      const nextPoints: Point[] = [];
-      for (let index = 0; index < points.length - 1; index += 1) {
-        nextPoints.push({
-          x: points[index].x + (points[index + 1].x - points[index].x) * ratio,
-          y: points[index].y + (points[index + 1].y - points[index].y) * ratio,
-        });
-      }
-      points = nextPoints;
-    }
-
-    return [points[0].x, points[0].y];
   }
 
   function computeStandardMouseGeometry(cursorRatioX = 0.5, cursorRatioY = 0.5) {
@@ -89,18 +94,28 @@
     const y = -76 * fx - 40 * fy + 324;
     const dx = STANDARD_HAND_DX;
     const dy = STANDARD_HAND_DY;
-    const pss = [211, 159];
+    const pss = standardArmControlCoords;
     const oof = 6;
+
+    let writeIndex = 0;
+    pss[writeIndex++] = 211;
+    pss[writeIndex++] = 159;
 
     let dist = Math.hypot(211 - x, 159 - y);
     const centreleft0 = 211 - (0.7237 * dist) / 2;
     const centreleft1 = 159 + (0.69 * dist) / 2;
 
     for (let index = 1; index < oof; index += 1) {
-      const [p0, p1] = bezierPoint(index / oof, [211, 159, centreleft0, centreleft1, x, y]);
-      pss.push(p0, p1);
+      const t = index / oof;
+      const inv = 1 - t;
+      const inv2 = inv * inv;
+      const mid = 2 * inv * t;
+      const t2 = t * t;
+      pss[writeIndex++] = inv2 * 211 + mid * centreleft0 + t2 * x;
+      pss[writeIndex++] = inv2 * 159 + mid * centreleft1 + t2 * y;
     }
-    pss.push(x, y);
+    pss[writeIndex++] = x;
+    pss[writeIndex++] = y;
 
     let a = y - centreleft1;
     let b = centreleft0 - x;
@@ -127,28 +142,57 @@
     s2 *= push / length;
     t2 *= push / length;
 
+    const c1x = x + s;
+    const c1y = y + t;
+    const c2x = a + s2;
+    const c2y = b + t2;
     for (let index = 1; index < oof; index += 1) {
-      const [p0, p1] = bezierPoint(index / oof, [x, y, x + s, y + t, a + s2, b + t2, a, b]);
-      pss.push(p0, p1);
+      const u = index / oof;
+      const inv = 1 - u;
+      const inv2 = inv * inv;
+      const u2 = u * u;
+      const w0 = inv2 * inv;
+      const w1 = 3 * inv2 * u;
+      const w2 = 3 * inv * u2;
+      const w3 = u2 * u;
+      pss[writeIndex++] = w0 * x + w1 * c1x + w2 * c2x + w3 * a;
+      pss[writeIndex++] = w0 * y + w1 * c1y + w2 * c2y + w3 * b;
     }
-    pss.push(a, b);
+    pss[writeIndex++] = a;
+    pss[writeIndex++] = b;
 
     for (let index = oof - 1; index > 0; index -= 1) {
-      const [p0, p1] = bezierPoint(index / oof, [a1, a2, centreright0, centreright1, a, b]);
-      pss.push(p0, p1);
+      const u = index / oof;
+      const inv = 1 - u;
+      const inv2 = inv * inv;
+      const mid = 2 * inv * u;
+      const u2 = u * u;
+      pss[writeIndex++] = inv2 * a1 + mid * centreright0 + u2 * a;
+      pss[writeIndex++] = inv2 * a2 + mid * centreright1 + u2 * b;
     }
-    pss.push(a1, a2);
+    pss[writeIndex++] = a1;
+    pss[writeIndex++] = a2;
 
     const mouseX = (a + x) / 2 - 67 + dx + STANDARD_DEVICE_OFFSET_X;
     const mouseY = (b + y) / 2 - 29 + dy + STANDARD_DEVICE_OFFSET_Y;
-    const armPoints = [{ x: pss[0] + dx, y: pss[1] + dy }];
-    const iter = 25;
+    const armPoints: Point[] = new Array(ARM_SAMPLE_ITER + 1);
+    armPoints[0] = { x: pss[0] + dx, y: pss[1] + dy };
 
-    for (let index = 1; index < iter; index += 1) {
-      const [p0, p1] = bezierPoint(index / iter, pss);
-      armPoints.push({ x: p0 + dx, y: p1 + dy });
+    for (let index = 1; index < ARM_SAMPLE_ITER; index += 1) {
+      const rowOffset = (index - 1) * ARM_CONTROL_COUNT;
+      let px = 0;
+      let py = 0;
+      for (let k = 0; k < ARM_CONTROL_COUNT; k += 1) {
+        const weight = ARM_BERNSTEIN_TABLE[rowOffset + k];
+        px += weight * pss[k * 2];
+        py += weight * pss[k * 2 + 1];
+      }
+      armPoints[index] = { x: px + dx, y: py + dy };
     }
-    armPoints.push({ x: pss[36] + dx, y: pss[37] + dy });
+    armPoints[ARM_SAMPLE_ITER] = {
+      x: pss[writeIndex - 2] + dx,
+      y: pss[writeIndex - 1] + dy,
+    };
 
     return { armPoints, mouseX, mouseY };
   }
@@ -353,14 +397,27 @@
   $: renderMode = preset.renderMode ?? 'standard';
   $: sceneInteractionLayout = preset.interactionLayout ?? null;
   $: cursorTweenDuration = mouseActive ? 44 : 110;
-  $: cursorRatioXTween.set(inputActivity.cursorRatioX ?? 0.5, {
-    duration: cursorTweenDuration,
-    easing: cubicOut,
-  });
-  $: cursorRatioYTween.set(inputActivity.cursorRatioY ?? 0.5, {
-    duration: cursorTweenDuration,
-    easing: cubicOut,
-  });
+  // 仅当目标光标比例真正变化时重设补间，避免敲键盘或 mouseActive 回落时反复重启已就位的补间动画。
+  $: {
+    const nextTargetX = inputActivity.cursorRatioX ?? 0.5;
+    if (nextTargetX !== lastCursorTargetX) {
+      lastCursorTargetX = nextTargetX;
+      cursorRatioXTween.set(nextTargetX, {
+        duration: cursorTweenDuration,
+        easing: cubicOut,
+      });
+    }
+  }
+  $: {
+    const nextTargetY = inputActivity.cursorRatioY ?? 0.5;
+    if (nextTargetY !== lastCursorTargetY) {
+      lastCursorTargetY = nextTargetY;
+      cursorRatioYTween.set(nextTargetY, {
+        duration: cursorTweenDuration,
+        easing: cubicOut,
+      });
+    }
+  }
   $: cursorRatioX = $cursorRatioXTween;
   $: cursorRatioY = $cursorRatioYTween;
   $: sceneSrc = preset.sceneSrc;
@@ -944,23 +1001,23 @@
   }
 
   .idle-breathe {
-    animation: avatar-float 3.1s ease-in-out infinite, idle-breathe 3.6s ease-in-out infinite;
+    animation: idle-breathe 3.6s ease-in-out infinite;
   }
 
   .idle-sway {
-    animation: avatar-float 3.1s ease-in-out infinite, idle-sway 4.2s ease-in-out infinite;
+    animation: idle-sway 4.2s ease-in-out infinite;
   }
 
   .idle-observe {
-    animation: avatar-float 3.1s ease-in-out infinite, idle-observe 4.8s ease-in-out infinite;
+    animation: idle-observe 4.8s ease-in-out infinite;
   }
 
   .idle-groove {
-    animation: avatar-float 3.1s ease-in-out infinite, idle-groove 2.8s ease-in-out infinite;
+    animation: idle-groove 2.8s ease-in-out infinite;
   }
 
   .idle-focus-pulse {
-    animation: avatar-float 3.1s ease-in-out infinite, idle-focus-pulse 3.1s ease-in-out infinite;
+    animation: idle-focus-pulse 3.1s ease-in-out infinite;
   }
 
   .transition-alert {

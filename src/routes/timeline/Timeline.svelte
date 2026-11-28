@@ -137,6 +137,9 @@
   let detailCloseButton: HTMLButtonElement | null = null;
   let categoryTrigger: HTMLElement | null = null;
   let showAppSettings = false;
+  let showDetailImageZoom = false;
+  let copiedDetailUrl = false;
+  let copiedDetailUrlTimer: ReturnType<typeof setTimeout> | null = null;
   let unlisten: UnlistenFn | null = null;
   let componentDestroyed = false;
   let currentTime = new Date();
@@ -1138,6 +1141,10 @@
         event.preventDefault();
         event.stopPropagation();
         cancelPendingAction();
+      } else if (event.key === 'Escape' && showCleanupPanel && !cleanupBusy) {
+        event.preventDefault();
+        event.stopPropagation();
+        showCleanupPanel = false;
       }
     };
 
@@ -1145,9 +1152,44 @@
     void closeDetail();
   }
 
+  function openDetailImageZoom(event: MouseEvent & { currentTarget: HTMLButtonElement }): void {
+    event.currentTarget.focus();
+    showDetailImageZoom = true;
+  }
+
+  function clearCopiedDetailUrl(): void {
+    if (copiedDetailUrlTimer) {
+      clearTimeout(copiedDetailUrlTimer);
+      copiedDetailUrlTimer = null;
+    }
+    copiedDetailUrl = false;
+  }
+
+  async function copyDetailUrl(url: string | null | undefined): Promise<void> {
+    const formatted = formatBrowserUrlForDisplay(url || '');
+    if (!formatted || typeof navigator === 'undefined' || !navigator.clipboard?.writeText) {
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(formatted);
+      clearCopiedDetailUrl();
+      copiedDetailUrl = true;
+      copiedDetailUrlTimer = setTimeout(() => {
+        copiedDetailUrl = false;
+        copiedDetailUrlTimer = null;
+      }, 1500);
+    } catch (e) {
+      console.warn('复制网址失败:', e);
+    }
+  }
+
   function handleDetailOverlayKeydown(event: KeyboardEvent): void {
     if (event.key !== 'Escape') return;
     event.preventDefault();
+    if (showDetailImageZoom) {
+      showDetailImageZoom = false;
+      return;
+    }
     if (showCreateCategory || showRenameCategory) {
       showCreateCategory = false;
       showRenameCategory = false;
@@ -1167,8 +1209,10 @@
     showCreateCategory = false;
     showRenameCategory = false;
     showAppSettings = false;
+    showDetailImageZoom = false;
     showProjectRuleCreator = false;
     selectedActivityProject = null;
+    clearCopiedDetailUrl();
     clearPendingChip();
     const requestId = ++viewActivityRequestId;
     const previewThumbnail = getTimelineThumbnail(activity);
@@ -1302,7 +1346,9 @@
     showCreateCategory = false;
     showRenameCategory = false;
     showAppSettings = false;
+    showDetailImageZoom = false;
     showProjectRuleCreator = false;
+    clearCopiedDetailUrl();
     clearPendingChip();
     pendingApplyCategory = null;
     pendingDeleteCategory = null;
@@ -1555,6 +1601,7 @@
     if (clockInterval) clearInterval(clockInterval);
     if (handleVisibilityChange) document.removeEventListener('visibilitychange', handleVisibilityChange);
     if (handleTimelineFocus) window.removeEventListener('timeline-focus-date', handleTimelineFocus);
+    clearCopiedDetailUrl();
     clearPendingChip();
     unsubIcons();
   });
@@ -1833,7 +1880,7 @@
   <!-- svelte-ignore a11y_click_events_have_key_events -->
   <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
   <div
-    class="timeline-detail-overlay fixed inset-0 z-[140] bg-slate-950/52 backdrop-blur-md flex items-center justify-end p-4 animate-fadeIn"
+    class="timeline-detail-overlay fixed inset-0 z-[140] bg-slate-950/42 backdrop-blur-md flex items-center justify-end p-4 animate-fadeIn"
     use:portalToBody
     role="presentation"
     on:click|self={handleDetailDismiss}
@@ -1847,70 +1894,84 @@
       aria-modal="true"
       aria-labelledby="timeline-detail-title"
     >
-      <div class="timeline-detail-header">
-        <div class="flex items-start justify-between gap-2">
-          <div class="flex items-center gap-2.5 min-w-0">
-            <div class="timeline-app-icon timeline-app-icon-lg"
-                 class:timeline-app-icon-has-image={Boolean(getTimelineIconSrc(selectedActivity))}
-                 style={iconStyle(info)}>
-              {#if getTimelineIconSrc(selectedActivity)}
-                <img src={getTimelineIconSrc(selectedActivity)}
-                     alt={selectedActivity.app_name}
-                     on:error={() => handleTimelineIconError(selectedActivity)}
-                     class="timeline-app-icon-image timeline-app-icon-image-lg app-icon object-cover" />
-              {:else}
-                {info.icon}
-              {/if}
-            </div>
-            <!-- 应用名是次要身份信息：列表里已经知道，这里降为小字 -->
+      <header class="timeline-detail-header">
+        <div class="timeline-detail-identity">
+          <div class="timeline-app-icon timeline-app-icon-lg timeline-detail-app-badge"
+               class:timeline-app-icon-has-image={Boolean(getTimelineIconSrc(selectedActivity))}
+               style={iconStyle(info)}>
+            {#if getTimelineIconSrc(selectedActivity)}
+              <img src={getTimelineIconSrc(selectedActivity)}
+                   alt={selectedActivity.app_name}
+                   on:error={() => handleTimelineIconError(selectedActivity)}
+                   class="timeline-app-icon-image timeline-app-icon-image-lg app-icon object-cover" />
+            {:else}
+              {info.icon}
+            {/if}
+          </div>
+          <div class="timeline-detail-heading">
+            <!-- 应用名是次要身份信息：降为精致眉标 -->
             <span class="timeline-detail-app-line">
               {getTimelineAppName(selectedActivity)}
             </span>
-          </div>
-          <div class="flex items-center gap-1">
-            <button
-              class="btn btn-ghost text-rose-500 hover:text-rose-600 dark:text-rose-400"
-              title={t('timeline.deleteActivity')}
-              on:click={() => deleteActivity(selectedActivity)}
-            >
-              <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6M1 7h22M9 7V4a1 1 0 011-1h4a1 1 0 011 1v3" />
-              </svg>
-            </button>
-            <button bind:this={detailCloseButton} class="btn btn-ghost" aria-label={t('window.close')} on:click={() => closeDetail()}>
-              <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
-              </svg>
-            </button>
+            <!-- 窗口标题才是详情的主角：具体"在干什么" -->
+            <h3 id="timeline-detail-title" class="timeline-detail-title" aria-label={t('timeline.detail.windowTitle')}>
+              {getTimelineTitle(selectedActivity) || t('timeline.noTitle')}
+            </h3>
+            <p class="timeline-detail-header-meta">
+              <span class="timeline-detail-meta-item">
+                <svg class="timeline-detail-meta-icon" aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
+                  <circle cx="12" cy="12" r="9" />
+                  <path stroke-linecap="round" stroke-linejoin="round" d="M12 7.5V12l3 1.8" />
+                </svg>
+                <span class="sr-only">{t('timeline.detail.recordTime')}</span>
+                {formatTimelineAnchor(selectedActivity.timestamp)}
+              </span>
+              <span class="timeline-detail-meta-sep" aria-hidden="true">·</span>
+              <span class="timeline-detail-meta-item">
+                <svg class="timeline-detail-meta-icon" aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
+                  <path stroke-linecap="round" stroke-linejoin="round" d="M10 2h4m-2 11l3-3m5 3a8 8 0 11-16 0 8 8 0 0116 0z" />
+                </svg>
+                <span class="sr-only">{t('timeline.detail.duration')}</span>
+                {formatDuration(selectedActivity.duration)}
+              </span>
+              <span class="timeline-detail-meta-divider" aria-hidden="true"></span>
+              <span class="timeline-detail-meta-category" style={`--chip-color: ${info.color}`}>
+                <span class="timeline-entry-category-dot" style={`background-color: ${info.color}`}></span>
+                {#if picker.current}{getCategoryDisplayName(picker.current)}{:else}{info.name}{/if}
+              </span>
+            </p>
           </div>
         </div>
-        <!-- 窗口标题才是详情的主角：具体"在干什么" -->
-        <h3 id="timeline-detail-title" class="timeline-detail-title" aria-label={t('timeline.detail.windowTitle')}>
-          {getTimelineTitle(selectedActivity) || t('timeline.noTitle')}
-        </h3>
-        <p class="timeline-detail-header-meta">
-          <span>
-            <span class="sr-only">{t('timeline.detail.recordTime')}</span>
-            {formatTimelineAnchor(selectedActivity.timestamp)}
-          </span>
-          <span aria-hidden="true"> · </span>
-          <span>
-            <span class="sr-only">{t('timeline.detail.duration')}</span>
-            {formatDuration(selectedActivity.duration)}
-          </span>
-          <span aria-hidden="true"> · </span>
-          <span class="timeline-detail-meta-category" style={`--chip-color: ${info.color}`}>
-            <span class="timeline-entry-category-dot" style={`background-color: ${info.color}`}></span>
-            {#if picker.current}{getCategoryDisplayName(picker.current)}{:else}{info.name}{/if}
-          </span>
-        </p>
-      </div>
+        <button
+          bind:this={detailCloseButton}
+          type="button"
+          class="timeline-detail-close"
+          aria-label={t('window.close')}
+          on:click={() => closeDetail()}
+        >
+          <svg class="w-4 h-4" aria-hidden="true" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
+          </svg>
+        </button>
+      </header>
 
       <div class="timeline-detail-body">
         <section class="timeline-detail-preview" aria-label={t('timeline.detail.screenshot')}>
           <div class="timeline-detail-preview-frame">
             {#if selectedActivity.thumbnail}
-              <img src={selectedActivity.thumbnail} alt={t('timeline.detail.screenshotAlt')} class="timeline-detail-preview-image" />
+              <button
+                type="button"
+                class="timeline-detail-preview-trigger"
+                aria-label={t('timeline.detail.screenshot')}
+                on:click={openDetailImageZoom}
+              >
+                <img src={selectedActivity.thumbnail} alt={t('timeline.detail.screenshotAlt')} class="timeline-detail-preview-image" />
+                <span class="timeline-detail-preview-zoom-hint" aria-hidden="true">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
+                    <path stroke-linecap="round" stroke-linejoin="round" d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7" />
+                  </svg>
+                </span>
+              </button>
               {#if selectedActivity.thumbnailLoading}
                 <span class="timeline-detail-preview-loading-indicator" aria-hidden="true">
                   <span class="animate-spin rounded-full h-3.5 w-3.5 border-b-2 border-primary-500"></span>
@@ -1930,321 +1991,431 @@
               </div>
             {/if}
           </div>
-          {#if selectedActivity.browser_url}
-            <button
-              type="button"
-              on:click={() => openUrl(selectedActivity?.browser_url)}
-              class="timeline-detail-url"
-              aria-label={t('timeline.detail.visitedUrl')}
-            >
-              {formatBrowserUrlForDisplay(selectedActivity.browser_url)}
-            </button>
-          {/if}
-        </section>
 
-        <section class="timeline-category-section" aria-label={t('timeline.detail.appCategory')}>
-          {#if categorySaving}
-            <div class="timeline-category-toolbar">
-              <span class="timeline-category-saving">{t('timeline.detail.saving')}</span>
-            </div>
-          {/if}
-          <div
-            bind:this={categoryTrigger}
-            class="timeline-category-picker"
-            tabindex="-1"
-          >
-            <div class="timeline-category-chips">
-              {#each allCategories as cat (cat.key)}
-                <span class="timeline-category-chip-group">
-                {#if cat.key === currentCategoryKey}
-                  <!-- 当前分类仅展示状态，管理入口与选择按钮并列。 -->
-                  <span
-                    class="timeline-category-chip timeline-category-chip-current"
-                    style={`--chip-color: ${cat.color}`}
-                  >
-                    <span class="timeline-category-dot" style={`background-color: ${cat.color}`}></span>
-                    <span class="timeline-category-chip-name">{getCategoryDisplayName(cat)}</span>
-                  </span>
-                {:else}
-                  <button
-                    type="button"
-                    class="timeline-category-chip"
-                    class:timeline-category-chip-pending={pendingChipCategory === cat.key}
-                    disabled={categorySaving}
-                    style={`--chip-color: ${cat.color}`}
-                    on:click={() => selectActivityCategory(cat.key)}
-                  >
-                    <span class="timeline-category-dot" style={`background-color: ${cat.color}`}></span>
-                    <span class="timeline-category-chip-name">{getCategoryDisplayName(cat)}</span>
-                  </button>
-                {/if}
-                    {#if !cat.is_system}
-                      <span class="timeline-category-chip-actions">
-                        <button
-                          type="button"
-                          disabled={categorySaving}
-                          title={t('timeline.renameCategory')}
-                          aria-label={t('timeline.renameCategory')}
-                          on:click={() => startRenameCategory(cat)}
-                        >
-                          <span aria-hidden="true">✎</span>
-                        </button>
-                        <button
-                          type="button"
-                          disabled={categorySaving}
-                          title={t('timeline.deleteCategory')}
-                          aria-label={t('timeline.deleteCategory')}
-                          on:click={() => {
-                            prepareCategoryConfirmation();
-                            pendingDeleteCategory = { key: cat.key, name: getCategoryDisplayName(cat) };
-                          }}
-                        >
-                          <span aria-hidden="true">×</span>
-                        </button>
-                      </span>
-                    {/if}
-                </span>
-              {/each}
+          <div class="timeline-detail-preview-bar">
+            <span class="timeline-detail-preview-stamp">
+              <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75">
+                <rect x="3" y="5" width="18" height="14" rx="2.5" />
+                <circle cx="9" cy="10.5" r="1.5" />
+                <path stroke-linecap="round" stroke-linejoin="round" d="M21 16l-4.5-4.5a1.5 1.5 0 00-2.12 0L7 19" />
+              </svg>
+              <span>{t('timeline.detail.screenshot')}</span>
+              <span aria-hidden="true">·</span>
+              <time>{formatTime(selectedActivity.timestamp)}</time>
+            </span>
+            {#if selectedActivity.thumbnail}
               <button
                 type="button"
-                class="timeline-category-chip timeline-category-chip-add"
-                class:timeline-category-chip-active={showCreateCategory}
-                disabled={categorySaving}
-                aria-expanded={showCreateCategory}
-                on:click={toggleCreateCategory}
+                class="timeline-detail-preview-expand"
+                aria-label={t('timeline.detail.screenshot')}
+                on:click={openDetailImageZoom}
               >
-                <span aria-hidden="true">{showCreateCategory ? '×' : '+'}</span>
-                <span>{t('timeline.createCategory')}</span>
+                <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
+                  <path stroke-linecap="round" stroke-linejoin="round" d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7" />
+                </svg>
               </button>
-            </div>
-            {#if pendingChipCategory}
-              {@const pendingCat = $categoryStore.find((cat) => cat.key === pendingChipCategory)}
-              <p class="timeline-category-pending-hint" role="status">
-                {t('timeline.detail.appCategoryPendingConfirm', {
-                  category: pendingCat ? getCategoryDisplayName(pendingCat) : pendingChipCategory,
-                })}
-              </p>
             {/if}
           </div>
-
-          {#if showCreateCategory}
-            <div class="timeline-category-editor">
-              <p>{t('timeline.createCategoryHint')}</p>
-              <div class="timeline-category-editor-fields">
-                <input
-                  type="text"
-                  bind:value={newCategoryName}
-                  placeholder={t('timeline.categoryNamePlaceholder')}
-                />
-                <input type="color" bind:value={newCategoryColor} aria-label={t('timeline.detail.appCategory')} />
-                <span>{newCategoryIcon}</span>
-              </div>
-              <div class="timeline-category-emoji-grid">
-                {#each CATEGORY_EMOJIS as emoji}
-                  <button
-                    type="button"
-                    class:timeline-category-emoji-active={newCategoryIcon === emoji}
-                    on:click={() => newCategoryIcon = emoji}
-                  >{emoji}</button>
-                {/each}
-              </div>
-              <div class="timeline-category-editor-actions">
-                <button type="button" on:click={() => showCreateCategory = false}>{t('timeline.cancel')}</button>
-                <button type="button" class="timeline-category-editor-primary" on:click={createCustomCategory}>{t('timeline.confirmChange')}</button>
-              </div>
-            </div>
-          {/if}
-
-          {#if showRenameCategory}
-            <div class="timeline-category-editor">
-              <p>{t('timeline.renameCategory')}</p>
-              <div class="timeline-category-editor-fields">
-                <input
-                  type="text"
-                  bind:value={renameCategoryName}
-                  placeholder={t('timeline.categoryNamePlaceholder')}
-                />
-                <input type="color" bind:value={renameCategoryColor} aria-label={t('timeline.detail.appCategory')} />
-                <span>{renameCategoryIcon}</span>
-              </div>
-              <div class="timeline-category-emoji-grid">
-                {#each CATEGORY_EMOJIS as emoji}
-                  <button
-                    type="button"
-                    class:timeline-category-emoji-active={renameCategoryIcon === emoji}
-                    on:click={() => renameCategoryIcon = emoji}
-                  >{emoji}</button>
-                {/each}
-              </div>
-              <div class="timeline-category-editor-actions">
-                <button type="button" on:click={() => showRenameCategory = false}>{t('timeline.cancel')}</button>
-                <button type="button" class="timeline-category-editor-primary" on:click={saveRenameCategory}>{t('timeline.confirmChange')}</button>
-              </div>
-            </div>
-          {/if}
         </section>
 
-        <section class="timeline-detail-settings" aria-label={t('timeline.detail.projectLabel')}>
-          <div class="flex flex-wrap items-center justify-between gap-2">
-            <div class="flex items-center gap-2 min-w-0">
-              <span class="text-xs font-medium text-slate-500 dark:text-[#7d8590]">
-                {t('timeline.detail.projectLabel')}
-              </span>
-              {#if selectedActivityProject}
-                <span class="inline-flex items-center gap-1.5 rounded-md border border-slate-200/80 bg-white/90 px-2 py-0.5 text-xs font-medium text-slate-700 dark:border-[#30363d] dark:bg-[#21262d] dark:text-[#c9d1d9]">
-                  <span class="h-2 w-2 rounded-[var(--radius-xs)]" style={`background-color: ${selectedActivityProject.color};`}></span>
-                  {selectedActivityProject.name}
-                </span>
-              {:else}
-                <span class="text-xs text-slate-400 dark:text-[#636c76]">
-                  {t('timeline.detail.projectUnassigned')}
-                </span>
-              {/if}
-            </div>
-            <button
-              type="button"
-              class="text-xs font-medium text-primary-600 hover:text-primary-700 dark:text-primary-400 dark:hover:text-primary-300"
-              on:click={() => {
-                if (showProjectRuleCreator) {
-                  showProjectRuleCreator = false;
-                } else if (selectedActivity) {
-                  openProjectRuleCreator(selectedActivity);
-                }
-              }}
-            >
-              {showProjectRuleCreator ? t('timeline.cancel') : t('timeline.detail.projectAddRule')}
-            </button>
-          </div>
-
-          {#if showProjectRuleCreator}
-            <div class="space-y-2.5 rounded-lg border border-slate-200/80 bg-white/80 p-3 dark:border-[#30363d] dark:bg-[#161b22]/60">
-              <div class="grid grid-cols-1 gap-2 sm:grid-cols-2">
-                <label class="block text-xs text-slate-500 dark:text-[#7d8590]">
-                  <span>{t('timeline.detail.projectRuleTarget')}</span>
-                  <select
-                    bind:value={projectRuleTargetKey}
-                    class="mt-1 w-full rounded-md border border-slate-200 bg-white px-2 py-1.5 text-xs text-slate-800 dark:border-[#484f58] dark:bg-[#21262d] dark:text-[#e6edf3]"
-                  >
-                    {#each projects.filter((p) => !p.archived) as p (p.key)}
-                      <option value={p.key}>{p.name}</option>
-                    {/each}
-                    <option value="__new__">{t('timeline.detail.projectNewOption')}</option>
-                  </select>
-                </label>
-
-                <label class="block text-xs text-slate-500 dark:text-[#7d8590]">
-                  <span>{t('timeline.detail.projectRuleField')}</span>
-                  <select
-                    bind:value={projectRuleField}
-                    class="mt-1 w-full rounded-md border border-slate-200 bg-white px-2 py-1.5 text-xs text-slate-800 dark:border-[#484f58] dark:bg-[#21262d] dark:text-[#e6edf3]"
-                  >
-                    <option value="title">{t('settingsProjects.fieldTitle')}</option>
-                    <option value="app">{t('settingsProjects.fieldApp')}</option>
-                    <option value="domain">{t('settingsProjects.fieldDomain')}</option>
-                    <option value="url_path">{t('settingsProjects.fieldUrlPath')}</option>
-                  </select>
-                </label>
-              </div>
-
-              {#if projectRuleTargetKey === '__new__'}
-                <input
-                  type="text"
-                  bind:value={projectRuleNewName}
-                  placeholder={t('timeline.detail.projectNewNamePlaceholder')}
-                  class="w-full rounded-md border border-slate-200 bg-white px-2.5 py-1.5 text-xs text-slate-900 dark:border-[#484f58] dark:bg-[#21262d] dark:text-[#e6edf3]"
-                />
-              {/if}
-
-              <input
-                type="text"
-                bind:value={projectRuleValue}
-                placeholder={t('timeline.detail.projectRuleValue')}
-                class="w-full rounded-md border border-slate-200 bg-white px-2.5 py-1.5 text-xs text-slate-900 dark:border-[#484f58] dark:bg-[#21262d] dark:text-[#e6edf3]"
-              />
-
-              <div class="flex justify-end gap-2">
-                <button
-                  type="button"
-                  on:click={() => (showProjectRuleCreator = false)}
-                  disabled={projectRuleSaving}
-                  class="rounded-md border border-slate-200 px-3 py-1 text-xs text-slate-600 hover:bg-slate-50 dark:border-[#30363d] dark:text-[#adbac7] dark:hover:bg-[#21262d]"
-                >
-                  {t('timeline.cancel')}
-                </button>
-                <button
-                  type="button"
-                  on:click={saveQuickProjectRule}
-                  disabled={projectRuleSaving}
-                  class="rounded-md bg-primary-600 px-3 py-1 text-xs font-medium text-white hover:bg-primary-700 disabled:opacity-50"
-                >
-                  {projectRuleSaving ? t('timeline.detail.saving') : t('timeline.detail.projectRuleSave')}
-                </button>
-              </div>
-            </div>
-          {/if}
-        </section>
-
-        <section class="timeline-detail-settings">
-          <button
-            type="button"
-            class="timeline-detail-settings-toggle"
-            aria-expanded={showAppSettings}
-            on:click={() => showAppSettings = !showAppSettings}
-          >
-            <span>{t('timeline.detail.appSettings')}</span>
-            <span class="timeline-detail-settings-summary">
-              {{
-                full: t('timeline.detail.privacyFull'),
-                anonymized: t('timeline.detail.privacyAnonymized'),
-                ignored: t('timeline.detail.privacyIgnored'),
-              }[privacyLevel]}
-            </span>
-            <svg class:timeline-detail-settings-chevron-open={showAppSettings} viewBox="0 0 24 24" fill="none" stroke="currentColor" aria-hidden="true">
-              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7" />
-            </svg>
-          </button>
-
-          {#if showAppSettings}
-            <div class="timeline-detail-setting-row">
-              <div class="flex items-center justify-between gap-3">
-                <div>
-                  <span class="text-sm font-medium text-slate-700 dark:text-[#adbac7]">{t('timeline.detail.privacyRule')}</span>
-                  <p class="mt-1 text-xs text-slate-500 dark:text-[#7d8590]">
-                    {t('timeline.detail.privacyRuleHelp')}
-                  </p>
+        <div class="timeline-detail-sidebar">
+          <div class="timeline-detail-inspector-scroll">
+            {#if selectedActivity.browser_url}
+              <section class="timeline-detail-section timeline-detail-location" aria-label={t('timeline.detail.visitedUrl')}>
+                <div class="timeline-detail-section-head">
+                  <h4 class="timeline-detail-label">{t('timeline.detail.visitedUrl')}</h4>
                 </div>
-                {#if privacySaving}
-                  <span class="text-xs text-slate-400 dark:text-[#7d8590]">{t('timeline.detail.saving')}</span>
+                <div class="timeline-detail-url-row">
+                  <button
+                    type="button"
+                    on:click={() => openUrl(selectedActivity?.browser_url)}
+                    class="timeline-detail-url"
+                    title={formatBrowserUrlForDisplay(selectedActivity.browser_url)}
+                  >
+                    <svg class="timeline-detail-url-globe" aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7">
+                      <circle cx="12" cy="12" r="9" />
+                      <path stroke-linecap="round" stroke-linejoin="round" d="M3.6 9h16.8M3.6 15h16.8M12 3a14 14 0 010 18M12 3a14 14 0 000 18" />
+                    </svg>
+                    <span>{formatBrowserUrlForDisplay(selectedActivity.browser_url)}</span>
+                    <svg class="timeline-detail-url-ext" aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7">
+                      <path stroke-linecap="round" stroke-linejoin="round" d="M14 4h6v6m0-6L10 14M10 4H6a2 2 0 00-2 2v12a2 2 0 002 2h12a2 2 0 002-2v-4" />
+                    </svg>
+                  </button>
+                  <button
+                    type="button"
+                    class="timeline-detail-url-copy"
+                    class:timeline-detail-url-copy-done={copiedDetailUrl}
+                    aria-label={t('settings.localhostApi.copyCurl')}
+                    title={t('settings.localhostApi.copyCurl')}
+                    on:click={() => copyDetailUrl(selectedActivity?.browser_url)}
+                  >
+                    {#if copiedDetailUrl}
+                      <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path stroke-linecap="round" stroke-linejoin="round" d="M5 13l4 4L19 7" />
+                      </svg>
+                    {:else}
+                      <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75">
+                        <rect x="9" y="9" width="11" height="11" rx="2" />
+                        <path stroke-linecap="round" stroke-linejoin="round" d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1" />
+                      </svg>
+                    {/if}
+                  </button>
+                </div>
+              </section>
+            {/if}
+
+            <section class="timeline-detail-section timeline-category-section" aria-label={t('timeline.detail.appCategory')}>
+              <div class="timeline-detail-section-head">
+                <h4 class="timeline-detail-label">{t('timeline.detail.appCategory')}</h4>
+                {#if categorySaving}
+                  <div class="timeline-category-toolbar">
+                    <span class="timeline-category-saving">{t('timeline.detail.saving')}</span>
+                  </div>
                 {/if}
               </div>
-              <div class="mt-3 flex gap-2">
-                {#each [
-                  { value: 'full', label: t('timeline.detail.privacyFull') },
-                  { value: 'anonymized', label: t('timeline.detail.privacyAnonymized') },
-                  { value: 'ignored', label: t('timeline.detail.privacyIgnored') },
-                ] as opt}
+              <p class="timeline-detail-section-hint">{t('timeline.detail.appCategoryHelp')}</p>
+              <div
+                bind:this={categoryTrigger}
+                class="timeline-category-picker"
+                tabindex="-1"
+              >
+                <div class="timeline-category-chips">
+                  {#each allCategories as cat (cat.key)}
+                    <span class="timeline-category-chip-group">
+                    {#if cat.key === currentCategoryKey}
+                      <!-- 当前分类仅展示状态，管理入口与选择按钮并列。 -->
+                      <span
+                        class="timeline-category-chip timeline-category-chip-current"
+                        style={`--chip-color: ${cat.color}`}
+                      >
+                        <span class="timeline-category-dot" style={`background-color: ${cat.color}`}></span>
+                        <span class="timeline-category-chip-name">{getCategoryDisplayName(cat)}</span>
+                      </span>
+                    {:else}
+                      <button
+                        type="button"
+                        class="timeline-category-chip"
+                        class:timeline-category-chip-pending={pendingChipCategory === cat.key}
+                        disabled={categorySaving}
+                        style={`--chip-color: ${cat.color}`}
+                        on:click={() => selectActivityCategory(cat.key)}
+                      >
+                        <span class="timeline-category-dot" style={`background-color: ${cat.color}`}></span>
+                        <span class="timeline-category-chip-name">{getCategoryDisplayName(cat)}</span>
+                      </button>
+                    {/if}
+                        {#if !cat.is_system}
+                          <span class="timeline-category-chip-actions">
+                            <button
+                              type="button"
+                              disabled={categorySaving}
+                              title={t('timeline.renameCategory')}
+                              aria-label={t('timeline.renameCategory')}
+                              on:click={() => startRenameCategory(cat)}
+                            >
+                              <span aria-hidden="true">✎</span>
+                            </button>
+                            <button
+                              type="button"
+                              disabled={categorySaving}
+                              title={t('timeline.deleteCategory')}
+                              aria-label={t('timeline.deleteCategory')}
+                              on:click={() => {
+                                prepareCategoryConfirmation();
+                                pendingDeleteCategory = { key: cat.key, name: getCategoryDisplayName(cat) };
+                              }}
+                            >
+                              <span aria-hidden="true">×</span>
+                            </button>
+                          </span>
+                        {/if}
+                    </span>
+                  {/each}
                   <button
                     type="button"
-                    on:click={() => requestPrivacyRuleByValue(opt.value)}
-                    class="timeline-detail-privacy-seg"
-                    class:timeline-detail-privacy-seg-active={privacyLevel === opt.value}
-                    disabled={privacySaving}
+                    class="timeline-category-chip timeline-category-chip-add"
+                    class:timeline-category-chip-active={showCreateCategory}
+                    disabled={categorySaving}
+                    aria-expanded={showCreateCategory}
+                    on:click={toggleCreateCategory}
                   >
-                    {opt.label}
+                    <span aria-hidden="true">{showCreateCategory ? '×' : '+'}</span>
+                    <span>{t('timeline.createCategory')}</span>
                   </button>
-                {/each}
+                </div>
+                {#if pendingChipCategory}
+                  {@const pendingCat = $categoryStore.find((cat) => cat.key === pendingChipCategory)}
+                  <p class="timeline-category-pending-hint" role="status">
+                    {t('timeline.detail.appCategoryPendingConfirm', {
+                      category: pendingCat ? getCategoryDisplayName(pendingCat) : pendingChipCategory,
+                    })}
+                  </p>
+                {/if}
               </div>
-              <p class="mt-1.5 text-xs settings-subtle">
-                {{
-                  full: t('settingsPrivacy.fullDesc'),
-                  anonymized: t('settingsPrivacy.anonymizedDesc'),
-                  ignored: t('settingsPrivacy.ignoredDesc'),
-                }[privacyLevel] || ''}
-              </p>
-            </div>
-          {/if}
-        </section>
+
+              {#if showCreateCategory}
+                <div class="timeline-category-editor">
+                  <p>{t('timeline.createCategoryHint')}</p>
+                  <div class="timeline-category-editor-fields">
+                    <input
+                      type="text"
+                      bind:value={newCategoryName}
+                      placeholder={t('timeline.categoryNamePlaceholder')}
+                    />
+                    <input type="color" bind:value={newCategoryColor} aria-label={t('timeline.detail.appCategory')} />
+                    <span>{newCategoryIcon}</span>
+                  </div>
+                  <div class="timeline-category-emoji-grid">
+                    {#each CATEGORY_EMOJIS as emoji}
+                      <button
+                        type="button"
+                        class:timeline-category-emoji-active={newCategoryIcon === emoji}
+                        on:click={() => newCategoryIcon = emoji}
+                      >{emoji}</button>
+                    {/each}
+                  </div>
+                  <div class="timeline-category-editor-actions">
+                    <button type="button" on:click={() => showCreateCategory = false}>{t('timeline.cancel')}</button>
+                    <button type="button" class="timeline-category-editor-primary" on:click={createCustomCategory}>{t('timeline.confirmChange')}</button>
+                  </div>
+                </div>
+              {/if}
+
+              {#if showRenameCategory}
+                <div class="timeline-category-editor">
+                  <p>{t('timeline.renameCategory')}</p>
+                  <div class="timeline-category-editor-fields">
+                    <input
+                      type="text"
+                      bind:value={renameCategoryName}
+                      placeholder={t('timeline.categoryNamePlaceholder')}
+                    />
+                    <input type="color" bind:value={renameCategoryColor} aria-label={t('timeline.detail.appCategory')} />
+                    <span>{renameCategoryIcon}</span>
+                  </div>
+                  <div class="timeline-category-emoji-grid">
+                    {#each CATEGORY_EMOJIS as emoji}
+                      <button
+                        type="button"
+                        class:timeline-category-emoji-active={renameCategoryIcon === emoji}
+                        on:click={() => renameCategoryIcon = emoji}
+                      >{emoji}</button>
+                    {/each}
+                  </div>
+                  <div class="timeline-category-editor-actions">
+                    <button type="button" on:click={() => showRenameCategory = false}>{t('timeline.cancel')}</button>
+                    <button type="button" class="timeline-category-editor-primary" on:click={saveRenameCategory}>{t('timeline.confirmChange')}</button>
+                  </div>
+                </div>
+              {/if}
+            </section>
+
+            <section class="timeline-detail-section timeline-detail-project" aria-label={t('timeline.detail.projectLabel')}>
+              <div class="timeline-detail-section-head">
+                <h4 class="timeline-detail-label">{t('timeline.detail.projectLabel')}</h4>
+                <button
+                  type="button"
+                  class="timeline-detail-inline-action"
+                  on:click={() => {
+                    if (showProjectRuleCreator) {
+                      showProjectRuleCreator = false;
+                    } else if (selectedActivity) {
+                      openProjectRuleCreator(selectedActivity);
+                    }
+                  }}
+                >
+                  {showProjectRuleCreator ? t('timeline.cancel') : t('timeline.detail.projectAddRule')}
+                </button>
+              </div>
+              <div class="timeline-detail-project-row">
+                {#if selectedActivityProject}
+                  <span class="timeline-detail-project-pill">
+                    <span class="timeline-detail-project-dot" style={`background-color: ${selectedActivityProject.color};`}></span>
+                    <span>{selectedActivityProject.name}</span>
+                  </span>
+                {:else}
+                  <span class="timeline-detail-project-empty">
+                    {t('timeline.detail.projectUnassigned')}
+                  </span>
+                {/if}
+              </div>
+
+              {#if showProjectRuleCreator}
+                <div class="timeline-detail-rule-form space-y-2.5">
+                  <div class="grid grid-cols-1 gap-2 sm:grid-cols-2">
+                    <label class="block text-xs text-slate-500 dark:text-[#7d8590]">
+                      <span>{t('timeline.detail.projectRuleTarget')}</span>
+                      <select
+                        bind:value={projectRuleTargetKey}
+                        class="mt-1 w-full rounded-md border border-slate-200 bg-white px-2 py-1.5 text-xs text-slate-800 dark:border-[#484f58] dark:bg-[#21262d] dark:text-[#e6edf3]"
+                      >
+                        {#each projects.filter((p) => !p.archived) as p (p.key)}
+                          <option value={p.key}>{p.name}</option>
+                        {/each}
+                        <option value="__new__">{t('timeline.detail.projectNewOption')}</option>
+                      </select>
+                    </label>
+
+                    <label class="block text-xs text-slate-500 dark:text-[#7d8590]">
+                      <span>{t('timeline.detail.projectRuleField')}</span>
+                      <select
+                        bind:value={projectRuleField}
+                        class="mt-1 w-full rounded-md border border-slate-200 bg-white px-2 py-1.5 text-xs text-slate-800 dark:border-[#484f58] dark:bg-[#21262d] dark:text-[#e6edf3]"
+                      >
+                        <option value="title">{t('settingsProjects.fieldTitle')}</option>
+                        <option value="app">{t('settingsProjects.fieldApp')}</option>
+                        <option value="domain">{t('settingsProjects.fieldDomain')}</option>
+                        <option value="url_path">{t('settingsProjects.fieldUrlPath')}</option>
+                      </select>
+                    </label>
+                  </div>
+
+                  {#if projectRuleTargetKey === '__new__'}
+                    <input
+                      type="text"
+                      bind:value={projectRuleNewName}
+                      placeholder={t('timeline.detail.projectNewNamePlaceholder')}
+                      class="w-full rounded-md border border-slate-200 bg-white px-2.5 py-1.5 text-xs text-slate-900 dark:border-[#484f58] dark:bg-[#21262d] dark:text-[#e6edf3]"
+                    />
+                  {/if}
+
+                  <input
+                    type="text"
+                    bind:value={projectRuleValue}
+                    placeholder={t('timeline.detail.projectRuleValue')}
+                    class="w-full rounded-md border border-slate-200 bg-white px-2.5 py-1.5 text-xs text-slate-900 dark:border-[#484f58] dark:bg-[#21262d] dark:text-[#e6edf3]"
+                  />
+
+                  <div class="flex justify-end gap-2">
+                    <button
+                      type="button"
+                      on:click={() => (showProjectRuleCreator = false)}
+                      disabled={projectRuleSaving}
+                      class="rounded-md border border-slate-200 px-3 py-1 text-xs text-slate-600 hover:bg-slate-50 dark:border-[#30363d] dark:text-[#adbac7] dark:hover:bg-[#21262d]"
+                    >
+                      {t('timeline.cancel')}
+                    </button>
+                    <button
+                      type="button"
+                      on:click={saveQuickProjectRule}
+                      disabled={projectRuleSaving}
+                      class="rounded-md bg-primary-600 px-3 py-1 text-xs font-medium text-white hover:bg-primary-700 disabled:opacity-50"
+                    >
+                      {projectRuleSaving ? t('timeline.detail.saving') : t('timeline.detail.projectRuleSave')}
+                    </button>
+                  </div>
+                </div>
+              {/if}
+            </section>
+
+            <section class="timeline-detail-settings">
+              <button
+                type="button"
+                class="timeline-detail-settings-toggle"
+                aria-expanded={showAppSettings}
+                on:click={() => showAppSettings = !showAppSettings}
+              >
+                <span class="timeline-detail-label">{t('timeline.detail.appSettings')}</span>
+                <span class="timeline-detail-settings-summary">
+                  {{
+                    full: t('timeline.detail.privacyFull'),
+                    anonymized: t('timeline.detail.privacyAnonymized'),
+                    ignored: t('timeline.detail.privacyIgnored'),
+                  }[privacyLevel]}
+                </span>
+                <svg class:timeline-detail-settings-chevron-open={showAppSettings} viewBox="0 0 24 24" fill="none" stroke="currentColor" aria-hidden="true">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7" />
+                </svg>
+              </button>
+
+              {#if showAppSettings}
+                <div class="timeline-detail-setting-row">
+                  <div class="flex items-center justify-between gap-3">
+                    <div>
+                      <span class="text-xs font-medium text-slate-700 dark:text-[#c9d1d9]">{t('timeline.detail.privacyRule')}</span>
+                      <p class="mt-0.5 text-[11px] leading-relaxed text-slate-500 dark:text-[#8b949e]">
+                        {t('timeline.detail.privacyRuleHelp')}
+                      </p>
+                    </div>
+                    {#if privacySaving}
+                      <span class="text-xs text-slate-400 dark:text-[#7d8590]">{t('timeline.detail.saving')}</span>
+                    {/if}
+                  </div>
+                  <div class="timeline-detail-privacy-track mt-2.5">
+                    {#each [
+                      { value: 'full', label: t('timeline.detail.privacyFull') },
+                      { value: 'anonymized', label: t('timeline.detail.privacyAnonymized') },
+                      { value: 'ignored', label: t('timeline.detail.privacyIgnored') },
+                    ] as opt}
+                      <button
+                        type="button"
+                        on:click={() => requestPrivacyRuleByValue(opt.value)}
+                        class="timeline-detail-privacy-seg"
+                        class:timeline-detail-privacy-seg-active={privacyLevel === opt.value}
+                        disabled={privacySaving}
+                      >
+                        {opt.label}
+                      </button>
+                    {/each}
+                  </div>
+                  <p class="mt-2 text-[11px] leading-relaxed settings-subtle">
+                    {{
+                      full: t('settingsPrivacy.fullDesc'),
+                      anonymized: t('settingsPrivacy.anonymizedDesc'),
+                      ignored: t('settingsPrivacy.ignoredDesc'),
+                    }[privacyLevel] || ''}
+                  </p>
+                </div>
+              {/if}
+            </section>
+          </div>
+
+          <footer class="timeline-detail-footer">
+            <button
+              type="button"
+              class="timeline-detail-delete"
+              title={t('timeline.deleteActivity')}
+              on:click={() => deleteActivity(selectedActivity)}
+            >
+              <svg class="w-3.5 h-3.5" aria-hidden="true" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.9" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6M1 7h22M9 7V4a1 1 0 011-1h4a1 1 0 011 1v3" />
+              </svg>
+              <span>{t('timeline.deleteActivity')}</span>
+            </button>
+          </footer>
+        </div>
       </div>
+
+      {#if showDetailImageZoom && selectedActivity.thumbnail}
+        <!-- svelte-ignore a11y_click_events_have_key_events -->
+        <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+        <div
+          class="timeline-detail-lightbox"
+          role="dialog"
+          tabindex="-1"
+          aria-modal="true"
+          aria-label={t('timeline.detail.screenshot')}
+          use:trapFocus
+          on:keydown|stopPropagation={handleDetailOverlayKeydown}
+          on:click|self={() => (showDetailImageZoom = false)}
+        >
+          <button
+            type="button"
+            class="timeline-detail-lightbox-close"
+            aria-label={t('window.close')}
+            on:click={() => (showDetailImageZoom = false)}
+          >
+            <svg class="w-4 h-4" aria-hidden="true" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
+            </svg>
+          </button>
+          <img
+            src={selectedActivity.thumbnail}
+            alt={t('timeline.detail.screenshotAlt')}
+            class="timeline-detail-lightbox-img"
+          />
+        </div>
+      {/if}
     </aside>
   </div>
 {/if}
@@ -2256,14 +2427,20 @@
   <div
     class="fixed inset-0 z-[150] bg-slate-950/40 flex items-center justify-center animate-fadeIn p-4"
     use:portalToBody
-    role="button"
-    tabindex="0"
+    role="presentation"
     on:click|self={() => !cleanupBusy && (showCleanupPanel = false)}
     on:keydown={(e) => e.key === 'Escape' && !cleanupBusy && (showCleanupPanel = false)}
   >
-    <div class="w-full max-w-lg rounded-[var(--radius-lg)] border border-slate-200 dark:border-[#30363d] bg-white dark:bg-[#161b22] shadow-2xl">
+    <div
+      class="w-full max-w-lg rounded-[var(--radius-lg)] border border-slate-200 dark:border-[#30363d] bg-white dark:bg-[#161b22] shadow-2xl"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="timeline-cleanup-title"
+      tabindex="-1"
+      use:trapFocus
+    >
       <div class="flex items-center justify-between p-5 border-b border-slate-200 dark:border-[#30363d]">
-        <h3 class="text-base font-semibold text-slate-900 dark:text-[#e6edf3]">{t('timeline.cleanupRecordsTitle')}</h3>
+        <h3 id="timeline-cleanup-title" class="text-base font-semibold text-slate-900 dark:text-[#e6edf3]">{t('timeline.cleanupRecordsTitle')}</h3>
         <button class="btn btn-ghost" aria-label={t('window.close')} on:click={() => (showCleanupPanel = false)} disabled={cleanupBusy}>
           <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
@@ -2970,100 +3147,222 @@
   }
 
   .timeline-detail-drawer {
-    width: min(42rem, 100%);
+    width: min(64rem, 100%);
     height: calc(100vh - 2rem);
-    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
     position: relative;
-    border: 1px solid rgba(148, 163, 184, 0.24);
+    border: 1px solid rgba(148, 163, 184, 0.28);
     border-radius: var(--radius-lg);
     background: var(--editorial-surface-featured);
-    box-shadow: -18px 0 48px rgba(15, 23, 42, 0.18);
+    box-shadow:
+      0 24px 64px -12px rgba(15, 23, 42, 0.22),
+      0 4px 16px rgba(15, 23, 42, 0.08);
   }
 
   .timeline-detail-header {
-    position: sticky;
-    top: 0;
+    flex: 0 0 auto;
     z-index: 5;
-    padding: 1.15rem 1.35rem;
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 1rem;
+    padding: 1rem 1.25rem;
     border-bottom: 1px solid rgba(148, 163, 184, 0.2);
-    background: color-mix(in srgb, var(--editorial-surface-featured) 94%, transparent);
-    backdrop-filter: blur(18px);
+    background: var(--editorial-surface-featured);
+  }
+
+  .timeline-detail-identity {
+    display: flex;
+    align-items: flex-start;
+    gap: 0.85rem;
+    min-width: 0;
+    flex: 1;
+  }
+
+  .timeline-detail-app-badge {
+    margin-top: 0.1rem;
+    flex: 0 0 auto;
+  }
+
+  .timeline-detail-heading {
+    min-width: 0;
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    gap: 0.2rem;
+  }
+
+  .timeline-detail-close {
+    width: 2rem;
+    height: 2rem;
+    flex: 0 0 auto;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border: 1px solid transparent;
+    border-radius: var(--radius-md);
+    color: var(--ui-subtle);
+    background: transparent;
+    cursor: pointer;
+    transition: background-color 140ms ease, color 140ms ease, border-color 140ms ease;
+  }
+
+  .timeline-detail-close:hover {
+    color: #0f172a;
+    background: rgba(148, 163, 184, 0.12);
+    border-color: rgba(148, 163, 184, 0.22);
   }
 
   .timeline-detail-body {
     display: grid;
-    gap: 1.35rem;
-    padding: 1.15rem 1.35rem 1.5rem;
+    grid-template-columns: minmax(0, 1fr) 22.5rem;
+    flex: 1;
+    min-height: 0;
+    overflow: hidden;
   }
 
-  .timeline-detail-header-meta {
-    margin: 0.18rem 0 0;
+  /* 左侧证据舞台：精致点阵画布 + 垂直居中截图 + 底部克制图注条 */
+  .timeline-detail-preview {
+    min-width: 0;
+    min-height: 0;
+    height: 100%;
     display: flex;
-    align-items: center;
-    flex-wrap: wrap;
-    gap: 0.3rem;
-    color: #78716c;
-    font-size: 0.78rem;
-    font-variant-numeric: tabular-nums;
-  }
-
-  /* 应用名：次要身份，小字灰阶 */
-  .timeline-detail-app-line {
-    min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    color: #57534e;
-    font-size: 0.85rem;
-    font-weight: 550;
-  }
-
-  /* 窗口标题：详情的主角 */
-  .timeline-detail-title {
-    display: -webkit-box;
-    -webkit-box-orient: vertical;
-    -webkit-line-clamp: 2;
-    line-clamp: 2;
-    overflow: hidden;
-    margin: 0.75rem 0 0;
-    color: #1c1917;
-    font-size: 1.16rem;
-    font-weight: 650;
-    line-height: 1.45;
-    overflow-wrap: anywhere;
-  }
-
-  /* meta 行内的当前分类胶囊（与列表条目同语言） */
-  .timeline-detail-meta-category {
-    display: inline-flex;
-    align-items: center;
-    gap: 0.32rem;
-    padding: 0.14rem 0.55rem;
-    border: 1px solid rgba(148, 163, 184, 0.32);
-    border-radius: var(--radius-full);
-    background: rgba(255, 255, 255, 0.9);
-    color: #57534e;
-    font-size: 0.72rem;
-    font-weight: 600;
-    line-height: 1;
-    white-space: nowrap;
-  }
-
-  .timeline-detail-preview,
-  .timeline-category-section,
-  .timeline-detail-settings {
-    min-width: 0;
+    flex-direction: column;
+    gap: 0.75rem;
+    padding: 1.25rem 1.35rem 1rem;
+    background-color: #f1f5f9;
+    background-image: radial-gradient(rgba(15, 23, 42, 0.06) 1px, transparent 1px);
+    background-size: 16px 16px;
   }
 
   .timeline-detail-preview-frame {
+    flex: 1;
     min-height: 16rem;
     overflow: hidden;
     position: relative;
     display: flex;
     align-items: center;
     justify-content: center;
+    padding: 0.75rem;
+    border: 1px solid rgba(15, 23, 42, 0.07);
     border-radius: var(--radius-md);
     background: rgba(148, 163, 184, 0.1);
+  }
+
+  .timeline-detail-preview-trigger {
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    max-width: 100%;
+    max-height: 100%;
+    padding: 0;
+    border: 0;
+    background: transparent;
+    cursor: zoom-in;
+  }
+
+  .timeline-detail-preview-image {
+    display: block;
+    max-width: 100%;
+    max-height: calc(100vh - 14.5rem);
+    width: auto;
+    height: auto;
+    object-fit: contain;
+    border: 1px solid rgba(15, 23, 42, 0.09);
+    border-radius: var(--radius-sm);
+    box-shadow:
+      0 14px 34px -8px rgba(15, 23, 42, 0.18),
+      0 2px 6px rgba(15, 23, 42, 0.08);
+    transition: transform 180ms var(--ui-ease), box-shadow 180ms var(--ui-ease);
+  }
+
+  .timeline-detail-preview-trigger:hover .timeline-detail-preview-image {
+    box-shadow:
+      0 18px 40px -8px rgba(15, 23, 42, 0.24),
+      0 4px 10px rgba(15, 23, 42, 0.1);
+  }
+
+  .timeline-detail-preview-zoom-hint {
+    position: absolute;
+    inset-inline-end: 0.65rem;
+    bottom: 0.65rem;
+    width: 1.85rem;
+    height: 1.85rem;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: var(--radius-md);
+    color: #f8fafc;
+    background: rgba(15, 23, 42, 0.68);
+    backdrop-filter: blur(8px);
+    opacity: 0;
+    transform: translateY(2px);
+    transition: opacity 150ms ease, transform 150ms ease;
+    pointer-events: none;
+  }
+
+  .timeline-detail-preview-zoom-hint svg {
+    width: 0.9rem;
+    height: 0.9rem;
+  }
+
+  .timeline-detail-preview-trigger:hover .timeline-detail-preview-zoom-hint,
+  .timeline-detail-preview-trigger:focus-visible .timeline-detail-preview-zoom-hint {
+    opacity: 1;
+    transform: translateY(0);
+  }
+
+  .timeline-detail-preview-bar {
+    flex: 0 0 auto;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.75rem;
+    padding-inline: 0.15rem;
+  }
+
+  .timeline-detail-preview-stamp {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    color: var(--ui-subtle);
+    font-size: 0.72rem;
+    font-weight: 500;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .timeline-detail-preview-stamp svg {
+    width: 0.85rem;
+    height: 0.85rem;
+    opacity: 0.78;
+  }
+
+  .timeline-detail-preview-expand {
+    width: 1.75rem;
+    height: 1.75rem;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border: 1px solid rgba(148, 163, 184, 0.28);
+    border-radius: var(--radius-sm);
+    color: var(--ui-muted);
+    background: rgba(255, 255, 255, 0.76);
+    cursor: pointer;
+    transition: color 140ms ease, border-color 140ms ease, background-color 140ms ease;
+  }
+
+  .timeline-detail-preview-expand:hover {
+    color: #0f172a;
+    border-color: rgba(100, 116, 139, 0.45);
+    background: #ffffff;
+  }
+
+  .timeline-detail-preview-expand svg {
+    width: 0.82rem;
+    height: 0.82rem;
   }
 
   .timeline-detail-preview-state {
@@ -3077,13 +3376,6 @@
     text-align: center;
   }
 
-  .timeline-detail-preview-image {
-    display: block;
-    width: 100%;
-    max-height: 28rem;
-    object-fit: contain;
-  }
-
   .timeline-detail-preview-loading-indicator {
     position: absolute;
     top: 0.65rem;
@@ -3095,82 +3387,392 @@
     justify-content: center;
     border: 1px solid rgba(148, 163, 184, 0.24);
     border-radius: var(--radius-full);
-    background: rgba(255, 255, 255, 0.82);
+    background: rgba(255, 255, 255, 0.86);
     box-shadow: 0 4px 12px rgba(15, 23, 42, 0.08);
   }
 
-  .timeline-detail-url {
+  /* 右侧统一检查器面板：单表面 + 细线分区，彻底去除嵌套卡片套娃 */
+  .timeline-detail-sidebar {
     min-width: 0;
-    display: block;
-    margin: 0.65rem 0 0;
-    color: #292524;
-    font-size: 0.88rem;
-    font-weight: 550;
+    min-height: 0;
+    height: 100%;
+    display: flex;
+    flex-direction: column;
+    border-inline-start: 1px solid rgba(148, 163, 184, 0.22);
+    background: var(--editorial-surface-featured);
+  }
+
+  .timeline-detail-inspector-scroll {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .timeline-detail-section {
+    padding: 1rem 1.25rem;
+    border-top: 1px solid rgba(148, 163, 184, 0.18);
+  }
+
+  .timeline-detail-inspector-scroll > .timeline-detail-section:first-child {
+    border-top: 0;
+  }
+
+  .timeline-detail-section-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.5rem;
+  }
+
+  .timeline-detail-label {
+    margin: 0;
+    color: var(--ui-muted);
+    font-size: 0.72rem;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+  }
+
+  .timeline-detail-section-hint {
+    margin: 0.28rem 0 0.65rem;
+    color: var(--ui-subtle);
+    font-size: 0.72rem;
     line-height: 1.45;
-    overflow-wrap: anywhere;
-    text-align: start;
+  }
+
+  .timeline-detail-inline-action {
+    padding: 0.18rem 0.45rem;
+    border: 0;
+    border-radius: var(--radius-sm);
+    color: var(--ui-accent);
+    background: transparent;
+    font-size: 0.72rem;
+    font-weight: 550;
+    cursor: pointer;
+    transition: background-color 140ms ease, color 140ms ease;
+  }
+
+  .timeline-detail-inline-action:hover {
+    color: var(--ui-accent-hover);
+    background: var(--ui-accent-soft);
+  }
+
+  .timeline-detail-url-row {
+    margin-top: 0.5rem;
+    display: flex;
+    align-items: stretch;
+    gap: 0.35rem;
+    min-width: 0;
   }
 
   .timeline-detail-url {
-    padding: 0;
-    border: 0;
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    align-items: flex-start;
+    gap: 0.4rem;
+    padding: 0.45rem 0.5rem;
+    border: 1px solid rgba(148, 163, 184, 0.24);
+    border-radius: var(--radius-md);
+    background: var(--editorial-surface-subtle);
     color: var(--ui-accent);
-    background: transparent;
-    font-size: 0.78rem;
-    font-weight: 500;
+    font-family: var(--font-mono);
+    font-size: 0.6875rem;
+    line-height: 1.5;
+    text-align: start;
     cursor: pointer;
+    transition: border-color 140ms ease, background-color 140ms ease;
   }
 
   .timeline-detail-url:hover {
+    border-color: var(--surface-border-emphasis);
+    background: var(--ui-accent-soft);
+  }
+
+  .timeline-detail-url > span {
+    min-width: 0;
+    flex: 1;
+    overflow-wrap: anywhere;
+  }
+
+  .timeline-detail-url-globe,
+  .timeline-detail-url-ext {
+    width: 0.85rem;
+    height: 0.85rem;
+    flex: 0 0 auto;
+    margin-top: 0.14rem;
+  }
+
+  .timeline-detail-url-globe {
+    color: var(--ui-subtle);
+  }
+
+  .timeline-detail-url-ext {
+    opacity: 0.72;
+  }
+
+  .timeline-detail-url:hover > span {
     text-decoration: underline;
+  }
+
+  .timeline-detail-url-copy {
+    width: 1.85rem;
+    flex: 0 0 auto;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border: 1px solid rgba(148, 163, 184, 0.24);
+    border-radius: var(--radius-md);
+    background: var(--editorial-surface-subtle);
+    color: var(--ui-subtle);
+    cursor: pointer;
+    transition: border-color 140ms ease, color 140ms ease, background-color 140ms ease;
+  }
+
+  .timeline-detail-url-copy:hover {
+    color: #0f172a;
+    border-color: rgba(100, 116, 139, 0.45);
+    background: #ffffff;
+  }
+
+  .timeline-detail-url-copy-done {
+    color: var(--ui-green);
+    border-color: rgba(22, 163, 74, 0.35);
+    background: var(--ui-green-soft);
+  }
+
+  .timeline-detail-url-copy svg {
+    width: 0.85rem;
+    height: 0.85rem;
+  }
+
+  .timeline-detail-project-row {
+    margin-top: 0.55rem;
+    display: flex;
+    align-items: center;
+  }
+
+  .timeline-detail-project-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.42rem;
+    padding: 0.24rem 0.62rem;
+    border: 1px solid rgba(148, 163, 184, 0.3);
+    border-radius: var(--radius-full);
+    background: var(--editorial-surface-subtle);
+    color: #1e293b;
+    font-size: 0.76rem;
+    font-weight: 550;
+  }
+
+  .timeline-detail-project-dot {
+    width: 0.5rem;
+    height: 0.5rem;
+    border-radius: var(--radius-full);
+    flex: 0 0 auto;
+  }
+
+  .timeline-detail-project-empty {
+    display: inline-flex;
+    align-items: center;
+    padding: 0.2rem 0.55rem;
+    border: 1px dashed rgba(148, 163, 184, 0.36);
+    border-radius: var(--radius-full);
+    color: var(--ui-subtle);
+    font-size: 0.74rem;
+  }
+
+  .timeline-detail-rule-form {
+    margin-top: 0.75rem;
+    padding: 0.75rem;
+    border: 1px solid rgba(148, 163, 184, 0.24);
+    border-radius: var(--radius-md);
+    background: var(--editorial-surface-subtle);
+  }
+
+  .timeline-detail-footer {
+    flex: 0 0 auto;
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    padding: 0.75rem 1.25rem;
+    border-top: 1px solid rgba(148, 163, 184, 0.18);
+    background: color-mix(in srgb, var(--editorial-surface-subtle) 70%, var(--editorial-surface-featured));
+  }
+
+  .timeline-detail-delete {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.375rem;
+    padding: 0.4rem 0.7rem;
+    border: 1px solid transparent;
+    border-radius: var(--radius-md);
+    color: #be123c;
+    background: transparent;
+    font-size: 0.76rem;
+    font-weight: 550;
+    cursor: pointer;
+    transition: background-color 140ms ease, border-color 140ms ease, color 140ms ease;
+  }
+
+  .timeline-detail-delete:hover {
+    color: #9f1239;
+    border-color: rgba(225, 29, 72, 0.24);
+    background: rgba(225, 29, 72, 0.08);
+  }
+
+  .timeline-detail-close:focus-visible,
+  .timeline-detail-delete:focus-visible,
+  .timeline-detail-url:focus-visible,
+  .timeline-detail-url-copy:focus-visible,
+  .timeline-detail-inline-action:focus-visible,
+  .timeline-detail-preview-trigger:focus-visible,
+  .timeline-detail-preview-expand:focus-visible,
+  .timeline-detail-lightbox-close:focus-visible {
+    outline: 2px solid var(--ui-accent-ring);
+    outline-offset: 2px;
+  }
+
+  :global(.dark) .timeline-detail-delete {
+    color: #fb7185;
+  }
+
+  :global(.dark) .timeline-detail-delete:hover {
+    color: #fda4af;
+    border-color: rgba(251, 113, 133, 0.28);
+    background: rgba(251, 113, 133, 0.12);
+  }
+
+  .timeline-detail-header-meta {
+    margin: 0.12rem 0 0;
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 0.42rem;
+    color: var(--ui-subtle);
+    font-size: 0.76rem;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .timeline-detail-meta-item {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.28rem;
+  }
+
+  .timeline-detail-meta-icon {
+    width: 0.8rem;
+    height: 0.8rem;
+    opacity: 0.75;
+    flex: 0 0 auto;
+  }
+
+  .timeline-detail-meta-sep {
+    opacity: 0.55;
+  }
+
+  .timeline-detail-meta-divider {
+    width: 1px;
+    height: 0.78rem;
+    background: rgba(148, 163, 184, 0.36);
+  }
+
+  /* 应用名：精致眉标 */
+  .timeline-detail-app-line {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--ui-subtle);
+    font-size: 0.76rem;
+    font-weight: 580;
+    line-height: 1.3;
+  }
+
+  /* 窗口标题：详情的主角 */
+  .timeline-detail-title {
+    display: -webkit-box;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
+    line-clamp: 2;
+    overflow: hidden;
+    margin: 0;
+    color: #0f172a;
+    font-size: 1.0625rem;
+    font-weight: 650;
+    line-height: 1.38;
+    overflow-wrap: anywhere;
+  }
+
+  /* meta 行内的当前分类胶囊：克制主题色轻染 */
+  .timeline-detail-meta-category {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.34rem;
+    padding: 0.18rem 0.56rem;
+    border: 1px solid color-mix(in srgb, var(--chip-color, #64748b) 28%, rgba(148, 163, 184, 0.28));
+    border-radius: var(--radius-full);
+    background: color-mix(in srgb, var(--chip-color, #64748b) 10%, var(--editorial-surface-featured));
+    color: #334155;
+    font-size: 0.72rem;
+    font-weight: 600;
+    line-height: 1;
+    white-space: nowrap;
+  }
+
+  .timeline-detail-preview,
+  .timeline-category-section,
+  .timeline-detail-project,
+  .timeline-detail-settings {
+    min-width: 0;
   }
 
   .timeline-detail-settings {
     display: grid;
     gap: 0.85rem;
-    padding-top: 0.35rem;
+    padding: 0.85rem 1.25rem 1rem;
     border-top: 1px solid rgba(148, 163, 184, 0.2);
   }
 
   .timeline-detail-settings-toggle {
     width: 100%;
-    min-height: 2.4rem;
+    min-height: 2rem;
     display: flex;
     align-items: center;
-    gap: 0.65rem;
-    padding: 0.4rem 0.65rem;
-    border: 1px solid rgba(148, 163, 184, 0.3);
-    border-radius: var(--radius-md);
-    background: #fff;
-    color: #57534e;
-    font-size: 0.84rem;
+    gap: 0.55rem;
+    padding: 0.2rem 0;
+    border: 0;
+    border-radius: var(--radius-sm);
+    background: transparent;
+    color: var(--ui-muted);
+    font-size: 0.78rem;
     font-weight: 600;
     text-align: start;
-    transition: border-color 120ms ease, background-color 120ms ease, color 120ms ease;
+    cursor: pointer;
+    transition: color 120ms ease;
   }
 
   .timeline-detail-settings-toggle:hover {
-    border-color: rgba(100, 116, 139, 0.6);
-    background: #fafaf9;
-    color: #292524;
+    color: #0f172a;
   }
 
   .timeline-detail-settings-summary {
     margin-inline-start: auto;
-    padding: 0.16rem 0.6rem;
-    border: 1px solid rgba(148, 163, 184, 0.3);
+    padding: 0.18rem 0.58rem;
+    border: 1px solid rgba(148, 163, 184, 0.28);
     border-radius: var(--radius-full);
-    background: #f5f5f4;
-    color: #57534e;
+    background: var(--editorial-surface-subtle);
+    color: #475569;
     font-size: 0.72rem;
     font-weight: 550;
   }
 
   .timeline-detail-settings-toggle svg {
-    width: 0.9rem;
-    height: 0.9rem;
+    width: 0.85rem;
+    height: 0.85rem;
     flex: 0 0 auto;
-    color: #78716c;
+    color: var(--ui-subtle);
     transition: transform 160ms ease;
   }
 
@@ -3180,26 +3782,38 @@
 
   .timeline-detail-setting-row {
     min-width: 0;
+    padding: 0.75rem;
+    border: 1px solid rgba(148, 163, 184, 0.2);
+    border-radius: var(--radius-md);
+    background: var(--editorial-surface-subtle);
   }
 
-  /* 隐私分段按钮：中性单色系，选中态统一深色实底（不随档位变红黄绿） */
+  /* 隐私分段轨道（复用 app.css 统一分段控件令牌） */
+  .timeline-detail-privacy-track {
+    display: flex;
+    gap: 2px;
+    padding: 3px;
+    border-radius: var(--radius-md);
+    background: var(--ui-seg-track);
+  }
+
   .timeline-detail-privacy-seg {
     flex: 1 1 0;
-    min-height: 2rem;
-    border: 1px solid rgba(148, 163, 184, 0.35);
-    border-radius: var(--radius-md);
-    background: #fff;
-    color: #57534e;
-    font-size: 0.78rem;
+    min-height: 1.85rem;
+    padding-inline: 0.35rem;
+    border: 0;
+    border-radius: var(--radius-sm);
+    background: transparent;
+    color: var(--ui-muted);
+    font-size: 0.74rem;
     font-weight: 550;
     text-align: center;
-    transition: border-color 120ms ease, background-color 120ms ease, color 120ms ease;
+    cursor: pointer;
+    transition: background-color 140ms ease, color 140ms ease, box-shadow 140ms ease;
   }
 
   .timeline-detail-privacy-seg:hover:not(:disabled) {
-    border-color: rgba(100, 116, 139, 0.65);
-    background: #fafaf9;
-    color: #292524;
+    color: #0f172a;
   }
 
   .timeline-detail-privacy-seg:disabled {
@@ -3209,10 +3823,10 @@
 
   .timeline-detail-privacy-seg-active,
   .timeline-detail-privacy-seg-active:hover:not(:disabled) {
-    border-color: #1e293b;
-    background: #1e293b;
-    color: #f8fafc;
+    background: var(--ui-seg-thumb);
+    color: #0f172a;
     font-weight: 620;
+    box-shadow: var(--ui-seg-edge);
   }
 
   .timeline-detail-privacy-seg:focus-visible {
@@ -3221,28 +3835,67 @@
   }
 
   :global(.dark) .timeline-detail-privacy-seg {
-    border-color: rgba(48, 54, 61, 0.9);
-    background: #21262d;
-    color: #adbac7;
+    color: #9ca3af;
   }
 
   :global(.dark) .timeline-detail-privacy-seg:hover:not(:disabled) {
-    border-color: #484f58;
-    background: #30363d;
     color: #e6edf3;
   }
 
   :global(.dark) .timeline-detail-privacy-seg-active,
   :global(.dark) .timeline-detail-privacy-seg-active:hover:not(:disabled) {
-    border-color: #e6edf3;
-    background: #e6edf3;
-    color: #0d1117;
+    background: var(--ui-seg-thumb);
+    color: #f8fafc;
+    box-shadow: var(--ui-seg-edge);
+  }
+
+  .timeline-detail-lightbox {
+    position: absolute;
+    inset: 0;
+    z-index: 20;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 1.5rem;
+    background: rgba(9, 13, 20, 0.84);
+    backdrop-filter: blur(12px);
+    animation: fadeIn 160ms ease-out;
+  }
+
+  .timeline-detail-lightbox-close {
+    position: absolute;
+    top: 1rem;
+    inset-inline-end: 1rem;
+    width: 2.25rem;
+    height: 2.25rem;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border: 1px solid rgba(255, 255, 255, 0.16);
+    border-radius: var(--radius-md);
+    color: #e2e8f0;
+    background: rgba(15, 23, 42, 0.72);
+    cursor: pointer;
+    transition: background-color 140ms ease, color 140ms ease;
+  }
+
+  .timeline-detail-lightbox-close:hover {
+    color: #ffffff;
+    background: rgba(30, 41, 59, 0.92);
+  }
+
+  .timeline-detail-lightbox-img {
+    display: block;
+    max-width: 100%;
+    max-height: 100%;
+    object-fit: contain;
+    border-radius: var(--radius-md);
+    box-shadow: 0 24px 64px rgba(0, 0, 0, 0.52);
   }
 
   .timeline-category-section {
     position: relative;
-    display: grid;
-    gap: 0.55rem;
+    display: block;
   }
 
   .timeline-category-toolbar {
@@ -3250,57 +3903,60 @@
   }
 
   .timeline-category-saving {
-    color: #a8a29e;
+    color: var(--ui-subtle);
     font-size: 0.72rem;
   }
 
   .timeline-category-picker {
     display: grid;
-    gap: 0.45rem;
+    gap: 0.5rem;
     outline: none;
   }
 
   .timeline-category-chips {
     display: flex;
     flex-wrap: wrap;
-    gap: 0.4rem;
+    gap: 0.38rem;
   }
 
   .timeline-category-chip {
     --chip-color: #d97706;
-    min-height: 1.9rem;
+    min-height: 1.8rem;
     max-width: 100%;
     display: inline-flex;
     align-items: center;
-    gap: 0.4rem;
-    padding: 0.28rem 0.72rem;
-    border: 1px solid rgba(148, 163, 184, 0.35);
+    gap: 0.36rem;
+    padding: 0.24rem 0.66rem;
+    border: 1px solid rgba(148, 163, 184, 0.32);
     border-radius: var(--radius-full);
-    color: #57534e;
-    background: #fff;
-    font-size: 0.78rem;
-    font-weight: 600;
+    color: #475569;
+    background: var(--editorial-surface-featured);
+    font-size: 0.75rem;
+    font-weight: 560;
+    cursor: pointer;
+    transition: border-color 130ms ease, background-color 130ms ease, color 130ms ease;
   }
 
   .timeline-category-chip:hover {
-    color: #292524;
-    border-color: rgba(100, 116, 139, 0.65);
-    background: #fafaf9;
+    color: #0f172a;
+    border-color: rgba(100, 116, 139, 0.55);
+    background: var(--editorial-surface-subtle);
   }
 
   .timeline-category-chip-active {
-    color: #292524;
-    border-color: rgba(100, 116, 139, 0.65);
-    background: #f5f5f4;
+    color: #0f172a;
+    border-color: rgba(100, 116, 139, 0.55);
+    background: var(--editorial-surface-subtle);
   }
 
-  /* 当前分类：中性实底与可点击 chip 区分，仅保留色点做识别 */
+  /* 当前分类：克制主题色轻染 + 加粗描边，一眼识别但不喧宾夺主 */
   .timeline-category-chip-current {
-    color: #1c1917;
-    border-color: #57534e;
+    color: #0f172a;
+    border-color: color-mix(in srgb, var(--chip-color) 48%, rgba(100, 116, 139, 0.45));
     border-radius: var(--radius-full);
-    background: #f5f5f4;
-    font-weight: 650;
+    background: color-mix(in srgb, var(--chip-color) 11%, var(--editorial-surface-featured));
+    font-weight: 630;
+    cursor: default;
   }
 
   /* 待确认态：虚线描边 + 加粗，等待第二次点击确认应用 */
@@ -3631,88 +4287,168 @@
   :global(.dark) .timeline-detail-drawer {
     border-color: rgba(48, 54, 61, 0.88);
     background: #161b22;
-    box-shadow: -18px 0 48px rgba(0, 0, 0, 0.28);
+    box-shadow: 0 24px 64px -12px rgba(0, 0, 0, 0.56);
   }
 
   :global(.dark) .timeline-detail-header {
-    border-color: rgba(48, 54, 61, 0.8);
-    background: rgba(22, 27, 34, 0.94);
+    border-color: rgba(48, 54, 61, 0.82);
+    background: #161b22;
+  }
+
+  :global(.dark) .timeline-detail-close:hover {
+    color: #f0f6fc;
+    background: rgba(139, 148, 158, 0.14);
+    border-color: rgba(48, 54, 61, 0.9);
+  }
+
+  :global(.dark) .timeline-detail-preview {
+    background-color: #0b0f16;
+    background-image: radial-gradient(rgba(255, 255, 255, 0.045) 1px, transparent 1px);
+  }
+
+  :global(.dark) .timeline-detail-preview-frame {
+    border-color: rgba(255, 255, 255, 0.06);
+    background: rgba(48, 54, 61, 0.38);
+  }
+
+  :global(.dark) .timeline-detail-preview-image {
+    border-color: rgba(255, 255, 255, 0.1);
+    box-shadow:
+      0 18px 42px -8px rgba(0, 0, 0, 0.56),
+      0 2px 8px rgba(0, 0, 0, 0.36);
+  }
+
+  :global(.dark) .timeline-detail-preview-expand {
+    border-color: rgba(48, 54, 61, 0.88);
+    color: #9ca3af;
+    background: rgba(22, 27, 34, 0.82);
+  }
+
+  :global(.dark) .timeline-detail-preview-expand:hover {
+    color: #f0f6fc;
+    border-color: #484f58;
+    background: #21262d;
+  }
+
+  :global(.dark) .timeline-detail-sidebar {
+    border-inline-start-color: rgba(48, 54, 61, 0.82);
+    background: #161b22;
+  }
+
+  :global(.dark) .timeline-detail-section {
+    border-top-color: rgba(48, 54, 61, 0.72);
   }
 
   :global(.dark) .timeline-detail-header-meta,
   :global(.dark) .timeline-category-saving {
-    color: #7d8590;
+    color: #8b949e;
+  }
+
+  :global(.dark) .timeline-detail-meta-divider {
+    background: rgba(139, 148, 158, 0.3);
   }
 
   :global(.dark) .timeline-detail-app-line {
-    color: #adbac7;
+    color: #8b949e;
   }
 
   :global(.dark) .timeline-detail-meta-category {
-    border-color: rgba(48, 54, 61, 0.9);
-    background: rgba(33, 38, 45, 0.85);
-    color: #adbac7;
+    border-color: color-mix(in srgb, var(--chip-color, #64748b) 34%, rgba(48, 54, 61, 0.9));
+    background: color-mix(in srgb, var(--chip-color, #64748b) 14%, #161b22);
+    color: #c9d1d9;
   }
 
-  :global(.dark) .timeline-detail-settings-toggle {
-    border-color: rgba(48, 54, 61, 0.9);
-    background: #21262d;
-    color: #adbac7;
-  }
-
-  :global(.dark) .timeline-detail-settings-toggle:hover {
-    border-color: #484f58;
-    background: #30363d;
-    color: #e6edf3;
-  }
-
-  :global(.dark) .timeline-detail-settings-summary {
-    border-color: rgba(48, 54, 61, 0.9);
-    background: #30363d;
-    color: #adbac7;
-  }
-
-  :global(.dark) .timeline-detail-settings {
-    border-color: rgba(48, 54, 61, 0.8);
-  }
-
-  :global(.dark) .timeline-detail-preview-frame {
-    background: rgba(48, 54, 61, 0.38);
-  }
-
-  :global(.dark) .timeline-detail-preview-loading-indicator {
-    border-color: rgba(48, 54, 61, 0.8);
-    background: rgba(22, 27, 34, 0.82);
-    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.18);
-  }
-
-  :global(.dark) .timeline-detail-title {
-    color: #e6edf3;
+  :global(.dark) .timeline-detail-url,
+  :global(.dark) .timeline-detail-url-copy {
+    border-color: rgba(48, 54, 61, 0.85);
+    background: #0d1117;
   }
 
   :global(.dark) .timeline-detail-url {
     color: var(--ui-accent);
   }
 
+  :global(.dark) .timeline-detail-url:hover {
+    border-color: var(--surface-border-emphasis);
+    background: rgba(129, 140, 248, 0.12);
+  }
+
+  :global(.dark) .timeline-detail-url-copy:hover {
+    color: #f0f6fc;
+    border-color: #484f58;
+    background: #21262d;
+  }
+
+  :global(.dark) .timeline-detail-project-pill {
+    border-color: rgba(48, 54, 61, 0.88);
+    background: #21262d;
+    color: #e6edf3;
+  }
+
+  :global(.dark) .timeline-detail-project-empty {
+    border-color: rgba(48, 54, 61, 0.85);
+    color: #8b949e;
+  }
+
+  :global(.dark) .timeline-detail-rule-form,
+  :global(.dark) .timeline-detail-setting-row {
+    border-color: rgba(48, 54, 61, 0.82);
+    background: #0d1117;
+  }
+
+  :global(.dark) .timeline-detail-settings-toggle {
+    color: #9c9ca6;
+  }
+
+  :global(.dark) .timeline-detail-settings-toggle:hover {
+    color: #e6edf3;
+  }
+
+  :global(.dark) .timeline-detail-settings-summary {
+    border-color: rgba(48, 54, 61, 0.88);
+    background: #21262d;
+    color: #c9d1d9;
+  }
+
+  :global(.dark) .timeline-detail-settings {
+    border-color: rgba(48, 54, 61, 0.72);
+  }
+
+  :global(.dark) .timeline-detail-footer {
+    border-top-color: rgba(48, 54, 61, 0.78);
+    background: #12171e;
+  }
+
+  :global(.dark) .timeline-detail-preview-loading-indicator {
+    border-color: rgba(48, 54, 61, 0.8);
+    background: rgba(22, 27, 34, 0.86);
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.24);
+  }
+
+  :global(.dark) .timeline-detail-title {
+    color: #f0f6fc;
+  }
+
   :global(.dark) .timeline-category-chip,
   :global(.dark) .timeline-category-editor,
   :global(.dark) .timeline-category-editor-fields input[type='text'],
   :global(.dark) .timeline-category-editor-actions button {
-    border-color: rgba(48, 54, 61, 0.8);
+    border-color: rgba(48, 54, 61, 0.85);
     color: #adbac7;
     background: #21262d;
   }
 
   :global(.dark) .timeline-category-chip:hover,
-  :global(.dark) .timeline-category-chip-active,
-  :global(.dark) .timeline-category-chip-current {
+  :global(.dark) .timeline-category-chip-active {
     color: #e6edf3;
     background: #30363d;
     border-color: #484f58;
   }
 
   :global(.dark) .timeline-category-chip-current {
-    border-color: #8b949e;
+    color: #f0f6fc;
+    background: color-mix(in srgb, var(--chip-color) 18%, #21262d);
+    border-color: color-mix(in srgb, var(--chip-color) 52%, #484f58);
   }
 
   :global(.dark) .timeline-category-chip-add {
@@ -3754,6 +4490,44 @@
     }
   }
 
+  @media (max-width: 960px) {
+    .timeline-detail-body {
+      display: flex;
+      flex-direction: column;
+      overflow-y: auto;
+    }
+
+    .timeline-detail-preview {
+      height: auto;
+      flex: 0 0 auto;
+      padding: 1rem 1.25rem 0.85rem;
+    }
+
+    .timeline-detail-preview-frame {
+      flex: none;
+      min-height: 12rem;
+    }
+
+    .timeline-detail-preview-image {
+      max-height: 22rem;
+    }
+
+    .timeline-detail-sidebar {
+      height: auto;
+      flex: 1 0 auto;
+      border-inline-start: 0;
+      border-top: 1px solid rgba(148, 163, 184, 0.22);
+    }
+
+    :global(.dark) .timeline-detail-sidebar {
+      border-top-color: rgba(48, 54, 61, 0.82);
+    }
+
+    .timeline-detail-inspector-scroll {
+      overflow-y: visible;
+    }
+  }
+
   @media (max-width: 860px) {
     .timeline-entry-card-featured {
       grid-template-columns: 1fr;
@@ -3776,13 +4550,18 @@
       border-radius: 0;
     }
 
-    .timeline-detail-header,
-    .timeline-detail-body {
-      padding-inline: 1rem;
+    .timeline-detail-header {
+      padding: 0.9rem 1rem;
     }
 
-    .timeline-detail-body {
-      gap: 1.15rem;
+    .timeline-detail-preview {
+      padding: 0.85rem 1rem 0.75rem;
+    }
+
+    .timeline-detail-section,
+    .timeline-detail-settings,
+    .timeline-detail-footer {
+      padding-inline: 1rem;
     }
 
     .timeline-detail-preview-frame,

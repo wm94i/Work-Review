@@ -123,7 +123,7 @@ pub fn is_routine_due(routine: &AgentRoutine, now: DateTime<Local>) -> bool {
             }
             match routine.last_run_at {
                 None => true,
-                Some(last_ts) => match Local.timestamp_opt(last_ts, 0).single() {
+                Some(last_ts) => match Local.timestamp_opt(last_ts, 0).earliest() {
                     Some(last_dt) => last_dt.date_naive() < now.date_naive(),
                     None => true,
                 },

@@ -27,9 +27,15 @@ export default defineConfig({
   // 否则发布流程中的 TAURI_SIGNING_PRIVATE_KEY 等变量可能被打进前端产物。
   envPrefix: ['VITE_', 'TAURI_ENV_'],
   optimizeDeps: {
-    entries: ['index.html'],
+    entries: ['index.html', 'avatar.html'],
   },
   build: {
+    rollupOptions: {
+      input: {
+        main: path.resolve('index.html'),
+        avatar: path.resolve('avatar.html'),
+      },
+    },
     target: ['es2021', 'chrome100', 'safari13'],
     minify: !process.env.TAURI_DEBUG ? 'esbuild' : false,
     sourcemap: !!process.env.TAURI_DEBUG,
